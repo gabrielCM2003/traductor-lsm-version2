@@ -42,7 +42,7 @@ except ImportError:
 from sign_classifier import SignClassifier, PredictionSmoother, normalize_keypoints, hand_to_feature_vector
 
 try:
-    from segmentador_automatico import AutoSegmenter
+    from segmentador_automatico import AutoSegmenter, MIN_SEQUENCE_MS as DYN_STANDALONE_MIN_SEQUENCE_MS
     from dtw_recognizer import DTWRecognizer
 except ImportError as e:
     # Alfabeto dinamico (J,K,Ñ,Q,X,Z): opcional. Si falta fastdtw/scipy o los
@@ -50,9 +50,36 @@ except ImportError as e:
     # que antes; el modo dinamico simplemente queda deshabilitado.
     AutoSegmenter = None
     DTWRecognizer = None
+    DYN_STANDALONE_MIN_SEQUENCE_MS = 170
     logging.getLogger("sign_translator").warning(
         "Alfabeto dinamico no disponible (%s). Instala fastdtw/scipy para habilitarlo.", e
     )
+
+# --------------------------------------------------------------------------- #
+# Parametros ajustables del alfabeto dinamico integrado en la GUI.
+#
+# Son deliberadamente independientes de las constantes de
+# segmentador_automatico.py (modo consola, NO_HAND_MS_TO_END / MIN_SEQUENCE_MS):
+# ese script no se toca. Valores de partida pensados para no cambiar el
+# comportamiento actual hasta que se afinen con datos reales de evaluacion.
+# --------------------------------------------------------------------------- #
+
+# Confianza minima del candidato top-1 (softmax entre las N señas dinamicas
+# disponibles) para comprometer la letra a la palabra.
+DYN_MIN_CONF = 0.55
+
+# Margen minimo entre el top-1 y el top-2 (confianza_1 - confianza_2) para
+# comprometer la letra. En 0.0 no exige ningun margen (o sea, no cambia el
+# comportamiento previo, que solo miraba DYN_MIN_CONF).
+DYN_MIN_MARGIN = 0.0
+
+# Mas tolerante que el modo consola (270ms): senas como la J son un trazo
+# largo y a veces la mano se pierde un instante a mitad del gesto sin que
+# eso signifique que ya termino.
+DYN_NO_HAND_MS_TO_END = 700
+
+# Tope duro: si el usuario no baja la mano, no seguir grabando para siempre.
+DYN_MAX_SEQUENCE_MS = 5000
 
 # DTWRecognizer.try_load() tarda ~2s en parsear las plantillas de
 # datos_dinamicas/ (cientos de JSON). HandTrackingThread se recrea cada vez
@@ -562,6 +589,26 @@ def build_dynamic_feature_vector(hands: dict[str, "HandDetection"]) -> np.ndarra
     return vec
 
 
+def dynamic_commit_decision(topk: list[tuple[str, float]]) -> tuple[bool, float]:
+    """Decide si el top-1 de una clasificacion dinamica se compromete o no.
+
+    Regla (ver DYN_MIN_CONF / DYN_MIN_MARGIN al inicio del archivo): se
+    compromete solo si la confianza del top-1 alcanza DYN_MIN_CONF Y ademas
+    el margen sobre el top-2 (confianza_1 - confianza_2) alcanza
+    DYN_MIN_MARGIN. Se centraliza aqui para que _process_dynamic_frame (que
+    decide si se agrega la letra) y _on_diagnostic_update en la GUI (que solo
+    explica por que no se agrego) usen exactamente el mismo criterio.
+
+    Devuelve (se_compromete, margen).
+    """
+    if not topk:
+        return False, 0.0
+    conf1 = topk[0][1]
+    margin = conf1 - topk[1][1] if len(topk) > 1 else conf1
+    should_commit = conf1 >= DYN_MIN_CONF and margin >= DYN_MIN_MARGIN
+    return should_commit, margin
+
+
 # =========================================================================== #
 # Hilo 2: MediaPipe Hands
 # =========================================================================== #
@@ -620,10 +667,8 @@ class HandTrackingThread(QThread):
         # plantillas en datos_dinamicas/.
         self._dynamic_mode: bool = False
         self._dtw_recognizer: Optional["DTWRecognizer"] = _get_dtw_recognizer()
-        self._auto_segmenter: Optional["AutoSegmenter"] = (
-            AutoSegmenter() if AutoSegmenter is not None else None
-        )
-        self._dynamic_min_confidence: float = 0.55
+        self._auto_segmenter: Optional["AutoSegmenter"] = self._new_auto_segmenter()
+
         # predict_topk() contra ~500+ plantillas puede tardar varios segundos
         # (medido: ~4.5s con 558 plantillas). Corriendolo en el propio hilo de
         # captura congelaba visiblemente el video (y en casos mas lentos podia
@@ -632,12 +677,53 @@ class HandTrackingThread(QThread):
         # resultado en esta cola; el bucle principal la revisa sin bloquearse.
         self._dynamic_result_queue: "queue.Queue[tuple]" = queue.Queue()
         self._dynamic_classifying: bool = False
+        self._dynamic_classify_start: float = 0.0
+
+        # Texto que se muestra en el cuadro "Estado" mientras no hay nada
+        # nuevo que reportar (ni grabando ni clasificando): al arrancar dice
+        # "Esperando mano", y despues de cada clasificacion queda mostrando
+        # esa ultima letra (comprometida o no) hasta que empiece una seña
+        # nueva. Antes se volvia a "..." en el siguiente frame (menos de
+        # 33ms), practicamente invisible para el usuario.
+        self._dynamic_idle_text: str = "Esperando mano"
+
+        # Instrumentacion por seña (duracion real, frames, fps efectivo,
+        # hueco maximo sin mano dentro de la seña). Se reinicia en cada
+        # "inicio" y se vuelca a consola cuando la seña termina.
+        self._dynamic_stats: Optional[dict] = None
 
         self._latencies: deque[float] = deque(maxlen=100)
         self._frame_times: deque[float] = deque(maxlen=30)
         self._hand_counts: deque[int] = deque(maxlen=60)
         self._last_metrics_emit = 0.0
 
+
+    def _new_auto_segmenter(self) -> Optional["AutoSegmenter"]:
+        """Crea el segmentador del modo dinamico con los umbrales de senas.py
+        (DYN_NO_HAND_MS_TO_END / DYN_MAX_SEQUENCE_MS), no los del modo consola
+        de segmentador_automatico.py. Ver comentario junto a esas constantes."""
+        if AutoSegmenter is None:
+            return None
+        return AutoSegmenter(
+            no_hand_ms_to_end=DYN_NO_HAND_MS_TO_END,
+            min_sequence_ms=DYN_STANDALONE_MIN_SEQUENCE_MS,
+            max_duration_ms=DYN_MAX_SEQUENCE_MS,
+        )
+
+    def _reset_dynamic_state(self) -> None:
+        """Descarta cualquier grabacion/clasificacion en curso del modo
+        dinamico y vuelve al estado inicial. Se usa al togglear el modo, al
+        pedir un espacio/borrar manualmente, y al reiniciar el hilo."""
+        if self._auto_segmenter is not None:
+            self._auto_segmenter = self._new_auto_segmenter()
+        self._dynamic_classifying = False
+        self._dynamic_idle_text = "Esperando mano"
+        self._dynamic_stats = None
+        while not self._dynamic_result_queue.empty():
+            try:
+                self._dynamic_result_queue.get_nowait()
+            except queue.Empty:
+                break
 
     def set_draw_landmarks(self, value: bool) -> None:
         self._cfg.draw_landmarks = value
@@ -652,14 +738,7 @@ class HandTrackingThread(QThread):
         self._stable_letter = None
         self._stable_frames = 0
         self._smoother.reset()
-        if self._auto_segmenter is not None:
-            self._auto_segmenter = AutoSegmenter()
-        self._dynamic_classifying = False
-        while not self._dynamic_result_queue.empty():
-            try:
-                self._dynamic_result_queue.get_nowait()
-            except queue.Empty:
-                break
+        self._reset_dynamic_state()
 
 
     def set_stable_frames_to_commit(self, value: int) -> None:
@@ -685,14 +764,7 @@ class HandTrackingThread(QThread):
 
     def set_dynamic_mode(self, enabled: bool) -> None:
         self._dynamic_mode = bool(enabled) and self._dtw_recognizer is not None
-        if self._auto_segmenter is not None:
-            self._auto_segmenter = AutoSegmenter()  # descarta cualquier buffer a medias
-        self._dynamic_classifying = False
-        while not self._dynamic_result_queue.empty():
-            try:
-                self._dynamic_result_queue.get_nowait()
-            except queue.Empty:
-                break
+        self._reset_dynamic_state()
 
     @property
     def has_classifier(self) -> bool:
@@ -794,6 +866,47 @@ class HandTrackingThread(QThread):
             self._update_metrics(dt, detections.num_hands)
 
 
+    # ---- instrumentacion por seña (duracion, frames, fps, hueco maximo) ---
+
+    def _dynamic_stats_reset(self, now: float) -> None:
+        self._dynamic_stats = {
+            "inicio": now,
+            "frames": 0,
+            "hueco_inicio": None,
+            "hueco_max_ms": 0.0,
+        }
+
+    def _dynamic_stats_update(self, has_hand: bool, now: float) -> None:
+        stats = self._dynamic_stats
+        if stats is None:
+            return
+        stats["frames"] += 1
+        if has_hand:
+            # se cierra el hueco (tramo sin mano) que estuviera abierto
+            if stats["hueco_inicio"] is not None:
+                hueco_ms = (now - stats["hueco_inicio"]) * 1000.0
+                stats["hueco_max_ms"] = max(stats["hueco_max_ms"], hueco_ms)
+                stats["hueco_inicio"] = None
+        elif stats["hueco_inicio"] is None:
+            stats["hueco_inicio"] = now
+
+    def _dynamic_stats_log(self, now: float, kind: str) -> None:
+        stats = self._dynamic_stats
+        if stats is None:
+            return
+        if stats["hueco_inicio"] is not None:
+            hueco_ms = (now - stats["hueco_inicio"]) * 1000.0
+            stats["hueco_max_ms"] = max(stats["hueco_max_ms"], hueco_ms)
+        duracion_s = max(1e-6, now - stats["inicio"])
+        fps_efectivo = stats["frames"] / duracion_s
+        etiqueta = "descartada por corta" if kind == "fin_descartada" else "seña"
+        log.info(
+            "[dinamico] %s: duracion=%.2fs frames=%d fps_efectivo=%.1f hueco_max=%.0fms",
+            etiqueta, duracion_s, stats["frames"], fps_efectivo, stats["hueco_max_ms"],
+        )
+
+    # ---- ciclo del modo dinamico -------------------------------------------
+
     def _process_dynamic_frame(self, detections: FrameDetections) -> tuple[str, float]:
         """Alfabeto dinamico (J,K,Ñ,Q,X,Z): segmenta con AutoSegmenter y
         clasifica con DTWRecognizer cuando detecta el fin de una seña.
@@ -813,44 +926,96 @@ class HandTrackingThread(QThread):
         """
         assert self._auto_segmenter is not None and self._dtw_recognizer is not None
 
+        now = time.perf_counter()
+
+        # 1. Si una clasificacion en curso ya termino, se recoge aqui primero
+        #    (sin bloquear: get_nowait). El top-3 se emite SIEMPRE en modo
+        #    dinamico (no solo con el checkbox de diagnostico) y el texto de
+        #    Estado se queda mostrando este resultado (comprometido o no)
+        #    hasta que arranque una seña nueva, en vez de volver a "..." en
+        #    el siguiente frame (antes duraba <33ms en pantalla).
         try:
             letter, conf, topk = self._dynamic_result_queue.get_nowait()
         except queue.Empty:
             pass
         else:
             self._dynamic_classifying = False
-            if self._diagnostic_mode:
-                self.sign_diagnostic_signal.emit(topk)
-            if conf >= self._dynamic_min_confidence:
+            self.sign_diagnostic_signal.emit(topk)
+            should_commit, margin = dynamic_commit_decision(topk)
+            top_str = "  ".join(f"{w} {c * 100:.1f}%" for w, c in topk)
+
+            if should_commit:
                 self.letter_committed_signal.emit(letter)
                 self._last_committed_label = letter
+                self._dynamic_idle_text = f"{letter} ({conf * 100:.0f}%)"
+                log.info("[dinamico] top-3: %s -> agregada (margen=%.1fpp)", top_str, margin * 100)
+            else:
+                self._dynamic_idle_text = f"¿{letter}? ({conf * 100:.0f}%) - no agregada"
+                motivos = []
+                if conf < DYN_MIN_CONF:
+                    motivos.append(f"confianza {conf * 100:.1f}% < {DYN_MIN_CONF * 100:.0f}%")
+                if margin < DYN_MIN_MARGIN:
+                    motivos.append(f"margen {margin * 100:.1f}pp < {DYN_MIN_MARGIN * 100:.0f}pp")
+                log.info(
+                    "[dinamico] top-3: %s -> NO agregada (%s)",
+                    top_str, "; ".join(motivos) or "umbral no alcanzado",
+                )
             return (letter, conf)
 
+        # 2. Construir el vector de este frame y avanzar el segmentador.
         hands_by_side: dict[str, HandDetection] = {}
         for h in detections.hands:
             if h.handedness not in hands_by_side:
                 hands_by_side[h.handedness] = h
+        has_hand = bool(hands_by_side)
 
         vector = build_dynamic_feature_vector(hands_by_side)
-        event = self._auto_segmenter.push(bool(hands_by_side), vector, time.perf_counter())
+        event = self._auto_segmenter.push(has_hand, vector, now)
 
         if event is None:
+            if self._auto_segmenter.state == "grabando":
+                self._dynamic_stats_update(has_hand, now)
+                return ("Grabando...", 0.0)
             if self._dynamic_classifying:
-                return ("clasificando…", 0.0)
-            return ("grabando…" if self._auto_segmenter.state == "grabando" else "...", 0.0)
+                elapsed_s = now - self._dynamic_classify_start
+                return (f"Clasificando... ({elapsed_s:.0f}s)", 0.0)
+            return (self._dynamic_idle_text, 0.0)
 
         kind, sequence = event
-        if kind == "inicio":
-            return ("grabando…", 0.0)
-        if kind == "fin_descartada":
-            return ("...", 0.0)
 
-        # kind == "fin_valida": clasificar en segundo plano, sin bloquear.
+        if kind == "inicio":
+            self._dynamic_stats_reset(now)
+            self._dynamic_stats_update(True, now)
+            return ("Grabando...", 0.0)
+
+        if kind == "fin_descartada":
+            self._dynamic_stats_log(now, kind)
+            self._dynamic_stats = None
+            return (self._dynamic_idle_text, 0.0)
+
+        # kind == "fin_valida"
+        self._dynamic_stats_log(now, kind)
+        self._dynamic_stats = None
+
+        if self._dynamic_classifying:
+            # Item 6: una seña nueva termino de grabarse mientras la anterior
+            # todavia se estaba clasificando. Se descarta (no se encola) en
+            # vez de lanzar una segunda clasificacion DTW en paralelo, para
+            # mantener el orden de resultados simple y predecible; se avisa
+            # tanto en consola como en el propio cuadro de Estado.
+            log.warning(
+                "[dinamico] seña descartada: la clasificacion anterior aun no termina (%d frames)",
+                len(sequence),
+            )
+            self._dynamic_idle_text = "Seña descartada (clasificando la anterior)"
+            return (self._dynamic_idle_text, 0.0)
+
         self._dynamic_classifying = True
+        self._dynamic_classify_start = now
         threading.Thread(
             target=self._classify_dynamic_sequence, args=(sequence,), daemon=True
         ).start()
-        return ("clasificando…", 0.0)
+        return ("Clasificando... (0s)", 0.0)
 
     def _classify_dynamic_sequence(self, sequence: list[np.ndarray]) -> None:
         """Corre en un hilo aparte (no QThread): solo hace la clasificacion y
@@ -1351,26 +1516,29 @@ class SignLanguageApp(QMainWindow):
         s.setFrameShadow(QFrame.Shadow.Sunken)
         return s
 
-    def _classifier_status_text(self) -> str:
+    def _dynamic_recognizer_available(self) -> bool:
+        models_dir = Path(__file__).resolve().parent
+        dynamic_dir = models_dir / "datos_dinamicas"
+        return (
+            AutoSegmenter is not None and DTWRecognizer is not None
+            and dynamic_dir.is_dir() and any(dynamic_dir.iterdir())
+        )
+
+    def _static_help_text(self) -> str:
         from sign_classifier import MODEL_FILENAME, LABELS_FILENAME
         models_dir = Path(__file__).resolve().parent
         onnx_path = models_dir / MODEL_FILENAME
         labels_path = models_dir / LABELS_FILENAME
 
-        dynamic_dir = models_dir / "datos_dinamicas"
-        dynamic_available = (
-            AutoSegmenter is not None and DTWRecognizer is not None
-            and dynamic_dir.is_dir() and any(dynamic_dir.iterdir())
-        )
         dynamic_line = (
             "Alfabeto dinámico (J,K,Ñ,Q,X,Z) disponible: Ctrl+D para activarlo."
-            if dynamic_available else
+            if self._dynamic_recognizer_available() else
             "Alfabeto dinámico no disponible (faltan plantillas o fastdtw/scipy)."
         )
 
         if onnx_path.exists() and labels_path.exists():
             return (
-                "Clasificador LSM activo (alfabeto, 21 letras estáticas).\n"
+                "Modo ESTÁTICO activo (alfabeto, 21 letras A-Y).\n"
                 "Mantén una seña ~12 frames para fijar la letra.\n"
                 "Baja las manos ~25 frames para insertar un espacio.\n"
                 f"{dynamic_line}"
@@ -1380,6 +1548,26 @@ class SignLanguageApp(QMainWindow):
             f"Coloca {MODEL_FILENAME} y {LABELS_FILENAME} en:\n{models_dir}\n"
             f"{dynamic_line}"
         )
+
+    def _dynamic_help_text(self) -> str:
+        labels = self.ai_thread.dynamic_labels if self.ai_thread is not None else []
+        letras = ", ".join(labels) if labels else "J, K, Ñ, Q, X, Z"
+        return (
+            f"Modo DINÁMICO activo ({letras}).\n"
+            "1) Levanta la mano y haz la seña completa.\n"
+            "2) Bájala al terminar: se clasifica sola, sin presionar nada.\n"
+            f"Fin de seña tras ~{DYN_NO_HAND_MS_TO_END}ms sin mano "
+            f"(tope máx. {DYN_MAX_SEQUENCE_MS / 1000:.0f}s por seña).\n"
+            "Ctrl+D para volver al alfabeto estático."
+        )
+
+    def _classifier_status_text(self) -> str:
+        # El texto de ayuda cambia segun el modo activo (item 1 del pedido):
+        # explica el flujo dinamico (levantar mano / señar / bajar mano)
+        # cuando ese modo esta encendido, o el estatico en caso contrario.
+        if self._dynamic_mode_enabled:
+            return self._dynamic_help_text()
+        return self._static_help_text()
 
 
     def _restore_window_state(self) -> None:
@@ -1507,6 +1695,7 @@ class SignLanguageApp(QMainWindow):
         self.action_dynamic_mode.blockSignals(True)
         self.action_dynamic_mode.setChecked(False)
         self.action_dynamic_mode.blockSignals(False)
+        self.classifier_info_label.setText(self._classifier_status_text())
 
     def _on_toggle_dynamic_mode(self, checked: bool) -> None:
         # Solo podemos saber si el reconocedor dinamico esta disponible una
@@ -1520,10 +1709,21 @@ class SignLanguageApp(QMainWindow):
         self._dynamic_mode_enabled = checked
         if self.ai_thread is not None:
             self.ai_thread.set_dynamic_mode(checked)
+
+        # El texto de ayuda de abajo del Estado y el panel top-3 dependen del
+        # modo activo (items 1 y 2 del pedido), no solo del checkbox de
+        # diagnostico estatico.
+        self.classifier_info_label.setText(self._classifier_status_text())
+        self.sign_label.setText("Esperando mano" if checked else "—")
+
         if checked:
+            self.diagnostic_label.show()
+            self.diagnostic_label.setText("Esperando seña...")
             labels = self.ai_thread.dynamic_labels if self.ai_thread is not None else []
             self.statusBar().showMessage(f"Modo dinámico activo ({', '.join(labels)})", 4000)
         else:
+            if not self.cb_diagnostic.isChecked():
+                self.diagnostic_label.hide()
             self.statusBar().showMessage("Modo estático activo (alfabeto A-Y)", 3000)
 
     def _apply_pending_dynamic_mode(self) -> None:
@@ -1578,6 +1778,20 @@ class SignLanguageApp(QMainWindow):
             bar_len = int(conf * 20)
             bar = "█" * bar_len + "░" * (20 - bar_len)
             lines.append(f"{i+1}. {letter}  {bar} {conf*100:5.1f}%")
+
+        if self._dynamic_mode_enabled:
+            # Item 2: top-3 siempre visible al terminar cada clasificacion
+            # dinamica (no solo con el checkbox de diagnostico), marcando si
+            # se agrego la letra o no y por que, con el mismo criterio
+            # (dynamic_commit_decision) que usa HandTrackingThread para
+            # decidir el commit real.
+            should_commit, margin = dynamic_commit_decision(topk)
+            if should_commit:
+                lines.append(f"→ agregada (margen {margin * 100:.1f}pp)")
+            else:
+                lines.append("→ baja confianza, no se agregó")
+            self.diagnostic_label.show()
+
         self.diagnostic_label.setText("\n".join(lines))
 
     def _on_model_loaded(self) -> None:
