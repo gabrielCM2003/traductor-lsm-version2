@@ -9,6 +9,7 @@ import platform
 import queue
 import statistics
 import sys
+import threading
 import time
 import urllib.request
 import urllib.error
@@ -38,12 +39,45 @@ except ImportError:
     print("ERROR: falta 'mediapipe'. Instala con: pip install mediapipe", file=sys.stderr)
     raise
 
-from sign_classifier import SignClassifier, PredictionSmoother
+from sign_classifier import SignClassifier, PredictionSmoother, normalize_keypoints, hand_to_feature_vector
+
+try:
+    from segmentador_automatico import AutoSegmenter
+    from dtw_recognizer import DTWRecognizer
+except ImportError as e:
+    # Alfabeto dinamico (J,K,Ñ,Q,X,Z): opcional. Si falta fastdtw/scipy o los
+    # archivos aun no existen, el alfabeto estatico sigue funcionando igual
+    # que antes; el modo dinamico simplemente queda deshabilitado.
+    AutoSegmenter = None
+    DTWRecognizer = None
+    logging.getLogger("sign_translator").warning(
+        "Alfabeto dinamico no disponible (%s). Instala fastdtw/scipy para habilitarlo.", e
+    )
+
+# DTWRecognizer.try_load() tarda ~2s en parsear las plantillas de
+# datos_dinamicas/ (cientos de JSON). HandTrackingThread se recrea cada vez
+# que el watchdog reinicia la IA por inactividad, y eso pasaba en el hilo de
+# GUI (bloqueando toda la ventana, no solo el video) porque __init__ volvia a
+# cargarlo desde disco cada vez. Se cachea una sola vez por proceso.
+_dtw_recognizer_singleton: Optional["DTWRecognizer"] = None
+_dtw_recognizer_load_attempted = False
+
+
+def _get_dtw_recognizer() -> Optional["DTWRecognizer"]:
+    global _dtw_recognizer_singleton, _dtw_recognizer_load_attempted
+    if not _dtw_recognizer_load_attempted:
+        _dtw_recognizer_load_attempted = True
+        if DTWRecognizer is not None:
+            try:
+                _dtw_recognizer_singleton = DTWRecognizer.try_load()
+            except Exception:
+                logging.getLogger("sign_translator").exception("Error cargando DTWRecognizer")
+    return _dtw_recognizer_singleton
 
 
 APP_NAME = "SignTranslator"
 APP_ORG = "OpenLSM"
-APP_VERSION = "3.2-lsm-classifier"
+APP_VERSION = "3.3-lsm-alfabeto-dinamico"
 
 HAND_MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
@@ -503,6 +537,32 @@ class CameraThread(QThread):
 
 
 # =========================================================================== #
+# Alfabeto dinamico: vector de 126 (dos manos) para DTWRecognizer
+# =========================================================================== #
+
+def build_dynamic_feature_vector(hands: dict[str, "HandDetection"]) -> np.ndarray:
+    """Vector de 126 = [mano izquierda normalizada (63)] + [mano derecha normalizada (63)].
+
+    Misma convencion de slots (Left, Right) y misma normalizacion por mano que
+    recolector_dinamico.build_feature_vector / procesar_dataset_dinamico.py
+    (que a su vez usan normalize_keypoints y hand_to_feature_vector de
+    sign_classifier.py). Se reimplementa aqui en vez de importarse de
+    recolector_dinamico.py porque ese modulo ya importa cosas de senas.py, y
+    un import en sentido contrario crearia un ciclo.
+    """
+    vec = np.zeros(126, dtype=np.float32)
+    for slot_idx, handedness in enumerate(("Left", "Right")):
+        hand = hands.get(handedness)
+        if hand is None:
+            continue
+        raw = hand_to_feature_vector(hand.landmarks_2d, hand.landmarks_3d)
+        norm = normalize_keypoints(raw)
+        offset = slot_idx * 63
+        vec[offset:offset + 63] = norm
+    return vec
+
+
+# =========================================================================== #
 # Hilo 2: MediaPipe Hands
 # =========================================================================== #
 
@@ -555,6 +615,24 @@ class HandTrackingThread(QThread):
         self._stable_letter: Optional[str] = None
         self._stable_frames: int = 0
 
+        # Alfabeto dinamico (J,K,Ñ,Q,X,Z): opcional, requiere AutoSegmenter y
+        # DTWRecognizer (ver import con try/except al inicio del archivo) y
+        # plantillas en datos_dinamicas/.
+        self._dynamic_mode: bool = False
+        self._dtw_recognizer: Optional["DTWRecognizer"] = _get_dtw_recognizer()
+        self._auto_segmenter: Optional["AutoSegmenter"] = (
+            AutoSegmenter() if AutoSegmenter is not None else None
+        )
+        self._dynamic_min_confidence: float = 0.55
+        # predict_topk() contra ~500+ plantillas puede tardar varios segundos
+        # (medido: ~4.5s con 558 plantillas). Corriendolo en el propio hilo de
+        # captura congelaba visiblemente el video (y en casos mas lentos podia
+        # superar watchdog_timeout_s y disparar un reinicio del hilo a medio
+        # reconocimiento). Se despacha a un hilo aparte que solo deja caer el
+        # resultado en esta cola; el bucle principal la revisa sin bloquearse.
+        self._dynamic_result_queue: "queue.Queue[tuple]" = queue.Queue()
+        self._dynamic_classifying: bool = False
+
         self._latencies: deque[float] = deque(maxlen=100)
         self._frame_times: deque[float] = deque(maxlen=30)
         self._hand_counts: deque[int] = deque(maxlen=60)
@@ -574,6 +652,14 @@ class HandTrackingThread(QThread):
         self._stable_letter = None
         self._stable_frames = 0
         self._smoother.reset()
+        if self._auto_segmenter is not None:
+            self._auto_segmenter = AutoSegmenter()
+        self._dynamic_classifying = False
+        while not self._dynamic_result_queue.empty():
+            try:
+                self._dynamic_result_queue.get_nowait()
+            except queue.Empty:
+                break
 
 
     def set_stable_frames_to_commit(self, value: int) -> None:
@@ -597,9 +683,28 @@ class HandTrackingThread(QThread):
     def set_diagnostic_mode(self, enabled: bool) -> None:
         self._diagnostic_mode = bool(enabled)
 
+    def set_dynamic_mode(self, enabled: bool) -> None:
+        self._dynamic_mode = bool(enabled) and self._dtw_recognizer is not None
+        if self._auto_segmenter is not None:
+            self._auto_segmenter = AutoSegmenter()  # descarta cualquier buffer a medias
+        self._dynamic_classifying = False
+        while not self._dynamic_result_queue.empty():
+            try:
+                self._dynamic_result_queue.get_nowait()
+            except queue.Empty:
+                break
+
     @property
     def has_classifier(self) -> bool:
         return self._classifier is not None
+
+    @property
+    def has_dynamic_recognizer(self) -> bool:
+        return self._dtw_recognizer is not None
+
+    @property
+    def dynamic_labels(self) -> list[str]:
+        return self._dtw_recognizer.labels if self._dtw_recognizer is not None else []
 
     # ---- ciclo principal --------------------------------------------------
 
@@ -635,7 +740,9 @@ class HandTrackingThread(QThread):
 
             sign_text = "—"
             sign_conf = 0.0
-            if self._classifier is not None and detections.num_hands > 0:
+            if self._dynamic_mode:
+                sign_text, sign_conf = self._process_dynamic_frame(detections)
+            elif self._classifier is not None and detections.num_hands > 0:
                 hand = next(
                     (h for h in detections.hands if h.handedness == "Right"),
                     detections.hands[0],
@@ -685,6 +792,80 @@ class HandTrackingThread(QThread):
 
             dt = time.perf_counter() - t0
             self._update_metrics(dt, detections.num_hands)
+
+
+    def _process_dynamic_frame(self, detections: FrameDetections) -> tuple[str, float]:
+        """Alfabeto dinamico (J,K,Ñ,Q,X,Z): segmenta con AutoSegmenter y
+        clasifica con DTWRecognizer cuando detecta el fin de una seña.
+
+        Misma convencion de slots que build_dynamic_feature_vector: la
+        primera mano detectada por cada handedness ("Left"/"Right") gana,
+        igual que _update_keypoint_buffer.
+
+        predict_topk() contra cientos de plantillas tarda varios segundos
+        (medido: ~4.5s con 558 plantillas) - demasiado para correrlo aqui
+        mismo, en el hilo que tambien produce el video: lo congelaba de forma
+        visible y, si la clasificacion se alargaba mas de watchdog_timeout_s,
+        el watchdog reiniciaba este hilo a medio reconocimiento. Por eso se
+        despacha a un hilo aparte (_classify_dynamic_sequence) que solo deja
+        el resultado en _dynamic_result_queue; este metodo la revisa primero,
+        sin bloquearse, antes de seguir con el frame actual.
+        """
+        assert self._auto_segmenter is not None and self._dtw_recognizer is not None
+
+        try:
+            letter, conf, topk = self._dynamic_result_queue.get_nowait()
+        except queue.Empty:
+            pass
+        else:
+            self._dynamic_classifying = False
+            if self._diagnostic_mode:
+                self.sign_diagnostic_signal.emit(topk)
+            if conf >= self._dynamic_min_confidence:
+                self.letter_committed_signal.emit(letter)
+                self._last_committed_label = letter
+            return (letter, conf)
+
+        hands_by_side: dict[str, HandDetection] = {}
+        for h in detections.hands:
+            if h.handedness not in hands_by_side:
+                hands_by_side[h.handedness] = h
+
+        vector = build_dynamic_feature_vector(hands_by_side)
+        event = self._auto_segmenter.push(bool(hands_by_side), vector, time.perf_counter())
+
+        if event is None:
+            if self._dynamic_classifying:
+                return ("clasificando…", 0.0)
+            return ("grabando…" if self._auto_segmenter.state == "grabando" else "...", 0.0)
+
+        kind, sequence = event
+        if kind == "inicio":
+            return ("grabando…", 0.0)
+        if kind == "fin_descartada":
+            return ("...", 0.0)
+
+        # kind == "fin_valida": clasificar en segundo plano, sin bloquear.
+        self._dynamic_classifying = True
+        threading.Thread(
+            target=self._classify_dynamic_sequence, args=(sequence,), daemon=True
+        ).start()
+        return ("clasificando…", 0.0)
+
+    def _classify_dynamic_sequence(self, sequence: list[np.ndarray]) -> None:
+        """Corre en un hilo aparte (no QThread): solo hace la clasificacion y
+        deja el resultado en una queue.Queue, que es segura entre hilos y no
+        involucra el mecanismo de senales/slots de Qt (HandTrackingThread.run
+        es un bucle propio, no QThread.exec(), asi que una senal emitida
+        desde otro hilo aqui no se entregaria de forma confiable)."""
+        assert self._dtw_recognizer is not None
+        try:
+            topk = self._dtw_recognizer.predict_topk(sequence, k=3)
+        except Exception as e:
+            log.exception("Error en DTWRecognizer: %s", e)
+            return
+        letter, conf = topk[0]
+        self._dynamic_result_queue.put((letter, conf, topk))
 
 
     def _init_mediapipe(self) -> bool:
@@ -894,6 +1075,7 @@ class SignLanguageApp(QMainWindow):
         self._watchdog_active = False
 
         self._available_cameras: list[int] = []
+        self._dynamic_mode_enabled = False
 
         self.setWindowTitle(f"Traductor LSM v{APP_VERSION}")
         self.setMinimumSize(QSize(1100, 720))
@@ -924,6 +1106,18 @@ class SignLanguageApp(QMainWindow):
         self.action_stop.triggered.connect(self.stop_system)
         self.action_stop.setEnabled(False)
         toolbar.addAction(self.action_stop)
+
+        toolbar.addSeparator()
+
+        self.action_dynamic_mode = QAction("🤟 Alfabeto dinámico (J K Ñ Q X Z)", self)
+        self.action_dynamic_mode.setCheckable(True)
+        self.action_dynamic_mode.setShortcut(QKeySequence("Ctrl+D"))
+        self.action_dynamic_mode.setToolTip(
+            "Alterna entre el alfabeto estático (A-Y, frame a frame) y el\n"
+            "alfabeto dinámico (J,K,Ñ,Q,X,Z, señas con movimiento)."
+        )
+        self.action_dynamic_mode.toggled.connect(self._on_toggle_dynamic_mode)
+        toolbar.addAction(self.action_dynamic_mode)
 
         toolbar.addSeparator()
 
@@ -1162,15 +1356,29 @@ class SignLanguageApp(QMainWindow):
         models_dir = Path(__file__).resolve().parent
         onnx_path = models_dir / MODEL_FILENAME
         labels_path = models_dir / LABELS_FILENAME
+
+        dynamic_dir = models_dir / "datos_dinamicas"
+        dynamic_available = (
+            AutoSegmenter is not None and DTWRecognizer is not None
+            and dynamic_dir.is_dir() and any(dynamic_dir.iterdir())
+        )
+        dynamic_line = (
+            "Alfabeto dinámico (J,K,Ñ,Q,X,Z) disponible: Ctrl+D para activarlo."
+            if dynamic_available else
+            "Alfabeto dinámico no disponible (faltan plantillas o fastdtw/scipy)."
+        )
+
         if onnx_path.exists() and labels_path.exists():
             return (
                 "Clasificador LSM activo (alfabeto, 21 letras estáticas).\n"
                 "Mantén una seña ~12 frames para fijar la letra.\n"
-                "Baja las manos ~25 frames para insertar un espacio."
+                "Baja las manos ~25 frames para insertar un espacio.\n"
+                f"{dynamic_line}"
             )
         return (
             "Sin modelo de clasificación cargado.\n"
-            f"Coloca {MODEL_FILENAME} y {LABELS_FILENAME} en:\n{models_dir}"
+            f"Coloca {MODEL_FILENAME} y {LABELS_FILENAME} en:\n{models_dir}\n"
+            f"{dynamic_line}"
         )
 
 
@@ -1216,6 +1424,7 @@ class SignLanguageApp(QMainWindow):
         self.ai_thread.set_min_confidence(self.min_confidence_slider.value() / 100.0)
         self.ai_thread.set_min_margin(self.min_margin_slider.value() / 100.0)
         self.ai_thread.set_diagnostic_mode(self.cb_diagnostic.isChecked())
+        self._apply_pending_dynamic_mode()
 
         self.camera_thread.error_signal.connect(self._on_camera_error)
         self.camera_thread.status_signal.connect(lambda s: self.status_camera.setText(f"● {s}"))
@@ -1276,6 +1485,7 @@ class SignLanguageApp(QMainWindow):
         self.ai_thread.set_min_confidence(self.min_confidence_slider.value() / 100.0)
         self.ai_thread.set_min_margin(self.min_margin_slider.value() / 100.0)
         self.ai_thread.set_diagnostic_mode(self.cb_diagnostic.isChecked())
+        self._apply_pending_dynamic_mode()
         self.ai_thread.start()
         self._last_heartbeat = time.time()
         self.statusBar().showMessage("IA reiniciada por inactividad", 3000)
@@ -1284,6 +1494,44 @@ class SignLanguageApp(QMainWindow):
     def _on_threshold_changed(self, value: int) -> None:
         self.threshold_value_label.setText(f"{value}%")
         self.cfg.min_detection_confidence = value / 100.0
+
+    def _warn_dynamic_unavailable(self) -> None:
+        QMessageBox.warning(
+            self, "Alfabeto dinámico no disponible",
+            "No se encontraron plantillas dinámicas (datos_dinamicas/) o "
+            "falta instalar fastdtw/scipy.\n\n"
+            "Corre recolector_dinamico.py o procesar_dataset_dinamico.py, "
+            "y revisa la consola al iniciar la app para más detalle.",
+        )
+        self._dynamic_mode_enabled = False
+        self.action_dynamic_mode.blockSignals(True)
+        self.action_dynamic_mode.setChecked(False)
+        self.action_dynamic_mode.blockSignals(False)
+
+    def _on_toggle_dynamic_mode(self, checked: bool) -> None:
+        # Solo podemos saber si el reconocedor dinamico esta disponible una
+        # vez que existe ai_thread (se crea al Iniciar). Si todavia no existe,
+        # guardamos la preferencia y se valida/aplica en start_system() via
+        # _apply_pending_dynamic_mode().
+        if checked and self.ai_thread is not None and not self.ai_thread.has_dynamic_recognizer:
+            self._warn_dynamic_unavailable()
+            return
+
+        self._dynamic_mode_enabled = checked
+        if self.ai_thread is not None:
+            self.ai_thread.set_dynamic_mode(checked)
+        if checked:
+            labels = self.ai_thread.dynamic_labels if self.ai_thread is not None else []
+            self.statusBar().showMessage(f"Modo dinámico activo ({', '.join(labels)})", 4000)
+        else:
+            self.statusBar().showMessage("Modo estático activo (alfabeto A-Y)", 3000)
+
+    def _apply_pending_dynamic_mode(self) -> None:
+        assert self.ai_thread is not None
+        if self._dynamic_mode_enabled and not self.ai_thread.has_dynamic_recognizer:
+            self._warn_dynamic_unavailable()
+            return
+        self.ai_thread.set_dynamic_mode(self._dynamic_mode_enabled)
 
     def _on_draw_landmarks(self, checked: bool) -> None:
         self.cfg.draw_landmarks = checked
