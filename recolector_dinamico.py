@@ -18,7 +18,14 @@ Uso:
 Controles:
     mantener 'g'  -> graba la secuencia mientras se sostiene
     n             -> termina la sena actual y pide una nueva
-    q / ESC       -> sale del programa (no durante una grabacion activa)
+    ESC           -> sale del programa (no durante una grabacion activa)
+    /salir        -> sale del programa (escrito en el prompt de texto)
+
+Nota: el comando para salir del prompt de sena es "/salir", con diagonal, a
+proposito. Las etiquetas aqui son justo las letras dinamicas (J, K, Ñ, Q, X,
+Z), y "Q" en mayusculas o minusculas es una de ellas: un comando de un solo
+caracter como "q" jamas puede usarse para salir sin bloquear esa letra. La
+diagonal inicial nunca puede aparecer en una etiqueta normalizada.
 """
 from __future__ import annotations
 
@@ -42,6 +49,11 @@ RECORD_KEY = ord('g')
 RELEASE_TIMEOUT_S = 0.4
 MIN_FRAMES = 3
 RECOMMENDED_SAMPLES = (3, 5)
+
+# Comando para terminar el programa desde el prompt de texto. Con diagonal a
+# proposito: nunca puede coincidir con una etiqueta real (J, K, Ñ, Q, X, Z u
+# otra letra/palabra que se agregue despues), a diferencia de "q" a secas.
+EXIT_COMMAND = "/salir"
 
 
 def init_hand_landmarker(max_num_hands: int = 2):
@@ -149,15 +161,27 @@ def main() -> int:
 
     try:
         while True:
-            word = input("\nSena a grabar ('q' para salir): ").strip()
-            if word.lower() in ("q", "salir", "exit"):
+            # Normalizacion de la etiqueta: strip() + upper(). El comando de
+            # salida se compara ANTES de decidir si esta vacia, y en
+            # minusculas para aceptar "/salir", "/SALIR", etc.
+            raw = input(f"\nSena a grabar ('{EXIT_COMMAND}' para salir): ")
+            candidate = raw.strip()
+            if candidate.lower() == EXIT_COMMAND:
                 break
-            if not word:
+            if not candidate:
+                print("  (etiqueta vacia, se ignora)")
                 continue
+            word = candidate.upper()
+            print(f"Grabando '{word}'.")
 
             word_dir = OUTPUT_ROOT / word
+            if OUTPUT_ROOT.is_dir() and not word_dir.is_dir():
+                carpetas = sorted(p.name for p in OUTPUT_ROOT.iterdir() if p.is_dir())
+                print(f"  aviso: no existe todavia datos_dinamicas/{word}/ (carpetas actuales: {carpetas}); "
+                      f"se creara nueva.")
+
             existing_n = len(list(word_dir.glob("muestra_*.json"))) if word_dir.exists() else 0
-            print(f"Grabando '{word}'. Manten 'g' presionada durante toda la sena.")
+            print(f"Manten 'g' presionada durante toda la sena.")
             print(f"Con {RECOMMENDED_SAMPLES[0]}-{RECOMMENDED_SAMPLES[1]} repeticiones basta, no grabes de mas.")
 
             recording = False
@@ -210,14 +234,15 @@ def main() -> int:
                 color = (0, 0, 255) if recording else (102, 255, 102)
                 cv2.putText(display, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
                 cv2.putText(display, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1, cv2.LINE_AA)
-                cv2.putText(display, "manten 'g'=grabar  n=nueva sena  q=salir", (10, 60),
+                cv2.putText(display, "manten 'g'=grabar  n=nueva sena  ESC=salir", (10, 60),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
 
                 cv2.imshow(window, display)
 
                 if key == ord('n') and not recording:
                     break
-                if key in (ord('q'), 27) and not recording:
+                # ESC. 'q' ya no sale: es una etiqueta valida (letra Q).
+                if key == 27 and not recording:
                     quit_all = True
                     break
 
