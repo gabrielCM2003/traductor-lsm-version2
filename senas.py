@@ -81,6 +81,16 @@ DYN_NO_HAND_MS_TO_END = 700
 # Tope duro: si el usuario no baja la mano, no seguir grabando para siempre.
 DYN_MAX_SEQUENCE_MS = 5000
 
+# Letras que SI se dejan comprometer a la palabra. En evaluacion, K, Q y Z
+# resultaron poco confiables (Z en particular "absorbe" predicciones que
+# deberian ser K o Q): mejor no agregar nada a que se agregue una letra
+# equivocada. Las que queden fuera de este conjunto se siguen clasificando y
+# aparecen en el top-3 (para poder seguir evaluando/afinando), solo que nunca
+# se comprometen. Para restaurar las seis letras, descomentar la linea de
+# abajo (o simplemente igualar DYN_COMMIT_LETTERS a las seis).
+DYN_COMMIT_LETTERS = {"J", "Ñ", "X"}
+# DYN_COMMIT_LETTERS = {"J", "K", "Ñ", "Q", "X", "Z"}  # las seis, sin restriccion
+
 # DTWRecognizer.try_load() tarda ~2s en parsear las plantillas de
 # datos_dinamicas/ (cientos de JSON). HandTrackingThread se recrea cada vez
 # que el watchdog reinicia la IA por inactividad, y eso pasaba en el hilo de
@@ -589,22 +599,37 @@ def build_dynamic_feature_vector(hands: dict[str, "HandDetection"]) -> np.ndarra
     return vec
 
 
+def is_experimental_dynamic_letter(letter: str) -> bool:
+    """True si `letter` quedo fuera de DYN_COMMIT_LETTERS: se sigue
+    clasificando y mostrando en el top-3 (para poder seguir evaluandola),
+    pero nunca se compromete a la palabra."""
+    return letter not in DYN_COMMIT_LETTERS
+
+
 def dynamic_commit_decision(topk: list[tuple[str, float]]) -> tuple[bool, float]:
     """Decide si el top-1 de una clasificacion dinamica se compromete o no.
 
-    Regla (ver DYN_MIN_CONF / DYN_MIN_MARGIN al inicio del archivo): se
-    compromete solo si la confianza del top-1 alcanza DYN_MIN_CONF Y ademas
-    el margen sobre el top-2 (confianza_1 - confianza_2) alcanza
-    DYN_MIN_MARGIN. Se centraliza aqui para que _process_dynamic_frame (que
-    decide si se agrega la letra) y _on_diagnostic_update en la GUI (que solo
-    explica por que no se agrego) usen exactamente el mismo criterio.
+    Regla: primero, la letra tiene que estar en DYN_COMMIT_LETTERS (ver
+    constante al inicio del archivo) - K, Q y Z quedaron fuera tras la
+    evaluacion (poco confiables, Z en particular absorbe predicciones que
+    deberian ser K o Q) y jamas se comprometen, sin importar la confianza.
+    Para las que si estan habilitadas, ademas se exige que la confianza del
+    top-1 alcance DYN_MIN_CONF Y que el margen sobre el top-2
+    (confianza_1 - confianza_2) alcance DYN_MIN_MARGIN.
+
+    Se centraliza aqui para que _process_dynamic_frame (que decide si se
+    agrega la letra) y _on_diagnostic_update en la GUI (que solo explica por
+    que no se agrego) usen exactamente el mismo criterio.
 
     Devuelve (se_compromete, margen).
     """
     if not topk:
         return False, 0.0
+    letra1 = topk[0][0]
     conf1 = topk[0][1]
     margin = conf1 - topk[1][1] if len(topk) > 1 else conf1
+    if is_experimental_dynamic_letter(letra1):
+        return False, margin
     should_commit = conf1 >= DYN_MIN_CONF and margin >= DYN_MIN_MARGIN
     return should_commit, margin
 
@@ -949,6 +974,13 @@ class HandTrackingThread(QThread):
                 self._last_committed_label = letter
                 self._dynamic_idle_text = f"{letter} ({conf * 100:.0f}%)"
                 log.info("[dinamico] top-3: %s -> agregada (margen=%.1fpp)", top_str, margin * 100)
+            elif is_experimental_dynamic_letter(letter):
+                # K, Q y Z (fuera de DYN_COMMIT_LETTERS): se siguen mostrando
+                # en el top-3 para poder seguir evaluandolas, pero nunca se
+                # comprometen sin importar la confianza.
+                self._dynamic_idle_text = f"¿{letter}? ({conf * 100:.0f}%) - modo experimental, no se agregó"
+                log.info("[dinamico] top-3: %s -> NO agregada (modo experimental: '%s' no esta en %s)",
+                          top_str, letter, sorted(DYN_COMMIT_LETTERS))
             else:
                 self._dynamic_idle_text = f"¿{letter}? ({conf * 100:.0f}%) - no agregada"
                 motivos = []
@@ -1788,6 +1820,8 @@ class SignLanguageApp(QMainWindow):
             should_commit, margin = dynamic_commit_decision(topk)
             if should_commit:
                 lines.append(f"→ agregada (margen {margin * 100:.1f}pp)")
+            elif is_experimental_dynamic_letter(topk[0][0]):
+                lines.append("→ modo experimental, no se agregó")
             else:
                 lines.append("→ baja confianza, no se agregó")
             self.diagnostic_label.show()
