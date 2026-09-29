@@ -81,15 +81,28 @@ DYN_NO_HAND_MS_TO_END = 700
 # Tope duro: si el usuario no baja la mano, no seguir grabando para siempre.
 DYN_MAX_SEQUENCE_MS = 5000
 
-# Letras que SI se dejan comprometer a la palabra. En evaluacion, K, Q y Z
-# resultaron poco confiables (Z en particular "absorbe" predicciones que
-# deberian ser K o Q): mejor no agregar nada a que se agregue una letra
-# equivocada. Las que queden fuera de este conjunto se siguen clasificando y
-# aparecen en el top-3 (para poder seguir evaluando/afinando), solo que nunca
-# se comprometen. Para restaurar las seis letras, descomentar la linea de
-# abajo (o simplemente igualar DYN_COMMIT_LETTERS a las seis).
+# Letras que usan la regla NORMAL de commit (DYN_MIN_CONF / DYN_MIN_MARGIN
+# de arriba). En evaluacion, K, Q y Z resultaron poco confiables en confianza
+# absoluta (las 6 clases quedan muy juntas en distancia DTW: ninguna de esas
+# tres cruzo nunca ~45%, aunque el top-1 fuera correcto), asi que
+# DYN_MIN_CONF=0.55 las bloqueaba siempre, acertaran o no. Para restaurar las
+# seis letras bajo la regla normal, descomentar la linea de abajo (o igualar
+# DYN_COMMIT_LETTERS a las seis).
 DYN_COMMIT_LETTERS = {"J", "Ñ", "X"}
 # DYN_COMMIT_LETTERS = {"J", "K", "Ñ", "Q", "X", "Z"}  # las seis, sin restriccion
+
+# Regla EXPERIMENTAL para las letras fuera de DYN_COMMIT_LETTERS (K, Q, Z):
+# en vez de bloquearlas siempre, se dejan comprometer si el MARGEN sobre el
+# 2.º lugar es lo bastante grande, aunque la confianza absoluta del top-1 no
+# alcance DYN_MIN_CONF. Es lo que de verdad distingue un acierto solido de
+# una adivinanza para estas tres: en evaluacion real, K/Q/Z con margen >15pp
+# resultaron ser el top-1 correcto, mientras que con margen <2pp era
+# practicamente un empate entre las 6 clases (ej. K 29.8% vs Z 28.2%, margen
+# 1.6pp, dudoso; K 38.9% vs Z 23.5%, margen 15.4pp, solido). DYN_EXPERIMENTAL_
+# MIN_CONF es solo un piso de cordura (no aceptar un top-1 absurdamente bajo
+# aunque el margen diera grande por casualidad), no el criterio principal.
+DYN_EXPERIMENTAL_MIN_MARGIN = 0.12
+DYN_EXPERIMENTAL_MIN_CONF = 0.30
 
 # DTWRecognizer.try_load() tarda ~2s en parsear las plantillas de
 # datos_dinamicas/ (cientos de JSON). HandTrackingThread se recrea cada vez
@@ -600,38 +613,46 @@ def build_dynamic_feature_vector(hands: dict[str, "HandDetection"]) -> np.ndarra
 
 
 def is_experimental_dynamic_letter(letter: str) -> bool:
-    """True si `letter` quedo fuera de DYN_COMMIT_LETTERS: se sigue
-    clasificando y mostrando en el top-3 (para poder seguir evaluandola),
-    pero nunca se compromete a la palabra."""
+    """True si `letter` quedo fuera de DYN_COMMIT_LETTERS: usa la regla
+    EXPERIMENTAL de margen (DYN_EXPERIMENTAL_MIN_MARGIN/MIN_CONF) en vez de
+    la regla normal (DYN_MIN_CONF/MIN_MARGIN)."""
     return letter not in DYN_COMMIT_LETTERS
 
 
-def dynamic_commit_decision(topk: list[tuple[str, float]]) -> tuple[bool, float]:
+def dynamic_commit_decision(topk: list[tuple[str, float]]) -> tuple[bool, float, bool]:
     """Decide si el top-1 de una clasificacion dinamica se compromete o no.
 
-    Regla: primero, la letra tiene que estar en DYN_COMMIT_LETTERS (ver
-    constante al inicio del archivo) - K, Q y Z quedaron fuera tras la
-    evaluacion (poco confiables, Z en particular absorbe predicciones que
-    deberian ser K o Q) y jamas se comprometen, sin importar la confianza.
-    Para las que si estan habilitadas, ademas se exige que la confianza del
-    top-1 alcance DYN_MIN_CONF Y que el margen sobre el top-2
-    (confianza_1 - confianza_2) alcance DYN_MIN_MARGIN.
+    Dos reglas segun la letra (ver constantes al inicio del archivo):
+      - En DYN_COMMIT_LETTERS (J, Ñ, X): regla normal, exige que la
+        confianza del top-1 alcance DYN_MIN_CONF Y que el margen sobre el
+        top-2 (confianza_1 - confianza_2) alcance DYN_MIN_MARGIN.
+      - Fuera de DYN_COMMIT_LETTERS (K, Q, Z): regla EXPERIMENTAL. Su
+        confianza absoluta nunca cruza ~45% aunque el top-1 sea correcto (las
+        6 clases quedan muy juntas en distancia DTW), asi que DYN_MIN_CONF
+        las bloquearia siempre. Lo que si distingue un acierto solido de una
+        adivinanza para estas tres es el MARGEN sobre el 2.º lugar: se dejan
+        comprometer si ese margen supera DYN_EXPERIMENTAL_MIN_MARGIN, con
+        DYN_EXPERIMENTAL_MIN_CONF como piso minimo de cordura (no la
+        condicion principal).
 
     Se centraliza aqui para que _process_dynamic_frame (que decide si se
     agrega la letra) y _on_diagnostic_update en la GUI (que solo explica por
     que no se agrego) usen exactamente el mismo criterio.
 
-    Devuelve (se_compromete, margen).
+    Devuelve (se_compromete, margen, via_regla_experimental).
     """
     if not topk:
-        return False, 0.0
+        return False, 0.0, False
     letra1 = topk[0][0]
     conf1 = topk[0][1]
     margin = conf1 - topk[1][1] if len(topk) > 1 else conf1
+
     if is_experimental_dynamic_letter(letra1):
-        return False, margin
+        should_commit = conf1 >= DYN_EXPERIMENTAL_MIN_CONF and margin >= DYN_EXPERIMENTAL_MIN_MARGIN
+        return should_commit, margin, should_commit
+
     should_commit = conf1 >= DYN_MIN_CONF and margin >= DYN_MIN_MARGIN
-    return should_commit, margin
+    return should_commit, margin, False
 
 
 # =========================================================================== #
@@ -966,21 +987,39 @@ class HandTrackingThread(QThread):
         else:
             self._dynamic_classifying = False
             self.sign_diagnostic_signal.emit(topk)
-            should_commit, margin = dynamic_commit_decision(topk)
+            should_commit, margin, via_experimental = dynamic_commit_decision(topk)
             top_str = "  ".join(f"{w} {c * 100:.1f}%" for w, c in topk)
 
-            if should_commit:
+            if should_commit and via_experimental:
+                # K, Q o Z comprometida por la regla EXPERIMENTAL de margen
+                # (ver dynamic_commit_decision): se etiqueta distinto para que
+                # quede claro que no vino de la regla normal de confianza.
+                self.letter_committed_signal.emit(letter)
+                self._last_committed_label = letter
+                self._dynamic_idle_text = f"{letter} {conf * 100:.1f}% (margen alto)"
+                log.info(
+                    "[dinamico] top-3: %s -> agregada por regla EXPERIMENTAL (margen=%.1fpp >= %.0fpp)",
+                    top_str, margin * 100, DYN_EXPERIMENTAL_MIN_MARGIN * 100,
+                )
+            elif should_commit:
                 self.letter_committed_signal.emit(letter)
                 self._last_committed_label = letter
                 self._dynamic_idle_text = f"{letter} ({conf * 100:.0f}%)"
                 log.info("[dinamico] top-3: %s -> agregada (margen=%.1fpp)", top_str, margin * 100)
             elif is_experimental_dynamic_letter(letter):
-                # K, Q y Z (fuera de DYN_COMMIT_LETTERS): se siguen mostrando
-                # en el top-3 para poder seguir evaluandolas, pero nunca se
-                # comprometen sin importar la confianza.
+                # K, Q y Z (fuera de DYN_COMMIT_LETTERS): no alcanzaron el
+                # margen de la regla experimental. Se siguen mostrando en el
+                # top-3 para poder seguir evaluandolas.
                 self._dynamic_idle_text = f"¿{letter}? ({conf * 100:.0f}%) - modo experimental, no se agregó"
-                log.info("[dinamico] top-3: %s -> NO agregada (modo experimental: '%s' no esta en %s)",
-                          top_str, letter, sorted(DYN_COMMIT_LETTERS))
+                motivos = []
+                if conf < DYN_EXPERIMENTAL_MIN_CONF:
+                    motivos.append(f"confianza {conf * 100:.1f}% < {DYN_EXPERIMENTAL_MIN_CONF * 100:.0f}%")
+                if margin < DYN_EXPERIMENTAL_MIN_MARGIN:
+                    motivos.append(f"margen {margin * 100:.1f}pp < {DYN_EXPERIMENTAL_MIN_MARGIN * 100:.0f}pp")
+                log.info(
+                    "[dinamico] top-3: %s -> NO agregada (modo experimental, %s)",
+                    top_str, "; ".join(motivos) or "umbral no alcanzado",
+                )
             else:
                 self._dynamic_idle_text = f"¿{letter}? ({conf * 100:.0f}%) - no agregada"
                 motivos = []
@@ -1817,8 +1856,10 @@ class SignLanguageApp(QMainWindow):
             # se agrego la letra o no y por que, con el mismo criterio
             # (dynamic_commit_decision) que usa HandTrackingThread para
             # decidir el commit real.
-            should_commit, margin = dynamic_commit_decision(topk)
-            if should_commit:
+            should_commit, margin, via_experimental = dynamic_commit_decision(topk)
+            if should_commit and via_experimental:
+                lines.append(f"→ agregada por regla experimental (margen {margin * 100:.1f}pp)")
+            elif should_commit:
                 lines.append(f"→ agregada (margen {margin * 100:.1f}pp)")
             elif is_experimental_dynamic_letter(topk[0][0]):
                 lines.append("→ modo experimental, no se agregó")
