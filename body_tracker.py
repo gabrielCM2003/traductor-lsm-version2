@@ -84,6 +84,15 @@ MIN_SHOULDER_WIDTH_PX = 20.0
 # menos de esta fraccion del ancho de hombros de la muneca que estima la pose.
 HAND_MATCH_MAX_DIST = 0.6
 
+# Linea de reposo para segmentar PALABRAS (segmentador_automatico.py --modo
+# palabras): una mano con la muneca por DEBAJO de esta linea se considera en
+# reposo (no esta senando), aunque siga en cuadro. Va en anchos de hombro bajo
+# el centro de los hombros, para que no dependa de la distancia a la camara:
+# 1.3 anchos cae mas o menos a la altura del ombligo, por debajo de las senas
+# mas bajas (las del estomago). Si en la practica corta senas bajas, subirlo.
+REST_LINE_SHOULDER_WIDTHS = 1.3
+REST_LINE_COLOR = (255, 200, 0)   # azul claro (BGR)
+
 # Bloque de ubicacion: 4 por mano (slots Left, Right) + 1 bandera de cuerpo.
 N_BODY_FEATURES_PER_HAND = 4
 N_BODY_FEATURES = 2 * N_BODY_FEATURES_PER_HAND + 1
@@ -228,6 +237,37 @@ class BodyTracker:
         self._landmarker.close()
 
 
+def rest_line_y(body: Optional[BodyDetection], frame_w: int, frame_h: int) -> Optional[float]:
+    """Altura en pixeles de la linea de reposo (ver REST_LINE_SHOULDER_WIDTHS),
+    o None si no se ven los hombros. Puede quedar por debajo de la imagen
+    (persona cerca de la camara): entonces una mano en reposo simplemente
+    sale de cuadro, que tambien cuenta como reposo."""
+    if body is None or not body.visible(LEFT_SHOULDER, RIGHT_SHOULDER):
+        return None
+    pts = body.image_xyz[:, :2] * np.array([frame_w, frame_h], dtype=np.float32)
+    shoulder_width = float(np.linalg.norm(pts[LEFT_SHOULDER] - pts[RIGHT_SHOULDER]))
+    if shoulder_width < MIN_SHOULDER_WIDTH_PX:
+        return None
+    shoulder_y = float(pts[LEFT_SHOULDER, 1] + pts[RIGHT_SHOULDER, 1]) / 2.0
+    return shoulder_y + REST_LINE_SHOULDER_WIDTHS * shoulder_width
+
+
+def hands_in_signing_space(
+    hands: Iterable[Any],
+    body: Optional[BodyDetection],
+    frame_w: int,
+    frame_h: int,
+) -> Optional[bool]:
+    """True si alguna mano detectada tiene la muneca por encima de la linea de
+    reposo (esta senando); False si todas estan por debajo o no hay ninguna;
+    None si no se ven los hombros, para que el llamador decida (el segmentador
+    vuelve al criterio de siempre: hay mano o no)."""
+    line_y = rest_line_y(body, frame_w, frame_h)
+    if line_y is None:
+        return None
+    return any(hand.landmarks_2d[0, 1] * frame_h < line_y for hand in hands)
+
+
 def body_location_features(
     hands: Mapping[str, Any],
     body: Optional[BodyDetection],
@@ -367,6 +407,19 @@ def draw_body_skeleton(image: np.ndarray, body: BodyDetection, hands: Iterable[A
     for mid in (shoulder_mid, mouth_mid):
         if mid is not None:
             cv2.drawMarker(image, pt(mid), REFERENCE_COLOR, cv2.MARKER_CROSS, 14, 2, cv2.LINE_AA)
+
+
+def draw_rest_line(image: np.ndarray, body: Optional[BodyDetection]) -> None:
+    """Linea de reposo punteada, con su etiqueta, si cae dentro de la imagen."""
+    h, w = image.shape[:2]
+    line_y = rest_line_y(body, w, h)
+    if line_y is None or not 0 <= line_y < h:
+        return
+    y = int(line_y)
+    for x in range(0, w, 24):
+        cv2.line(image, (x, y), (min(x + 12, w - 1), y), REST_LINE_COLOR, 2, cv2.LINE_AA)
+    cv2.putText(image, "reposo", (w - 80, y - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3, cv2.LINE_AA)
+    cv2.putText(image, "reposo", (w - 80, y - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, REST_LINE_COLOR, 1, cv2.LINE_AA)
 
 
 def draw_body_status(image: np.ndarray, body_ok: bool, origin: tuple[int, int] = (10, 90)) -> None:

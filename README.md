@@ -20,13 +20,14 @@ El repositorio incluye también la documentación del **guante instrumentado** d
 | `senas.py` | Aplicación (PyQt6): cámara, MediaPipe, clasificación estática y dinámica, interfaz y voz |
 | `sign_classifier.py` | Clasificador ONNX del alfabeto estático, suavizado de predicciones y confirmación de letras y espacios |
 | `dtw_recognizer.py` | Reconocedor DTW del alfabeto dinámico (J, K, Ñ, Q, X, Z) |
-| `segmentador_automatico.py` | Máquina de estados que detecta inicio/fin de una seña dinámica sin tecla |
+| `segmentador_automatico.py` | Detecta solo, sin tecla, dónde empieza y termina una seña, y la reconoce o la graba como muestra (`--grabar`). Letras: mientras haya mano. Palabras (`--modo palabras`): mientras una mano esté sobre la línea de reposo, usando la pose |
 | `body_tracker.py` | Esqueleto del cuerpo (MediaPipe Pose) y ubicación de las manos respecto a hombros y boca (9 valores aparte del vector de 126) |
 | `recolector_estatico.py`, `recolector_dinamico.py` | Herramientas para grabar vocabulario nuevo (letras o palabras), con la ubicación respecto al cuerpo |
 | `entrenar_palabras.py`, `word_classifier.py`, `lsm_words.onnx`, `word_labels.json` | Entrenamiento y clasificador de palabras. El modelo incluido es solo de prueba (datos sintéticos, no reconoce palabras reales; ver `ESTADO_PROYECTO_COMPLETO.md`) |
 | `procesar_dataset_dinamico.py`, `extraer_landmarks_crudos.py`, `verificar_landmarks_crudos.py` | Conversión del dataset CICESE a plantillas y respaldo de landmarks crudos |
 | `evaluar_*.py`, `diagnostico_orientacion.py`, `separar_muestras_cortas.py`, `probar_modelos.py` | Herramientas de evaluación y limpieza de datos usadas para medir el alfabeto dinámico |
 | `datos_dinamicas/` | Plantillas DTW del alfabeto dinámico (dataset CICESE procesado) |
+| `datos_palabras_dinamicas/` | Muestras de palabras con movimiento grabadas con el segmentador. Van aparte porque el DTW toma cada subcarpeta como una clase; mezcladas con las letras, las confundiría |
 | `lsm_alphabet.onnx`, `lsm_alphabet.onnx.data` | Modelo entrenado del alfabeto estático (red pequeña, 63 entradas: 21 puntos × 3) |
 | `lsm_labels.json` | Etiquetas del modelo estático y tipo de normalización |
 | `tests/` | Pruebas unitarias del alfabeto estático |
@@ -49,7 +50,7 @@ pip install -r requirements.txt
 
 En macOS, `requirements.txt` evita mediapipe 1.0.1, que se cae al iniciar los detectores en Mac.
 
-En Raspberry Pi con la cámara oficial, instala además Picamera2 con `sudo apt install python3-picamera2` y crea el entorno virtual con `--system-site-packages`. Para la voz en Linux: `sudo apt install espeak-ng` (macOS usa `say`, que ya viene instalado).
+En Raspberry Pi con la cámara oficial, instala además Picamera2 con `sudo apt install python3-picamera2` y crea el entorno virtual con `--system-site-packages`. Para la voz en Linux: `sudo apt install espeak-ng`. macOS usa `say` y Windows la voz del sistema (System.Speech por PowerShell), que ya vienen instalados.
 
 ## Uso
 
@@ -75,6 +76,20 @@ Ejemplo:
 python senas.py --camera 1 --threshold 0.7
 ```
 
+Si la mano se acerca demasiado a la cámara, el video muestra un aviso: MediaPipe sigue la mano mientras no la pierda, pero una vez perdida no la puede volver a detectar si ocupa ~80% de la imagen o más.
+
+### Grabar vocabulario sin tecla
+
+`segmentador_automatico.py` detecta solo cada seña y, con `--grabar`, la guarda como muestra (manos, ubicación respecto al cuerpo y datos crudos):
+
+```bash
+python segmentador_automatico.py --modo palabras --grabar HOLA   # sube las manos, haz la seña, bájalas
+python segmentador_automatico.py --grabar J                      # letras: la seña dura mientras haya mano
+python segmentador_automatico.py --modo palabras                 # reconocer contra las palabras grabadas
+```
+
+En modo palabras, la seña termina al bajar las manos por debajo de la línea de reposo punteada, sin sacarlas de cuadro. En la ventana, `d` descarta la última muestra (la mueve a `datos_descartados/`) y `ESC` sale. Las letras se siguen cortando como las plantillas del dataset CICESE (del primer al último frame con mano), para que coincidan con ellas.
+
 ### Atajos de teclado
 
 | Atajo (en macOS, Cmd en lugar de Ctrl) | Acción |
@@ -83,10 +98,12 @@ python senas.py --camera 1 --threshold 0.7
 | Ctrl+D | Alternar entre alfabeto estático y dinámico |
 | Retroceso | Borrar la última letra |
 | Ctrl+Retroceso | Borrar la palabra |
-| Enter | Terminar la palabra (espacio) |
+| Enter o Ctrl+Espacio | Terminar la palabra (espacio) |
 | Ctrl+S | Guardar captura |
 
-Para repetir una letra (LL, RR, EE), relaja la mano un instante y vuelve a hacerla.
+Para repetir una letra (LL, RR, EE), relaja la mano un instante (o bájala) y vuelve a hacerla.
+
+En el panel lateral, **Mano que deletrea** elige qué mano se clasifica cuando hay dos en cuadro. Con la izquierda, la seña se refleja para compararla con el modelo y las plantillas, que son de la mano derecha. **Leer palabras en voz alta** lee cada palabra al terminarla. Los valores de los sliders y estas opciones se guardan en la configuración.
 
 ## Pruebas
 

@@ -88,8 +88,14 @@ CONFIRM_FORCE_KEY = ord('f')
 
 # Respaldo crudo (landmarks sin normalizar) para el extractor del dataset.
 # Ruta absoluta fuera del proyecto, a proposito: es un dataset compartido con
-# otro trabajo (Dataset_CICESE), no un artefacto de este repo.
-RAW_DATASET_ROOT = Path(r"C:\Proyectos\Dataset_CICESE\propias_crudas")
+# otro trabajo (Dataset_CICESE), no un artefacto de este repo. Fuera de
+# Windows, "C:\..." no es una ruta absoluta: Path la tomaba como el nombre de
+# una carpeta y creaba "C:\Proyectos\Dataset_CICESE\propias_crudas" dentro de
+# la carpeta actual; ahi se usa el equivalente en el home del usuario.
+RAW_DATASET_ROOT = (
+    Path(r"C:\Proyectos\Dataset_CICESE\propias_crudas") if sys.platform == "win32"
+    else Path.home() / "Dataset_CICESE" / "propias_crudas"
+)
 
 # Comando para terminar el programa desde el prompt de texto. Con diagonal a
 # proposito: nunca puede coincidir con una etiqueta real (J, K, Ñ, Q, X, Z u
