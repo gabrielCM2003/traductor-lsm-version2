@@ -1,8 +1,17 @@
-opencv-python
-numpy
-PyQt6<6.8
-mediapipe
-onnxruntime
-py7zr
-fastdtw
+# Traductor LSM — probado con Python 3.11
+#   pip install -r requirements.txt
+numpy>=1.24
+PyQt6>=6.5,<6.8
+mediapipe>=0.10.14
+onnxruntime>=1.16
+# mediapipe ya instala opencv-contrib-python. No añadas también
+# opencv-python: ambos paquetes instalan el módulo cv2 y chocan.
+opencv-contrib-python>=4.8
 scipy
+numba
+py7zr
+
+# Raspberry Pi con cámara CSI (no se instala con pip):
+#   sudo apt install python3-picamera2
+# Voz en Linux / Raspberry Pi (macOS usa `say`, ya incluido):
+#   sudo apt install espeak-ng

@@ -89,13 +89,6 @@ class PredictionSmoother:
         raw_top2 = (top2_letter, top2_conf)
         raw_top3 = topk[2] if len(topk) >= 3 else None
 
-        if not self._preds:
-            return SmoothedPrediction(
-                letter=None, confidence=0.0,
-                raw_top1=raw_top1, raw_top2=raw_top2, raw_top3=raw_top3,
-                margin=margin,
-            )
-
         counter = Counter(p[0] for p in self._preds)
         winner, votes = counter.most_common(1)[0]
 
@@ -122,6 +115,91 @@ class PredictionSmoother:
     @property
     def last_topk(self) -> list[tuple[str, float]]:
         return list(self._last_topk)
+
+
+class LetterCommitter:
+    """Convierte la letra suavizada de cada frame en letras y espacios confirmados.
+
+    - Una letra se confirma tras mantenerse `stable_frames` frames seguidos.
+    - La misma letra no se repite mientras se mantiene la seña; se puede
+      repetir (LL, RR, EE...) si la seña se interrumpe `release_frames` frames.
+    - Si la mano desaparece `hand_lost_reset_frames` frames se pierde el
+      progreso acumulado, y tras `space_frames` se inserta un espacio.
+    """
+
+    SPACE = " "
+
+    def __init__(
+        self,
+        stable_frames: int = 12,
+        release_frames: int = 8,
+        space_frames: int = 25,
+        hand_lost_reset_frames: int = 5,
+    ):
+        self.stable_frames = stable_frames
+        self.release_frames = release_frames
+        self.space_frames = space_frames
+        self.hand_lost_reset_frames = hand_lost_reset_frames
+        self.reset()
+
+    def reset(self, has_letters: bool = False) -> None:
+        self.frames_without_hand = 0
+        self._stable_letter: Optional[str] = None
+        self._stable_count = 0
+        self._last_committed: Optional[str] = None   # bloquea repetirla sin pausa
+        self._release_count = 0
+        self._has_letters = has_letters
+
+    @property
+    def hand_just_lost(self) -> bool:
+        """True solo en el frame en que la ausencia de mano llega al umbral de reset."""
+        return self.frames_without_hand == self.hand_lost_reset_frames
+
+    def update(self, letter: Optional[str], hand_present: bool) -> Optional[str]:
+        """Devuelve la letra confirmada, SPACE, o None si no se confirma nada."""
+        if hand_present:
+            self.frames_without_hand = 0
+        else:
+            letter = None
+            self.frames_without_hand += 1
+            # Una pérdida breve (parpadeo del tracking) conserva el progreso.
+            if self.hand_just_lost:
+                self._stable_letter = None
+                self._stable_count = 0
+
+        if self._last_committed is not None:
+            if letter == self._last_committed:
+                self._release_count = 0
+            else:
+                self._release_count += 1
+                if self._release_count >= self.release_frames:
+                    self._last_committed = None
+
+        if not hand_present:
+            if self.frames_without_hand >= self.space_frames and self._has_letters:
+                self._has_letters = False
+                self._last_committed = None
+                self._stable_letter = None
+                self._stable_count = 0
+                return self.SPACE
+            return None
+
+        if letter is None:
+            self._stable_count = 0
+            return None
+
+        if letter == self._stable_letter:
+            self._stable_count += 1
+        else:
+            self._stable_letter = letter
+            self._stable_count = 1
+
+        if self._stable_count >= self.stable_frames and letter != self._last_committed:
+            self._last_committed = letter
+            self._release_count = 0
+            self._has_letters = True
+            return letter
+        return None
 
 
 # =========================================================================== #
