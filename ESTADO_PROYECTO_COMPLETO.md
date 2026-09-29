@@ -56,6 +56,29 @@ El documento de Code dice: *"ya existe también una primera versión funcional d
   - **Ningún modelo los usa todavía**: `entrenar_palabras.py` sigue leyendo solo `v0..v125`.
   - Probado con una persona real y con movimiento simulado: sin retraso (la pose usa tiempo real, no el contador de +1 ms de las manos) y con los brazos completos aunque los codos queden cerca del borde de la imagen.
 - **Ojo con el CSV de prueba:** `recolector_estatico.py` se niega a escribir en un `dataset_palabras.csv` con las columnas viejas (sin `b0..b8`), para no desalinearlo. Si alguien todavía tiene el CSV mock, hay que renombrarlo o moverlo antes de grabar vocabulario real.
+- **Segmentador con pose y grabación automática (`segmentador_automatico.py`)**:
+  - `--modo palabras`: la seña dura mientras una mano esté sobre la línea de reposo (1.3 anchos de hombro bajo los hombros) y termina al bajarlas, sin sacarlas de cuadro. Probado con escenas simuladas: guarda solo los frames con la mano arriba, no el tramo en reposo.
+  - `--grabar ETIQUETA`: guarda cada seña detectada, con el mismo formato que `recolector_dinamico.py`. Las palabras van a `datos_palabras_dinamicas/`, no a `datos_dinamicas/`, para que el DTW de letras no las tome como clases nuevas.
+  - **Las letras no cambian a propósito:** se siguen cortando mientras haya mano, igual que las plantillas del dataset CICESE (`procesar_dataset_dinamico.py`), que solo tienen los 126 valores de la mano. Cortarlas por pose haría que lo capturado en vivo no se pareciera a las plantillas.
+  - El DTW sigue comparando solo los 126 de la mano, también para palabras. Cuánto pesa la ubicación hay que ajustarlo cuando haya vocabulario grabado.
+  - **Ojo:** `recolector_dinamico.py` sigue guardando cualquier etiqueta en `datos_dinamicas/`. Una palabra grabada ahí aparecería como una letra más en el modo dinámico de `senas.py`.
+- **Aviso de mano demasiado cerca** en `senas.py` y en el segmentador. Medido: MediaPipe sigue la mano mientras no la pierda, pero ya no puede volver a detectarla si ocupa ~80% de la imagen o más (70%: 5/5, 80%: 2/5, 90%: 0/5). En el modo dinámico eso cortaba la seña a la mitad.
+
+### 🔧 Bugs corregidos en la revisión final de `senas.py`
+
+- **Con dos manos en cuadro, el alfabeto estático clasificaba la mano que no hacía la seña.** Elegía la etiqueta `"Right"` de MediaPipe, que en este programa es la mano izquierda de la persona: 585 de las 586 plantillas, todas de gente que deletrea con la derecha, tienen la mano en el slot `"Left"`. Ahora hay un selector **Mano que deletrea** (`dominant_hand`); con la izquierda, la seña se refleja, también en el modo dinámico (medido: una J hecha con la izquierda se leía como X, ahora como J).
+- **No se podían escribir letras dobles (LL, RR, EE):** la misma letra no se confirmaba de nuevo hasta cerrar la palabra. Ahora basta relajar o bajar la mano un instante (`repeat_release_frames`), como ya decía el README.
+- **Faltaban funciones que el README y `tests/` describían.** Venían de la versión de kidflash117 que el merge dejó fuera:
+  - `Retroceso` borra la última letra y `Enter` cierra la palabra;
+  - lectura en voz alta (macOS, Linux/Pi y ahora también Windows);
+  - validación de `config.json`: antes un archivo mal formado tronaba al arrancar;
+  - los sliders de confianza y margen se guardan.
+- **El slider de confianza de detección no hacía nada** hasta el siguiente Iniciar. Ahora recrea el detector en vivo.
+- **El watchdog podía cerrar la app de golpe:** si el hilo trabado no terminaba en 3 s, se soltaba y Qt abortaba; además se cerraba MediaPipe mientras seguía en uso. Ahora el hilo se conserva hasta que termina y cierra sus modelos él mismo. El DTW también suelta el candado de Python (`nogil`) para no trabar el video en máquinas lentas.
+- **Si el DTW fallaba una vez, el modo dinámico se quedaba en "Clasificando..." para siempre** y descartaba todas las señas siguientes.
+- **"Guardar captura" fallaba en Windows** con rutas con "ñ" (`cv2.imwrite`).
+- **En macOS, la "Ñ" del DTW no coincidía con la del código** (nombre de carpeta descompuesto): se normaliza.
+- `probar_modo_dinamico_senas.py` comparaba el Estado ("J (81%)") con la letra sola ("J"); con eso, `tests/` y esa prueba pasan completos.
 
 ### ❌ No empezado
 
