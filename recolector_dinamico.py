@@ -3,23 +3,42 @@
 Igual que recolector_estatico.py, reutiliza la deteccion de manos y la
 normalizacion de senas.py / sign_classifier.py, pero en vez de un solo vector
 guarda una secuencia completa (una muestra = lista de vectores de 126, uno
-por frame) mientras se mantiene presionada una tecla.
+por frame) durante el tiempo que dura la seña.
 
-OpenCV no expone un evento nativo de "tecla soltada" (waitKey solo informa
-teclas presionadas, via el auto-repeat del sistema operativo). Por eso la
-"suelta" se simula: si la tecla de grabar no vuelve a detectarse durante
-RELEASE_TIMEOUT_S segundos, se asume que se solto y se guarda la secuencia.
-Esto anade un pequeno colchon de frames al final de cada muestra (no afecta
-el entrenamiento, solo agrega unos frames de la pose final).
+Grabacion con INICIO/FIN explicitos (no "mantener presionada"): la primera
+vez que se presiona 'g' arranca la grabacion, la segunda vez la termina. Se
+elimino el esquema anterior de "mantener presionada + tiempo de espera para
+detectar la suelta" (RELEASE_TIMEOUT_S ~0.4s): el auto-repeat del teclado de
+Windows (delay inicial antes de repetir la tecla) podia dejar un hueco justo
+al presionar, y ese hueco se interpretaba como "se solto", grabando una
+muestra fantasma de ~12-14 frames antes de la real. Con inicio/fin explicitos
+ese problema desaparece: la duracion de la grabacion la decide el usuario, no
+un temporizador.
+
+Al terminar una grabacion se pide confirmacion en la propia ventana (no hace
+falta volver a la terminal): 's' = guardar, 'd' = descartar. Si la seña dura
+menos de MIN_FRAMES_OK frames se avisa "demasiado corta" y se descarta por
+defecto (se puede forzar el guardado con 'f').
+
+Cada muestra guardada se escribe DOS veces, con el mismo indice N:
+  - datos_dinamicas/<LETRA>/muestra_N.json   (formato que ya usa el proyecto,
+    vectores normalizados de 126 valores, sin cambios)
+  - Dataset_CICESE/propias_crudas/<LETRA>/muestra_N.npz (landmarks crudos:
+    timestamp por frame, y por cada mano detectada su etiqueta Left/Right,
+    score, los 21 landmarks de imagen (x,y,z) y los 21 world (x,y,z); los
+    frames sin ninguna mano se guardan igual, vacios, no se omiten)
 
 Uso:
     python recolector_dinamico.py [--camera 0]
 
 Controles:
-    mantener 'g'  -> graba la secuencia mientras se sostiene
-    n             -> termina la sena actual y pide una nueva
-    ESC           -> sale del programa (no durante una grabacion activa)
-    /salir        -> sale del programa (escrito en el prompt de texto)
+    'g'      -> primera vez: empieza a grabar. segunda vez: termina.
+    's'      -> (al terminar de grabar) guardar la muestra
+    'd'      -> (al terminar de grabar) descartar la muestra
+    'f'      -> (solo si salio "demasiado corta") forzar el guardado
+    n        -> termina la seña actual y pide una nueva
+    ESC      -> sale del programa (no durante una grabacion activa)
+    /salir   -> sale del programa (escrito en el prompt de texto)
 
 Nota: el comando para salir del prompt de sena es "/salir", con diagonal, a
 proposito. Las etiquetas aqui son justo las letras dinamicas (J, K, Ñ, Q, X,
@@ -33,7 +52,9 @@ import argparse
 import json
 import sys
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -46,9 +67,21 @@ OUTPUT_ROOT = Path(__file__).resolve().parent / "datos_dinamicas"
 N_FEATURES_PER_HAND = 63
 N_FEATURES = N_FEATURES_PER_HAND * 2
 RECORD_KEY = ord('g')
-RELEASE_TIMEOUT_S = 0.4
-MIN_FRAMES = 3
 RECOMMENDED_SAMPLES = (3, 5)
+
+# Debajo de esto se avisa "demasiado corta" y se descarta por defecto al
+# confirmar (el minimo observado en el dataset real es 27 frames).
+MIN_FRAMES_OK = 25
+
+# Teclas de la confirmacion al terminar de grabar (ver docstring del modulo).
+CONFIRM_SAVE_KEY = ord('s')
+CONFIRM_DISCARD_KEY = ord('d')
+CONFIRM_FORCE_KEY = ord('f')
+
+# Respaldo crudo (landmarks sin normalizar) para el extractor del dataset.
+# Ruta absoluta fuera del proyecto, a proposito: es un dataset compartido con
+# otro trabajo (Dataset_CICESE), no un artefacto de este repo.
+RAW_DATASET_ROOT = Path(r"C:\Proyectos\Dataset_CICESE\propias_crudas")
 
 # Comando para terminar el programa desde el prompt de texto. Con diagonal a
 # proposito: nunca puede coincidir con una etiqueta real (J, K, Ñ, Q, X, Z u
@@ -123,21 +156,159 @@ def build_feature_vector(hands: dict[str, HandDetection]) -> np.ndarray:
     return vec
 
 
-def next_sample_path(word_dir: Path) -> Path:
+# =========================================================================== #
+# Respaldo crudo (landmarks sin normalizar) para Dataset_CICESE/propias_crudas
+# =========================================================================== #
+
+@dataclass
+class RawHandSample:
+    """Una mano detectada en un frame, con los landmarks TAL CUAL los entrega
+    MediaPipe (sin normalizar), a diferencia de HandDetection/build_feature_vector
+    que solo guardan lo que hace falta para clasificar (x,y de imagen + z de
+    world) y descartan la z de imagen. Este respaldo la conserva."""
+    label: str          # "Left" o "Right"
+    score: float
+    image_xyz: np.ndarray   # (21, 3): x,y,z tal como los da MediaPipe en la imagen
+    world_xyz: np.ndarray   # (21, 3): x,y,z en el sistema "world" (metros aprox.)
+
+
+@dataclass
+class RawFrameSample:
+    """Un frame completo de la grabacion cruda. hands puede estar vacio
+    (frame sin ninguna mano detectada) - se guarda igual, no se omite."""
+    timestamp_ms: float
+    hands: dict[str, RawHandSample] = field(default_factory=dict)
+
+
+def capture_raw_hands(results) -> dict[str, RawHandSample]:
+    """Como parse_hands, pero sin descartar informacion: conserva la z de los
+    landmarks de imagen (parse_hands no la necesita para el vector de 126 y
+    la tira). Se usa solo para el respaldo crudo, no para clasificar."""
+    hands: dict[str, RawHandSample] = {}
+    if not results.hand_landmarks:
+        return hands
+
+    for i, hand_lms in enumerate(results.hand_landmarks):
+        handedness = "Right"
+        score = 0.0
+        if results.handedness and i < len(results.handedness) and results.handedness[i]:
+            cat = results.handedness[i][0]
+            handedness = cat.category_name
+            score = cat.score
+
+        if handedness in hands:
+            continue
+
+        image_xyz = np.array([[lm.x, lm.y, lm.z] for lm in hand_lms], dtype=np.float32)
+
+        world_xyz = np.zeros((21, 3), dtype=np.float32)
+        if results.hand_world_landmarks and i < len(results.hand_world_landmarks):
+            world = results.hand_world_landmarks[i]
+            world_xyz = np.array([[lm.x, lm.y, lm.z] for lm in world], dtype=np.float32)
+
+        hands[handedness] = RawHandSample(
+            label=handedness, score=score, image_xyz=image_xyz, world_xyz=world_xyz,
+        )
+    return hands
+
+
+def save_raw_npz(path: Path, raw_frames: list[RawFrameSample], fps_medido: float) -> None:
+    """Empaqueta la grabacion cruda en arreglos de forma fija (T, 2, 21, 3):
+    el slot 0 es la mano "Left" y el slot 1 la "Right" (misma convencion de
+    slots que el resto del proyecto), en vez de una lista de largo variable
+    por frame. Así un frame sin manos queda representado igual (todo en
+    ceros/etiqueta vacia) en vez de tener que omitirse."""
+    total_frames = len(raw_frames)
+    timestamps_ms = np.zeros(total_frames, dtype=np.float64)
+    hand_labels = np.full((total_frames, 2), "", dtype="<U5")
+    hand_scores = np.zeros((total_frames, 2), dtype=np.float32)
+    landmarks_image = np.zeros((total_frames, 2, 21, 3), dtype=np.float32)
+    landmarks_world = np.zeros((total_frames, 2, 21, 3), dtype=np.float32)
+
+    for t, frame in enumerate(raw_frames):
+        timestamps_ms[t] = frame.timestamp_ms
+        for slot_idx, lado in enumerate(("Left", "Right")):
+            hand = frame.hands.get(lado)
+            if hand is None:
+                continue
+            hand_labels[t, slot_idx] = hand.label
+            hand_scores[t, slot_idx] = hand.score
+            landmarks_image[t, slot_idx] = hand.image_xyz
+            landmarks_world[t, slot_idx] = hand.world_xyz
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(
+        path,
+        timestamps_ms=timestamps_ms,
+        hand_labels=hand_labels,
+        hand_scores=hand_scores,
+        landmarks_image=landmarks_image,
+        landmarks_world=landmarks_world,
+        fps_medido=np.float32(fps_medido),
+    )
+
+
+# =========================================================================== #
+# Decision de guardar/descartar y escritura de una muestra (funciones puras,
+# sin camara ni teclado, para poder probarlas con datos sinteticos)
+# =========================================================================== #
+
+def should_discard_by_default(n_frames: int) -> bool:
+    """True si, sin intervencion del usuario, esta grabacion se descartaria
+    por ser demasiado corta (por debajo de MIN_FRAMES_OK). La confirmacion
+    interactiva puede forzar el guardado de todas formas con 'f'."""
+    return n_frames < MIN_FRAMES_OK
+
+
+def compute_recording_stats(raw_frames: list[RawFrameSample], duration_s: float) -> dict:
+    """Frames, duracion real y % de frames sin ninguna mano detectada."""
+    n_frames = len(raw_frames)
+    sin_mano = sum(1 for f in raw_frames if not f.hands)
+    pct_sin_mano = (sin_mano / n_frames * 100.0) if n_frames else 0.0
+    return {"n_frames": n_frames, "duracion_s": duration_s, "pct_sin_mano": pct_sin_mano}
+
+
+def next_muestra_index(word_dir: Path) -> int:
+    """Siguiente indice N libre para muestra_N.json, robusto a huecos (si se
+    borro a mano una muestra intermedia, usar solo len(archivos)+1 podia
+    volver a usar un numero ya ocupado; aqui se toma el maximo existente+1)."""
     word_dir.mkdir(parents=True, exist_ok=True)
-    n = len(list(word_dir.glob("muestra_*.json"))) + 1
-    return word_dir / f"muestra_{n}.json"
+    numeros = []
+    for p in word_dir.glob("muestra_*.json"):
+        try:
+            numeros.append(int(p.stem.split("_", 1)[1]))
+        except (IndexError, ValueError):
+            continue
+    return (max(numeros) + 1) if numeros else 1
 
 
-def save_sequence(word_dir: Path, sequence: list[np.ndarray]) -> Path:
-    path = next_sample_path(word_dir)
+def save_muestra(
+    word_dir: Path,
+    letra: str,
+    feature_sequence: list[np.ndarray],
+    raw_frames: list[RawFrameSample],
+    fps_medido: float,
+    raw_dataset_root: Path = RAW_DATASET_ROOT,
+) -> tuple[Path, Path]:
+    """Guarda la muestra en datos_dinamicas/<LETRA>/muestra_N.json (formato
+    del proyecto, sin cambios) Y en Dataset_CICESE/propias_crudas/<LETRA>/
+    muestra_N.npz (landmarks crudos), con el MISMO indice N en ambas, tomado
+    una sola vez a partir de los .json existentes (para que ambos formatos
+    queden sincronizados aunque uno de los dos directorios se limpie aparte)."""
+    n = next_muestra_index(word_dir)
+
+    json_path = word_dir / f"muestra_{n}.json"
     payload = {
-        "n_frames": len(sequence),
+        "n_frames": len(feature_sequence),
         "n_features": N_FEATURES,
-        "frames": [vec.tolist() for vec in sequence],
+        "frames": [vec.tolist() for vec in feature_sequence],
     }
-    path.write_text(json.dumps(payload), encoding="utf-8")
-    return path
+    json_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    npz_path = raw_dataset_root / letra / f"muestra_{n}.npz"
+    save_raw_npz(npz_path, raw_frames, fps_medido)
+
+    return json_path, npz_path
 
 
 def main() -> int:
@@ -164,8 +335,8 @@ def main() -> int:
             # Normalizacion de la etiqueta: strip() + upper(). El comando de
             # salida se compara ANTES de decidir si esta vacia, y en
             # minusculas para aceptar "/salir", "/SALIR", etc.
-            raw = input(f"\nSena a grabar ('{EXIT_COMMAND}' para salir): ")
-            candidate = raw.strip()
+            raw_input_text = input(f"\nSena a grabar ('{EXIT_COMMAND}' para salir): ")
+            candidate = raw_input_text.strip()
             if candidate.lower() == EXIT_COMMAND:
                 break
             if not candidate:
@@ -181,12 +352,13 @@ def main() -> int:
                       f"se creara nueva.")
 
             existing_n = len(list(word_dir.glob("muestra_*.json"))) if word_dir.exists() else 0
-            print(f"Manten 'g' presionada durante toda la sena.")
+            print("Presiona 'g' para EMPEZAR a grabar y otra vez para TERMINAR.")
             print(f"Con {RECOMMENDED_SAMPLES[0]}-{RECOMMENDED_SAMPLES[1]} repeticiones basta, no grabes de mas.")
 
             recording = False
             sequence: list[np.ndarray] = []
-            last_key_seen = 0.0
+            raw_frames: list[RawFrameSample] = []
+            record_start = 0.0
             quit_all = False
 
             while True:
@@ -206,35 +378,113 @@ def main() -> int:
                 key = cv2.waitKey(1) & 0xFF
 
                 if key == RECORD_KEY:
-                    last_key_seen = now
                     if not recording:
+                        # Primera pulsacion: EMPIEZA. Ya no se "mantiene
+                        # presionada" ni se espera un timeout para la suelta.
                         recording = True
                         sequence = []
-                        print("  grabando...")
+                        raw_frames = []
+                        record_start = now
+                        print("  grabando... (presiona 'g' de nuevo para terminar)")
+                    else:
+                        # Segunda pulsacion: TERMINA y pasa a confirmacion.
+                        recording = False
+                        duracion_s = now - record_start
+                        stats = compute_recording_stats(raw_frames, duracion_s)
+                        print(
+                            f"  grabacion terminada: {stats['n_frames']} frames, "
+                            f"{stats['duracion_s']:.2f}s, "
+                            f"{stats['pct_sin_mano']:.0f}% de frames sin mano"
+                        )
+
+                        demasiado_corta = should_discard_by_default(stats["n_frames"])
+                        if demasiado_corta:
+                            print(f"  AVISO: demasiado corta (<{MIN_FRAMES_OK} frames), se descartara.")
+                            print("  presiona 'f' para forzar el guardado, cualquier otra tecla para descartar.")
+                        else:
+                            print("  presiona 's' para guardar, 'd' para descartar.")
+
+                        # Mini-bucle de confirmacion: sigue mostrando camara en
+                        # vivo (sin acumular mas frames a la secuencia) hasta
+                        # que se decida que hacer con la grabacion.
+                        decidido = False
+                        guardar = False
+                        while not decidido:
+                            ret2, frame2 = cap.read()
+                            if not ret2:
+                                guardar = False
+                                break
+                            frame2 = cv2.flip(frame2, 1)
+                            aviso = (
+                                f"Confirmar '{word}': {stats['n_frames']} frames, "
+                                f"{stats['duracion_s']:.1f}s"
+                            )
+                            accion = (
+                                "'f'=forzar guardar, otra tecla=descartar" if demasiado_corta
+                                else "'s'=guardar  'd'=descartar"
+                            )
+                            cv2.putText(frame2, aviso, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                                        (0, 0, 0), 3, cv2.LINE_AA)
+                            cv2.putText(frame2, aviso, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                                        (0, 165, 255), 1, cv2.LINE_AA)
+                            cv2.putText(frame2, accion, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                                        (255, 255, 255), 1, cv2.LINE_AA)
+                            cv2.imshow(window, frame2)
+
+                            key2 = cv2.waitKey(1) & 0xFF
+                            if demasiado_corta:
+                                if key2 == CONFIRM_FORCE_KEY:
+                                    guardar, decidido = True, True
+                                elif key2 != 255:  # cualquier OTRA tecla real descarta
+                                    guardar, decidido = False, True
+                            else:
+                                if key2 == CONFIRM_SAVE_KEY:
+                                    guardar, decidido = True, True
+                                elif key2 == CONFIRM_DISCARD_KEY:
+                                    guardar, decidido = False, True
+                                elif key2 == 27:  # ESC tambien descarta y sale del todo
+                                    guardar, decidido = False, True
+                                    quit_all = True
+
+                        if guardar:
+                            fps_medido = stats["n_frames"] / stats["duracion_s"] if stats["duracion_s"] > 0 else 0.0
+                            json_path, npz_path = save_muestra(
+                                word_dir, word, sequence, raw_frames, fps_medido,
+                            )
+                            existing_n += 1
+                            print(f"  guardada {json_path.name} + {npz_path.name} "
+                                  f"({stats['n_frames']} frames) - muestras de '{word}': {existing_n}")
+                            if existing_n >= RECOMMENDED_SAMPLES[1]:
+                                print(f"  ya tienes {existing_n}, con eso basta para '{word}'")
+                        else:
+                            print("  descartada.")
+
+                        sequence = []
+                        raw_frames = []
+                        if quit_all:
+                            break
 
                 if recording:
                     sequence.append(build_feature_vector(hands))
-                    if now - last_key_seen > RELEASE_TIMEOUT_S:
-                        recording = False
-                        if len(sequence) < MIN_FRAMES:
-                            print(f"  secuencia muy corta ({len(sequence)} frames), descartada")
-                        else:
-                            path = save_sequence(word_dir, sequence)
-                            existing_n += 1
-                            print(f"  guardada {path.name} ({len(sequence)} frames) - muestras de '{word}': {existing_n}")
-                            if existing_n >= RECOMMENDED_SAMPLES[1]:
-                                print(f"  ya tienes {existing_n}, con eso basta para '{word}'")
-                        sequence = []
+                    raw_frames.append(RawFrameSample(
+                        timestamp_ms=(now - record_start) * 1000.0,
+                        hands=capture_raw_hands(results),
+                    ))
 
                 display = frame.copy()
                 for hand in hands.values():
                     draw_hand_landmarks(display, hand)
 
-                status = f"Sena: {word}  |  muestras: {existing_n}  |  {'GRABANDO' if recording else 'listo'}"
-                color = (0, 0, 255) if recording else (102, 255, 102)
+                if recording:
+                    elapsed = now - record_start
+                    status = f"Sena: {word}  |  GRABANDO  |  frames: {len(sequence)}  |  {elapsed:.1f}s"
+                    color = (0, 0, 255)
+                else:
+                    status = f"Sena: {word}  |  muestras: {existing_n}  |  listo"
+                    color = (102, 255, 102)
                 cv2.putText(display, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
                 cv2.putText(display, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1, cv2.LINE_AA)
-                cv2.putText(display, "manten 'g'=grabar  n=nueva sena  ESC=salir", (10, 60),
+                cv2.putText(display, "'g'=empezar/terminar  n=nueva sena  ESC=salir", (10, 60),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
 
                 cv2.imshow(window, display)
@@ -253,7 +503,7 @@ def main() -> int:
         cv2.destroyAllWindows()
         landmarker.close()
 
-    print(f"\nListo. Datos guardados en {OUTPUT_ROOT}")
+    print(f"\nListo. Datos guardados en {OUTPUT_ROOT} y {RAW_DATASET_ROOT}")
     return 0
 
 

@@ -65,13 +65,10 @@ except ImportError as e:
 # --------------------------------------------------------------------------- #
 
 # Confianza minima del candidato top-1 (softmax entre las N señas dinamicas
-# disponibles) para comprometer la letra a la palabra.
+# disponibles) para comprometer la letra a la palabra (grupo NORMAL, via
+# confianza). Ver DYN_NORMAL_MIN_MARGIN mas abajo para la via alternativa
+# de margen del mismo grupo.
 DYN_MIN_CONF = 0.55
-
-# Margen minimo entre el top-1 y el top-2 (confianza_1 - confianza_2) para
-# comprometer la letra. En 0.0 no exige ningun margen (o sea, no cambia el
-# comportamiento previo, que solo miraba DYN_MIN_CONF).
-DYN_MIN_MARGIN = 0.0
 
 # Mas tolerante que el modo consola (270ms): senas como la J son un trazo
 # largo y a veces la mano se pierde un instante a mitad del gesto sin que
@@ -81,26 +78,38 @@ DYN_NO_HAND_MS_TO_END = 700
 # Tope duro: si el usuario no baja la mano, no seguir grabando para siempre.
 DYN_MAX_SEQUENCE_MS = 5000
 
-# Letras que usan la regla NORMAL de commit (DYN_MIN_CONF / DYN_MIN_MARGIN
-# de arriba). En evaluacion, K, Q y Z resultaron poco confiables en confianza
-# absoluta (las 6 clases quedan muy juntas en distancia DTW: ninguna de esas
-# tres cruzo nunca ~45%, aunque el top-1 fuera correcto), asi que
-# DYN_MIN_CONF=0.55 las bloqueaba siempre, acertaran o no. Para restaurar las
-# seis letras bajo la regla normal, descomentar la linea de abajo (o igualar
-# DYN_COMMIT_LETTERS a las seis).
-DYN_COMMIT_LETTERS = {"J", "Ñ", "X"}
-# DYN_COMMIT_LETTERS = {"J", "K", "Ñ", "Q", "X", "Z"}  # las seis, sin restriccion
+# ------------------------------------------------------------------------- #
+# Dos grupos de letras, cada uno con su propia regla de commit (ver
+# dynamic_commit_decision). Separados por letra (no una sola regla global)
+# para poder recalibrar cada grupo por separado si hace falta.
+# ------------------------------------------------------------------------- #
 
-# Regla EXPERIMENTAL para las letras fuera de DYN_COMMIT_LETTERS (K, Q, Z):
-# en vez de bloquearlas siempre, se dejan comprometer si el MARGEN sobre el
-# 2.º lugar es lo bastante grande, aunque la confianza absoluta del top-1 no
-# alcance DYN_MIN_CONF. Es lo que de verdad distingue un acierto solido de
-# una adivinanza para estas tres: en evaluacion real, K/Q/Z con margen >15pp
+# Grupo NORMAL: confianza absoluta del top-1 suele ser un buen indicador.
+# Datos reales (2026-09-29) confirman el mismo patron que ya se veia en
+# K/Q/Z: un margen amplio sobre el 2.º lugar tambien es señal solida de
+# acierto aunque la confianza absoluta no llegue a DYN_MIN_CONF (ej. J con
+# margenes de 34.5pp, 24.6pp y 37pp -> deberian comprometer aunque la
+# confianza este debajo de 0.55; margenes de 11.1pp y 2.1pp -> correctamente
+# dudosos, no deben comprometer). Por eso el grupo NORMAL compromete por
+# confianza >= DYN_MIN_CONF O por margen >= DYN_NORMAL_MIN_MARGIN, lo que se
+# cumpla primero.
+DYN_NORMAL_LETTERS = {"J", "Ñ", "X"}
+DYN_NORMAL_MIN_MARGIN = 0.20
+
+# Grupo EXPERIMENTAL: en evaluacion, K, Q y Z resultaron poco confiables en
+# confianza absoluta (las 6 clases quedan muy juntas en distancia DTW:
+# ninguna de esas tres cruzo nunca ~45%, aunque el top-1 fuera correcto), asi
+# que DYN_MIN_CONF=0.55 las bloqueaba siempre, acertaran o no. En vez de
+# bloquearlas siempre, se dejan comprometer si el MARGEN sobre el 2.º lugar
+# es lo bastante grande, aunque la confianza absoluta del top-1 no alcance
+# DYN_MIN_CONF. Es lo que de verdad distingue un acierto solido de una
+# adivinanza para estas tres: en evaluacion real, K/Q/Z con margen >15pp
 # resultaron ser el top-1 correcto, mientras que con margen <2pp era
 # practicamente un empate entre las 6 clases (ej. K 29.8% vs Z 28.2%, margen
 # 1.6pp, dudoso; K 38.9% vs Z 23.5%, margen 15.4pp, solido). DYN_EXPERIMENTAL_
 # MIN_CONF es solo un piso de cordura (no aceptar un top-1 absurdamente bajo
 # aunque el margen diera grande por casualidad), no el criterio principal.
+DYN_EXPERIMENTAL_LETTERS = {"K", "Q", "Z"}
 DYN_EXPERIMENTAL_MIN_MARGIN = 0.12
 DYN_EXPERIMENTAL_MIN_CONF = 0.30
 
@@ -613,46 +622,55 @@ def build_dynamic_feature_vector(hands: dict[str, "HandDetection"]) -> np.ndarra
 
 
 def is_experimental_dynamic_letter(letter: str) -> bool:
-    """True si `letter` quedo fuera de DYN_COMMIT_LETTERS: usa la regla
-    EXPERIMENTAL de margen (DYN_EXPERIMENTAL_MIN_MARGIN/MIN_CONF) en vez de
-    la regla normal (DYN_MIN_CONF/MIN_MARGIN)."""
-    return letter not in DYN_COMMIT_LETTERS
+    """True si `letter` esta en DYN_EXPERIMENTAL_LETTERS (K, Q, Z): usa la
+    regla EXPERIMENTAL de margen (DYN_EXPERIMENTAL_MIN_MARGIN/MIN_CONF) en
+    vez de la regla del grupo NORMAL (DYN_MIN_CONF/DYN_NORMAL_MIN_MARGIN)."""
+    return letter in DYN_EXPERIMENTAL_LETTERS
 
 
-def dynamic_commit_decision(topk: list[tuple[str, float]]) -> tuple[bool, float, bool]:
+def dynamic_commit_decision(topk: list[tuple[str, float]]) -> tuple[bool, float, str]:
     """Decide si el top-1 de una clasificacion dinamica se compromete o no.
 
-    Dos reglas segun la letra (ver constantes al inicio del archivo):
-      - En DYN_COMMIT_LETTERS (J, Ñ, X): regla normal, exige que la
-        confianza del top-1 alcance DYN_MIN_CONF Y que el margen sobre el
-        top-2 (confianza_1 - confianza_2) alcance DYN_MIN_MARGIN.
-      - Fuera de DYN_COMMIT_LETTERS (K, Q, Z): regla EXPERIMENTAL. Su
+    Dos grupos de letras, cada uno con su propia regla (ver constantes al
+    inicio del archivo):
+      - Grupo NORMAL (DYN_NORMAL_LETTERS, hoy J, Ñ, X): compromete si la
+        confianza del top-1 alcanza DYN_MIN_CONF, O si el margen sobre el
+        top-2 (confianza_1 - confianza_2) alcanza DYN_NORMAL_MIN_MARGIN,
+        lo que se cumpla primero. La via de margen existe porque, igual que
+        con K/Q/Z, un margen amplio es señal solida de acierto aunque la
+        confianza absoluta se quede corta.
+      - Grupo EXPERIMENTAL (DYN_EXPERIMENTAL_LETTERS, hoy K, Q, Z): su
         confianza absoluta nunca cruza ~45% aunque el top-1 sea correcto (las
         6 clases quedan muy juntas en distancia DTW), asi que DYN_MIN_CONF
-        las bloquearia siempre. Lo que si distingue un acierto solido de una
-        adivinanza para estas tres es el MARGEN sobre el 2.º lugar: se dejan
-        comprometer si ese margen supera DYN_EXPERIMENTAL_MIN_MARGIN, con
-        DYN_EXPERIMENTAL_MIN_CONF como piso minimo de cordura (no la
-        condicion principal).
+        las bloquearia siempre. Se comprometen si el margen sobre el 2.º
+        lugar supera DYN_EXPERIMENTAL_MIN_MARGIN, con DYN_EXPERIMENTAL_
+        MIN_CONF como piso minimo de cordura (no la condicion principal).
 
     Se centraliza aqui para que _process_dynamic_frame (que decide si se
     agrega la letra) y _on_diagnostic_update en la GUI (que solo explica por
     que no se agrego) usen exactamente el mismo criterio.
 
-    Devuelve (se_compromete, margen, via_regla_experimental).
+    Devuelve (se_compromete, margen, regla), donde regla es una de:
+      "confianza"    -> grupo normal, comprometio por DYN_MIN_CONF.
+      "margen"       -> grupo normal, comprometio por DYN_NORMAL_MIN_MARGIN.
+      "experimental" -> grupo experimental, comprometio por margen amplio.
+      ""             -> no se comprometio.
     """
     if not topk:
-        return False, 0.0, False
+        return False, 0.0, ""
     letra1 = topk[0][0]
     conf1 = topk[0][1]
     margin = conf1 - topk[1][1] if len(topk) > 1 else conf1
 
     if is_experimental_dynamic_letter(letra1):
         should_commit = conf1 >= DYN_EXPERIMENTAL_MIN_CONF and margin >= DYN_EXPERIMENTAL_MIN_MARGIN
-        return should_commit, margin, should_commit
+        return should_commit, margin, "experimental" if should_commit else ""
 
-    should_commit = conf1 >= DYN_MIN_CONF and margin >= DYN_MIN_MARGIN
-    return should_commit, margin, False
+    if conf1 >= DYN_MIN_CONF:
+        return True, margin, "confianza"
+    if margin >= DYN_NORMAL_MIN_MARGIN:
+        return True, margin, "margen"
+    return False, margin, ""
 
 
 # =========================================================================== #
@@ -738,6 +756,17 @@ class HandTrackingThread(QThread):
         # "inicio" y se vuelca a consola cuando la seña termina.
         self._dynamic_stats: Optional[dict] = None
 
+        # "Identidad de mano(s)" de la secuencia dinamica en curso: que
+        # handedness ("Left"/"Right") estaban presentes en el primer frame
+        # detectado de la seña. Mientras se graba, cualquier mano que NO
+        # estaba en esta identidad se ignora (se deja en ceros) en vez de
+        # agregarse al vector de 126 - evita que una mano que se asoma sin
+        # intencion de señar (p.ej. de forma pasajera) convierta una seña de
+        # una sola mano en un vector que no se parece a ninguna plantilla
+        # (la enorme mayoria del dataset es de una sola mano activa). None
+        # cuando no hay una secuencia en curso.
+        self._dynamic_sequence_hand_identity: Optional[set[str]] = None
+
         self._latencies: deque[float] = deque(maxlen=100)
         self._frame_times: deque[float] = deque(maxlen=30)
         self._hand_counts: deque[int] = deque(maxlen=60)
@@ -765,6 +794,7 @@ class HandTrackingThread(QThread):
         self._dynamic_classifying = False
         self._dynamic_idle_text = "Esperando mano"
         self._dynamic_stats = None
+        self._dynamic_sequence_hand_identity = None
         while not self._dynamic_result_queue.empty():
             try:
                 self._dynamic_result_queue.get_nowait()
@@ -987,10 +1017,10 @@ class HandTrackingThread(QThread):
         else:
             self._dynamic_classifying = False
             self.sign_diagnostic_signal.emit(topk)
-            should_commit, margin, via_experimental = dynamic_commit_decision(topk)
+            should_commit, margin, rule = dynamic_commit_decision(topk)
             top_str = "  ".join(f"{w} {c * 100:.1f}%" for w, c in topk)
 
-            if should_commit and via_experimental:
+            if rule == "experimental":
                 # K, Q o Z comprometida por la regla EXPERIMENTAL de margen
                 # (ver dynamic_commit_decision): se etiqueta distinto para que
                 # quede claro que no vino de la regla normal de confianza.
@@ -1001,15 +1031,25 @@ class HandTrackingThread(QThread):
                     "[dinamico] top-3: %s -> agregada por regla EXPERIMENTAL (margen=%.1fpp >= %.0fpp)",
                     top_str, margin * 100, DYN_EXPERIMENTAL_MIN_MARGIN * 100,
                 )
-            elif should_commit:
+            elif rule == "margen":
+                # Grupo normal comprometido por margen amplio aunque la
+                # confianza absoluta no llegara a DYN_MIN_CONF.
+                self.letter_committed_signal.emit(letter)
+                self._last_committed_label = letter
+                self._dynamic_idle_text = f"{letter} {conf * 100:.1f}% (margen amplio)"
+                log.info(
+                    "[dinamico] top-3: %s -> agregada por margen amplio (margen=%.1fpp >= %.0fpp)",
+                    top_str, margin * 100, DYN_NORMAL_MIN_MARGIN * 100,
+                )
+            elif rule == "confianza":
                 self.letter_committed_signal.emit(letter)
                 self._last_committed_label = letter
                 self._dynamic_idle_text = f"{letter} ({conf * 100:.0f}%)"
-                log.info("[dinamico] top-3: %s -> agregada (margen=%.1fpp)", top_str, margin * 100)
+                log.info("[dinamico] top-3: %s -> agregada (confianza=%.1f%%)", top_str, conf * 100)
             elif is_experimental_dynamic_letter(letter):
-                # K, Q y Z (fuera de DYN_COMMIT_LETTERS): no alcanzaron el
-                # margen de la regla experimental. Se siguen mostrando en el
-                # top-3 para poder seguir evaluandolas.
+                # K, Q y Z (grupo experimental): no alcanzaron el margen de
+                # la regla experimental. Se siguen mostrando en el top-3 para
+                # poder seguir evaluandolas.
                 self._dynamic_idle_text = f"¿{letter}? ({conf * 100:.0f}%) - modo experimental, no se agregó"
                 motivos = []
                 if conf < DYN_EXPERIMENTAL_MIN_CONF:
@@ -1021,15 +1061,11 @@ class HandTrackingThread(QThread):
                     top_str, "; ".join(motivos) or "umbral no alcanzado",
                 )
             else:
+                # Grupo normal: ni confianza ni margen alcanzaron su umbral.
                 self._dynamic_idle_text = f"¿{letter}? ({conf * 100:.0f}%) - no agregada"
-                motivos = []
-                if conf < DYN_MIN_CONF:
-                    motivos.append(f"confianza {conf * 100:.1f}% < {DYN_MIN_CONF * 100:.0f}%")
-                if margin < DYN_MIN_MARGIN:
-                    motivos.append(f"margen {margin * 100:.1f}pp < {DYN_MIN_MARGIN * 100:.0f}pp")
                 log.info(
-                    "[dinamico] top-3: %s -> NO agregada (%s)",
-                    top_str, "; ".join(motivos) or "umbral no alcanzado",
+                    "[dinamico] top-3: %s -> NO agregada (confianza %.1f%% < %.0f%% y margen %.1fpp < %.0fpp)",
+                    top_str, conf * 100, DYN_MIN_CONF * 100, margin * 100, DYN_NORMAL_MIN_MARGIN * 100,
                 )
             return (letter, conf)
 
@@ -1039,6 +1075,22 @@ class HandTrackingThread(QThread):
             if h.handedness not in hands_by_side:
                 hands_by_side[h.handedness] = h
         has_hand = bool(hands_by_side)
+
+        if self._auto_segmenter.state == "esperando":
+            # Este es el frame que, si has_hand, va a disparar "inicio" (ver
+            # AutoSegmenter.push: la transicion es inmediata, sin espera de
+            # varios frames). Fija la identidad de mano(s) de la secuencia
+            # nueva ANTES de filtrar nada: aqui no hay nada que filtrar
+            # todavia, este frame es el que define la identidad.
+            self._dynamic_sequence_hand_identity = set(hands_by_side.keys()) if has_hand else None
+        elif self._dynamic_sequence_hand_identity:
+            # Seguimos dentro de la MISMA secuencia (state == "grabando"):
+            # cualquier mano que aparezca y no estaba en la identidad
+            # original se trata como ruido (se ignora, no se agrega al
+            # vector) en vez de convertir esto en una postura de dos manos.
+            for handedness in list(hands_by_side.keys()):
+                if handedness not in self._dynamic_sequence_hand_identity:
+                    del hands_by_side[handedness]
 
         vector = build_dynamic_feature_vector(hands_by_side)
         event = self._auto_segmenter.push(has_hand, vector, now)
@@ -1856,11 +1908,13 @@ class SignLanguageApp(QMainWindow):
             # se agrego la letra o no y por que, con el mismo criterio
             # (dynamic_commit_decision) que usa HandTrackingThread para
             # decidir el commit real.
-            should_commit, margin, via_experimental = dynamic_commit_decision(topk)
-            if should_commit and via_experimental:
+            should_commit, margin, rule = dynamic_commit_decision(topk)
+            if rule == "experimental":
                 lines.append(f"→ agregada por regla experimental (margen {margin * 100:.1f}pp)")
-            elif should_commit:
-                lines.append(f"→ agregada (margen {margin * 100:.1f}pp)")
+            elif rule == "margen":
+                lines.append(f"→ agregada por margen amplio (margen {margin * 100:.1f}pp)")
+            elif rule == "confianza":
+                lines.append(f"→ agregada (confianza {topk[0][1] * 100:.1f}%)")
             elif is_experimental_dynamic_letter(topk[0][0]):
                 lines.append("→ modo experimental, no se agregó")
             else:

@@ -11,7 +11,16 @@ Uso:
 Controles:
     ESPACIO  -> captura y guarda una muestra de la palabra actual
     n        -> termina la palabra actual y pide una nueva
-    q / ESC  -> sale del programa
+    ESC      -> sale del programa (desde la ventana de la camara)
+    /salir   -> sale del programa (escrito en el prompt de texto)
+
+Nota: el comando para salir del prompt de palabra es "/salir", con diagonal,
+a proposito. Las etiquetas de este recolector son palabras libres (no solo
+letras sueltas), asi que un comando corto como "q" o una palabra comun como
+"salir" podrian coincidir con una palabra real que alguien quiera grabar
+(por ejemplo, "salir" es una palabra perfectamente valida en LSM). La
+diagonal inicial nunca puede aparecer en una etiqueta normalizada, asi que
+no hay forma de que choquen.
 """
 from __future__ import annotations
 
@@ -34,6 +43,11 @@ N_FEATURES_PER_HAND = 63
 N_FEATURES = N_FEATURES_PER_HAND * 2
 FIELDNAMES = [f"v{i}" for i in range(N_FEATURES)] + ["etiqueta", "quien_grabo"]
 TARGET_SAMPLES = (150, 200)
+
+# Comando para terminar el programa desde el prompt de texto. Con diagonal a
+# proposito: nunca puede coincidir con una etiqueta real (una palabra o letra
+# que alguien quiera grabar), a diferencia de "q" o "salir" a secas.
+EXIT_COMMAND = "/salir"
 
 
 def init_hand_landmarker(max_num_hands: int = 2):
@@ -151,15 +165,22 @@ def main() -> int:
 
     try:
         while True:
-            label = input("\nPalabra/sena a grabar ('q' para salir): ").strip()
-            if label.lower() in ("q", "salir", "exit"):
+            # Normalizacion de la etiqueta: strip() + upper(). Se compara
+            # el comando de salida ANTES de decidir si esta vacia, y en
+            # minusculas para aceptar "/salir", "/SALIR", etc.
+            raw = input(f"\nPalabra/sena a grabar ('{EXIT_COMMAND}' para salir): ")
+            candidate = raw.strip()
+            if candidate.lower() == EXIT_COMMAND:
                 break
-            if not label:
+            if not candidate:
+                print("  (etiqueta vacia, se ignora)")
                 continue
+            label = candidate.upper()
+            print(f"Grabando '{label}'.")
 
             existing = count_existing_samples(label)
             session_count = 0
-            print(f"Grabando '{label}'. ESPACIO=capturar  n=cambiar de palabra  q/ESC=salir del todo")
+            print("ESPACIO=capturar  n=cambiar de palabra  ESC=salir del todo")
 
             quit_all = False
             while True:
@@ -186,7 +207,7 @@ def main() -> int:
                 )
                 cv2.putText(display, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
                 cv2.putText(display, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (102, 255, 102), 1, cv2.LINE_AA)
-                cv2.putText(display, "ESPACIO=capturar  n=nueva palabra  q=salir", (10, 60),
+                cv2.putText(display, "ESPACIO=capturar  n=nueva palabra  ESC=salir", (10, 60),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
 
                 cv2.imshow(window, display)
@@ -202,7 +223,7 @@ def main() -> int:
                         print(f"  capturada muestra #{existing + session_count} de '{label}'")
                 elif key == ord('n'):
                     break
-                elif key in (ord('q'), 27):
+                elif key == 27:  # ESC. 'q' ya no sale: es una etiqueta valida (letra Q).
                     quit_all = True
                     break
 

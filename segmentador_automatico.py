@@ -72,15 +72,24 @@ class AutoSegmenter:
       ("inicio", [])                -> se acaba de detectar el arranque de una sena
       ("fin_valida", secuencia)     -> sena terminada, lista para clasificar
       ("fin_descartada", secuencia) -> sena terminada pero demasiado corta
+
+    max_duration_ms (opcional, None por defecto = sin tope, igual que antes):
+    corta la grabacion por la fuerza si se excede, aunque la mano siga
+    presente. Lo usa senas.py en su integracion con la GUI (constante
+    DYN_MAX_SEQUENCE_MS) para no grabar indefinidamente si el usuario no baja
+    la mano; el modo consola de este archivo (main(), mas abajo) no lo pasa,
+    asi que su comportamiento no cambia.
     """
 
     def __init__(
         self,
         no_hand_ms_to_end: float = NO_HAND_MS_TO_END,
         min_sequence_ms: float = MIN_SEQUENCE_MS,
+        max_duration_ms: Optional[float] = None,
     ):
         self.no_hand_ms_to_end = no_hand_ms_to_end
         self.min_sequence_ms = min_sequence_ms
+        self.max_duration_ms = max_duration_ms
         self.state = "esperando"
         self.buffer: list[np.ndarray] = []
         self.last_hand_idx = -1
@@ -105,7 +114,11 @@ class AutoSegmenter:
             self.last_hand_time = now
 
         elapsed_since_hand_ms = (now - self.last_hand_time) * 1000.0
-        if elapsed_since_hand_ms < self.no_hand_ms_to_end:
+        duration_so_far_ms = (now - self.start_time) * 1000.0
+        tope_alcanzado = (
+            self.max_duration_ms is not None and duration_so_far_ms >= self.max_duration_ms
+        )
+        if elapsed_since_hand_ms < self.no_hand_ms_to_end and not tope_alcanzado:
             return None
 
         # Se acumulan frames vacios mientras se decide si la sena termino;
