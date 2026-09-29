@@ -22,11 +22,15 @@ defecto (se puede forzar el guardado con 'f').
 
 Cada muestra guardada se escribe DOS veces, con el mismo indice N:
   - datos_dinamicas/<LETRA>/muestra_N.json   (formato que ya usa el proyecto,
-    vectores normalizados de 126 valores, sin cambios)
+    vectores normalizados de 126 valores en "frames", sin cambios; ademas
+    "body_frames" con la ubicacion de las manos respecto al cuerpo, 9 valores
+    por frame, ver body_location_features en body_tracker.py. DTWRecognizer
+    solo lee "frames", asi que las plantillas del alfabeto no cambian)
   - Dataset_CICESE/propias_crudas/<LETRA>/muestra_N.npz (landmarks crudos:
     timestamp por frame, y por cada mano detectada su etiqueta Left/Right,
     score, los 21 landmarks de imagen (x,y,z) y los 21 world (x,y,z); los
-    frames sin ninguna mano se guardan igual, vacios, no se omiten)
+    frames sin ninguna mano se guardan igual, vacios, no se omiten. Tambien
+    los 33 puntos del cuerpo de MediaPipe Pose por frame, igual sin procesar)
 
 Uso:
     python recolector_dinamico.py [--camera 0]
@@ -62,6 +66,10 @@ import mediapipe as mp
 
 from sign_classifier import normalize_keypoints, hand_to_feature_vector
 from senas import ensure_hand_model, HandDetection, draw_hand_landmarks
+from body_tracker import (
+    N_BODY_FEATURES, N_POSE_LANDMARKS, BodyDetection, body_location_features,
+    BodyTracker, draw_body_skeleton, draw_body_status,
+)
 
 OUTPUT_ROOT = Path(__file__).resolve().parent / "datos_dinamicas"
 N_FEATURES_PER_HAND = 63
@@ -175,9 +183,11 @@ class RawHandSample:
 @dataclass
 class RawFrameSample:
     """Un frame completo de la grabacion cruda. hands puede estar vacio
-    (frame sin ninguna mano detectada) - se guarda igual, no se omite."""
+    (frame sin ninguna mano detectada) - se guarda igual, no se omite. body
+    es None si la pose no detecto a nadie en ese frame."""
     timestamp_ms: float
     hands: dict[str, RawHandSample] = field(default_factory=dict)
+    body: Optional[BodyDetection] = None
 
 
 def capture_raw_hands(results) -> dict[str, RawHandSample]:
@@ -224,9 +234,20 @@ def save_raw_npz(path: Path, raw_frames: list[RawFrameSample], fps_medido: float
     hand_scores = np.zeros((total_frames, 2), dtype=np.float32)
     landmarks_image = np.zeros((total_frames, 2, 21, 3), dtype=np.float32)
     landmarks_world = np.zeros((total_frames, 2, 21, 3), dtype=np.float32)
+    body_detected = np.zeros(total_frames, dtype=bool)
+    body_image = np.zeros((total_frames, N_POSE_LANDMARKS, 3), dtype=np.float32)
+    body_visibility = np.zeros((total_frames, N_POSE_LANDMARKS), dtype=np.float32)
+    body_presence = np.zeros((total_frames, N_POSE_LANDMARKS), dtype=np.float32)
+    body_world = np.zeros((total_frames, N_POSE_LANDMARKS, 3), dtype=np.float32)
 
     for t, frame in enumerate(raw_frames):
         timestamps_ms[t] = frame.timestamp_ms
+        if frame.body is not None:
+            body_detected[t] = True
+            body_image[t] = frame.body.image_xyz
+            body_visibility[t] = frame.body.visibility
+            body_presence[t] = frame.body.presence
+            body_world[t] = frame.body.world_xyz
         for slot_idx, lado in enumerate(("Left", "Right")):
             hand = frame.hands.get(lado)
             if hand is None:
@@ -244,6 +265,11 @@ def save_raw_npz(path: Path, raw_frames: list[RawFrameSample], fps_medido: float
         hand_scores=hand_scores,
         landmarks_image=landmarks_image,
         landmarks_world=landmarks_world,
+        body_detected=body_detected,
+        body_image=body_image,
+        body_visibility=body_visibility,
+        body_presence=body_presence,
+        body_world=body_world,
         fps_medido=np.float32(fps_medido),
     )
 
@@ -289,12 +315,17 @@ def save_muestra(
     raw_frames: list[RawFrameSample],
     fps_medido: float,
     raw_dataset_root: Path = RAW_DATASET_ROOT,
+    body_sequence: Optional[list[np.ndarray]] = None,
 ) -> tuple[Path, Path]:
     """Guarda la muestra en datos_dinamicas/<LETRA>/muestra_N.json (formato
     del proyecto, sin cambios) Y en Dataset_CICESE/propias_crudas/<LETRA>/
     muestra_N.npz (landmarks crudos), con el MISMO indice N en ambas, tomado
     una sola vez a partir de los .json existentes (para que ambos formatos
-    queden sincronizados aunque uno de los dos directorios se limpie aparte)."""
+    queden sincronizados aunque uno de los dos directorios se limpie aparte).
+
+    body_sequence (un vector de N_BODY_FEATURES por frame, alineado con
+    feature_sequence) se agrega al .json como "body_frames"; si es None el
+    .json queda exactamente como antes."""
     n = next_muestra_index(word_dir)
 
     json_path = word_dir / f"muestra_{n}.json"
@@ -303,6 +334,9 @@ def save_muestra(
         "n_features": N_FEATURES,
         "frames": [vec.tolist() for vec in feature_sequence],
     }
+    if body_sequence is not None:
+        payload["n_body_features"] = N_BODY_FEATURES
+        payload["body_frames"] = [vec.tolist() for vec in body_sequence]
     json_path.write_text(json.dumps(payload), encoding="utf-8")
 
     npz_path = raw_dataset_root / letra / f"muestra_{n}.npz"
@@ -320,6 +354,7 @@ def main() -> int:
     input("Tu nombre (solo como referencia, no se guarda en el archivo): ")
 
     landmarker = init_hand_landmarker(max_num_hands=2)
+    body_tracker = BodyTracker()
 
     cap = cv2.VideoCapture(args.camera)
     if not cap.isOpened():
@@ -357,6 +392,7 @@ def main() -> int:
 
             recording = False
             sequence: list[np.ndarray] = []
+            body_sequence: list[np.ndarray] = []
             raw_frames: list[RawFrameSample] = []
             record_start = 0.0
             quit_all = False
@@ -373,6 +409,9 @@ def main() -> int:
                 timestamp_ms += 1
                 results = landmarker.detect_for_video(mp_image, timestamp_ms)
                 hands = parse_hands(results)
+                body = body_tracker.detect(mp_image)   # tiempo real, no timestamp_ms (ver BodyTracker)
+                frame_h, frame_w = frame.shape[:2]
+                body_vec = body_location_features(hands, body, frame_w, frame_h)
 
                 now = time.monotonic()
                 key = cv2.waitKey(1) & 0xFF
@@ -383,6 +422,7 @@ def main() -> int:
                         # presionada" ni se espera un timeout para la suelta.
                         recording = True
                         sequence = []
+                        body_sequence = []
                         raw_frames = []
                         record_start = now
                         print("  grabando... (presiona 'g' de nuevo para terminar)")
@@ -391,10 +431,15 @@ def main() -> int:
                         recording = False
                         duracion_s = now - record_start
                         stats = compute_recording_stats(raw_frames, duracion_s)
+                        pct_sin_cuerpo = (
+                            100.0 * sum(1 for v in body_sequence if not v[-1]) / len(body_sequence)
+                            if body_sequence else 0.0
+                        )
                         print(
                             f"  grabacion terminada: {stats['n_frames']} frames, "
                             f"{stats['duracion_s']:.2f}s, "
-                            f"{stats['pct_sin_mano']:.0f}% de frames sin mano"
+                            f"{stats['pct_sin_mano']:.0f}% de frames sin mano, "
+                            f"{pct_sin_cuerpo:.0f}% sin cuerpo (hombros y boca)"
                         )
 
                         demasiado_corta = should_discard_by_default(stats["n_frames"])
@@ -450,6 +495,7 @@ def main() -> int:
                             fps_medido = stats["n_frames"] / stats["duracion_s"] if stats["duracion_s"] > 0 else 0.0
                             json_path, npz_path = save_muestra(
                                 word_dir, word, sequence, raw_frames, fps_medido,
+                                body_sequence=body_sequence,
                             )
                             existing_n += 1
                             print(f"  guardada {json_path.name} + {npz_path.name} "
@@ -460,18 +506,23 @@ def main() -> int:
                             print("  descartada.")
 
                         sequence = []
+                        body_sequence = []
                         raw_frames = []
                         if quit_all:
                             break
 
                 if recording:
                     sequence.append(build_feature_vector(hands))
+                    body_sequence.append(body_vec)
                     raw_frames.append(RawFrameSample(
                         timestamp_ms=(now - record_start) * 1000.0,
                         hands=capture_raw_hands(results),
+                        body=body,
                     ))
 
                 display = frame.copy()
+                if body is not None:
+                    draw_body_skeleton(display, body, hands.values())
                 for hand in hands.values():
                     draw_hand_landmarks(display, hand)
 
@@ -486,6 +537,7 @@ def main() -> int:
                 cv2.putText(display, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1, cv2.LINE_AA)
                 cv2.putText(display, "'g'=empezar/terminar  n=nueva sena  ESC=salir", (10, 60),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+                draw_body_status(display, bool(body_vec[-1]))
 
                 cv2.imshow(window, display)
 
@@ -502,6 +554,7 @@ def main() -> int:
         cap.release()
         cv2.destroyAllWindows()
         landmarker.close()
+        body_tracker.close()
 
     print(f"\nListo. Datos guardados en {OUTPUT_ROOT} y {RAW_DATASET_ROOT}")
     return 0

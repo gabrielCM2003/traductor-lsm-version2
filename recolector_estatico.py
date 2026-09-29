@@ -5,6 +5,11 @@ de landmarks ya definidas en senas.py / sign_classifier.py, para que los
 vectores generados aqui sean compatibles con ese mismo esquema de features.
 No reimplementa esa logica: la importa directamente.
 
+Ademas de las 126 columnas de las manos (v0..v125), cada fila guarda la
+ubicacion de las manos respecto al cuerpo en 9 columnas b0..b8 (MediaPipe
+Pose, ver body_location_features en body_tracker.py). entrenar_palabras.py
+sigue leyendo solo v0..v125 hasta que se entrene un modelo que las use.
+
 Uso:
     python recolector_estatico.py [--camera 0]
 
@@ -36,12 +41,20 @@ import mediapipe as mp
 
 from sign_classifier import normalize_keypoints, hand_to_feature_vector
 from senas import ensure_hand_model, HandDetection, draw_hand_landmarks
+from body_tracker import (
+    N_BODY_FEATURES, BodyTracker, body_location_features,
+    draw_body_skeleton, draw_body_status,
+)
 
 OUTPUT_DIR = Path(__file__).resolve().parent / "datos_palabras"
 OUTPUT_CSV = OUTPUT_DIR / "dataset_palabras.csv"
 N_FEATURES_PER_HAND = 63
 N_FEATURES = N_FEATURES_PER_HAND * 2
-FIELDNAMES = [f"v{i}" for i in range(N_FEATURES)] + ["etiqueta", "quien_grabo"]
+FIELDNAMES = (
+    [f"v{i}" for i in range(N_FEATURES)]
+    + [f"b{i}" for i in range(N_BODY_FEATURES)]
+    + ["etiqueta", "quien_grabo"]
+)
 TARGET_SAMPLES = (150, 200)
 
 # Comando para terminar el programa desde el prompt de texto. Con diagonal a
@@ -131,7 +144,18 @@ def count_existing_samples(label: str) -> int:
     return count
 
 
-def append_sample(vec: np.ndarray, label: str, recorder: str) -> None:
+def csv_header_matches() -> bool:
+    """False si OUTPUT_CSV ya existe con otras columnas (p. ej. uno grabado
+    antes de agregar b0..b8). Agregar filas de 135 valores bajo un encabezado
+    de 126 desalinearia todo el archivo, asi que main() se niega a seguir."""
+    if not OUTPUT_CSV.exists():
+        return True
+    with OUTPUT_CSV.open("r", newline="", encoding="utf-8") as f:
+        header = next(csv.reader(f), None)
+    return header is None or header == FIELDNAMES
+
+
+def append_sample(vec: np.ndarray, body_vec: np.ndarray, label: str, recorder: str) -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     is_new = not OUTPUT_CSV.exists()
     with OUTPUT_CSV.open("a", newline="", encoding="utf-8") as f:
@@ -139,6 +163,7 @@ def append_sample(vec: np.ndarray, label: str, recorder: str) -> None:
         if is_new:
             writer.writeheader()
         row = {f"v{i}": float(vec[i]) for i in range(N_FEATURES)}
+        row.update({f"b{i}": float(body_vec[i]) for i in range(N_BODY_FEATURES)})
         row["etiqueta"] = label
         row["quien_grabo"] = recorder
         writer.writerow(row)
@@ -150,9 +175,18 @@ def main() -> int:
     args = parser.parse_args()
 
     print("=== Recolector de senas ESTATICAS ===")
+    if not csv_header_matches():
+        print(
+            f"ERROR: {OUTPUT_CSV} tiene columnas de una version anterior (sin b0..b{N_BODY_FEATURES - 1},\n"
+            f"la ubicacion respecto al cuerpo). Renombralo o muevelo a otra carpeta y vuelve a correr\n"
+            f"este programa; no se agregan filas encima para no desalinear el archivo.",
+            file=sys.stderr,
+        )
+        return 1
     recorder = input("Tu nombre (para rastrear quien grabo cada muestra): ").strip() or "anonimo"
 
     landmarker = init_hand_landmarker(max_num_hands=2)
+    body_tracker = BodyTracker()
 
     cap = cv2.VideoCapture(args.camera)
     if not cap.isOpened():
@@ -195,8 +229,14 @@ def main() -> int:
                 timestamp_ms += 1
                 results = landmarker.detect_for_video(mp_image, timestamp_ms)
                 hands = parse_hands(results)
+                body = body_tracker.detect(mp_image)   # tiempo real, no timestamp_ms (ver BodyTracker)
+                frame_h, frame_w = frame.shape[:2]
+                body_vec = body_location_features(hands, body, frame_w, frame_h)
+                body_ok = bool(body_vec[-1])
 
                 display = frame.copy()
+                if body is not None:
+                    draw_body_skeleton(display, body, hands.values())
                 for hand in hands.values():
                     draw_hand_landmarks(display, hand)
 
@@ -209,6 +249,7 @@ def main() -> int:
                 cv2.putText(display, status, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (102, 255, 102), 1, cv2.LINE_AA)
                 cv2.putText(display, "ESPACIO=capturar  n=nueva palabra  ESC=salir", (10, 60),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+                draw_body_status(display, body_ok)
 
                 cv2.imshow(window, display)
                 key = cv2.waitKey(1) & 0xFF
@@ -218,9 +259,11 @@ def main() -> int:
                         print("  (sin manos detectadas, no se guardo)")
                     else:
                         vec = build_feature_vector(hands)
-                        append_sample(vec, label, recorder)
+                        append_sample(vec, body_vec, label, recorder)
                         session_count += 1
                         print(f"  capturada muestra #{existing + session_count} de '{label}'")
+                        if not body_ok:
+                            print("  aviso: no se veian hombros y boca, la ubicacion quedo en ceros")
                 elif key == ord('n'):
                     break
                 elif key == 27:  # ESC. 'q' ya no sale: es una etiqueta valida (letra Q).
@@ -233,6 +276,7 @@ def main() -> int:
         cap.release()
         cv2.destroyAllWindows()
         landmarker.close()
+        body_tracker.close()
 
     print(f"\nListo. Datos guardados en {OUTPUT_CSV}")
     return 0

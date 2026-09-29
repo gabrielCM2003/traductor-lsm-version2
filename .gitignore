@@ -6,3 +6,5 @@ __pycache__/
 .vscode/
 .idea/
 .DS_Store
+# Lo regenera DTWRecognizer (dtw_recognizer.py) cada vez que arranca senas.py.
+labels_dinamicas.json

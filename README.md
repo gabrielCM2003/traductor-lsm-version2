@@ -9,6 +9,7 @@ El repositorio incluye también la documentación del **guante instrumentado** d
 - Detección de manos en tiempo real con MediaPipe Hand Landmarker (una o dos manos).
 - Alfabeto estático (21 letras) vía modelo ONNX + suavizado temporal de predicciones.
 - Alfabeto dinámico (J, K, Ñ, Q, X, Z) vía DTW (Dynamic Time Warping) contra un dataset abierto de LSM (CICESE, CC BY 4.0), con segmentación automática de inicio/fin de seña y sin necesidad de tecla. Se alterna con **Ctrl+D** dentro de la app.
+- Esqueleto del cuerpo con MediaPipe Pose (hombros, brazos, cuello y cara) para saber dónde están las manos respecto a la persona, necesario para las palabras completas. Se muestra u oculta con la casilla "Dibujar esqueleto del cuerpo".
 - Interfaz gráfica construida con PyQt6.
 - Construcción de palabras letra por letra, con historial y lectura en voz alta.
 
@@ -20,7 +21,11 @@ El repositorio incluye también la documentación del **guante instrumentado** d
 | `sign_classifier.py` | Clasificador ONNX del alfabeto estático, suavizado de predicciones y confirmación de letras y espacios |
 | `dtw_recognizer.py` | Reconocedor DTW del alfabeto dinámico (J, K, Ñ, Q, X, Z) |
 | `segmentador_automatico.py` | Máquina de estados que detecta inicio/fin de una seña dinámica sin tecla |
-| `recolector_estatico.py`, `recolector_dinamico.py` | Herramientas para grabar vocabulario nuevo (letras o palabras) |
+| `body_tracker.py` | Esqueleto del cuerpo (MediaPipe Pose) y ubicación de las manos respecto a hombros y boca (9 valores aparte del vector de 126) |
+| `recolector_estatico.py`, `recolector_dinamico.py` | Herramientas para grabar vocabulario nuevo (letras o palabras), con la ubicación respecto al cuerpo |
+| `entrenar_palabras.py`, `word_classifier.py`, `lsm_words.onnx`, `word_labels.json` | Entrenamiento y clasificador de palabras. El modelo incluido es solo de prueba (datos sintéticos, no reconoce palabras reales; ver `ESTADO_PROYECTO_COMPLETO.md`) |
+| `procesar_dataset_dinamico.py`, `extraer_landmarks_crudos.py`, `verificar_landmarks_crudos.py` | Conversión del dataset CICESE a plantillas y respaldo de landmarks crudos |
+| `evaluar_*.py`, `diagnostico_orientacion.py`, `separar_muestras_cortas.py`, `probar_modelos.py` | Herramientas de evaluación y limpieza de datos usadas para medir el alfabeto dinámico |
 | `datos_dinamicas/` | Plantillas DTW del alfabeto dinámico (dataset CICESE procesado) |
 | `lsm_alphabet.onnx`, `lsm_alphabet.onnx.data` | Modelo entrenado del alfabeto estático (red pequeña, 63 entradas: 21 puntos × 3) |
 | `lsm_labels.json` | Etiquetas del modelo estático y tipo de normalización |
@@ -42,6 +47,8 @@ source venv/bin/activate        # En Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
+En macOS, `requirements.txt` evita mediapipe 1.0.1, que se cae al iniciar los detectores en Mac.
+
 En Raspberry Pi con la cámara oficial, instala además Picamera2 con `sudo apt install python3-picamera2` y crea el entorno virtual con `--system-site-packages`. Para la voz en Linux: `sudo apt install espeak-ng` (macOS usa `say`, que ya viene instalado).
 
 ## Uso
@@ -50,7 +57,7 @@ En Raspberry Pi con la cámara oficial, instala además Picamera2 con `sudo apt 
 python senas.py
 ```
 
-La primera vez descarga el modelo de manos de MediaPipe en `~/.sign_translator/models/` (requiere internet la primera vez). La configuración se guarda en `~/.sign_translator/config.json`; los valores inválidos se ignoran o se ajustan a su rango.
+La primera vez descarga los modelos de manos y de pose de MediaPipe en `~/.sign_translator/models/` (requiere internet la primera vez). En la Raspberry Pi, si hace falta CPU, el modelo de pose se puede bajar a `"pose_model": "lite"` o apagar con `"body_tracking": false` en la configuración. La configuración se guarda en `~/.sign_translator/config.json`; los valores inválidos se ignoran o se ajustan a su rango.
 
 ### Opciones disponibles
 

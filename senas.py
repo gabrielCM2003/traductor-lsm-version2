@@ -40,6 +40,7 @@ except ImportError:
     raise
 
 from sign_classifier import SignClassifier, PredictionSmoother, normalize_keypoints, hand_to_feature_vector
+from body_tracker import BodyDetection, BodyTracker, DEFAULT_POSE_MODEL, draw_body_skeleton
 
 try:
     from segmentador_automatico import AutoSegmenter, MIN_SEQUENCE_MS as DYN_STANDALONE_MIN_SEQUENCE_MS
@@ -158,6 +159,14 @@ DEFAULT_CONFIG = {
     "watchdog_timeout_s": 5.0,
     "draw_landmarks": True,
     "draw_connections": True,
+    # Esqueleto del cuerpo (MediaPipe Pose, ver body_tracker.py). En False no
+    # se carga el modelo de pose: util si en la Raspberry Pi hace falta el
+    # tiempo de CPU y solo se usa el alfabeto.
+    "body_tracking": True,
+    "draw_body": True,
+    # "full" (mas estable) o "lite" (mas rapido, para la Raspberry Pi si hace
+    # falta). Ver DEFAULT_POSE_MODEL en body_tracker.py.
+    "pose_model": DEFAULT_POSE_MODEL,
 }
 
 
@@ -185,6 +194,9 @@ class AppConfig:
     watchdog_timeout_s: float = DEFAULT_CONFIG["watchdog_timeout_s"]
     draw_landmarks: bool = DEFAULT_CONFIG["draw_landmarks"]
     draw_connections: bool = DEFAULT_CONFIG["draw_connections"]
+    body_tracking: bool = DEFAULT_CONFIG["body_tracking"]
+    draw_body: bool = DEFAULT_CONFIG["draw_body"]
+    pose_model: str = DEFAULT_CONFIG["pose_model"]
 
     @classmethod
     def load(cls, json_path: Optional[Path] = None) -> "AppConfig":
@@ -400,6 +412,7 @@ class HandDetection:
 @dataclass
 class FrameDetections:
     hands: list[HandDetection] = field(default_factory=list)
+    body: Optional[BodyDetection] = None    # None si body_tracking esta apagado o no hay nadie en cuadro
     timestamp: float = field(default_factory=time.time)
 
     @property
@@ -705,6 +718,7 @@ class HandTrackingThread(QThread):
         self._cfg = config
         self._run_flag = True
         self._hands_solution = None
+        self._body_tracker: Optional[BodyTracker] = None
 
         self._keypoint_buffer: deque[np.ndarray] = deque(
             maxlen=config.keypoint_buffer_size
@@ -807,6 +821,9 @@ class HandTrackingThread(QThread):
     def set_draw_connections(self, value: bool) -> None:
         self._cfg.draw_connections = value
 
+    def set_draw_body(self, value: bool) -> None:
+        self._cfg.draw_body = value
+
     def reset_word_state(self) -> None:
         self._frames_without_hand = 0
         self._space_already_committed = False
@@ -881,6 +898,13 @@ class HandTrackingThread(QThread):
                 continue
 
             detections = self._parse_results(results)
+            if self._body_tracker is not None:
+                # Sin timestamp_ms a proposito: BodyTracker usa tiempo real
+                # (con el +1 de las manos la pose se retrasa, ver body_tracker.py).
+                try:
+                    detections.body = self._body_tracker.detect(mp_image)
+                except Exception as e:
+                    log.exception("MediaPipe Pose falló: %s", e)
             annotated = self._render(frame, detections)
 
             self._update_keypoint_buffer(detections)
@@ -1179,6 +1203,18 @@ class HandTrackingThread(QThread):
             )
             self._hands_solution = HandLandmarker.create_from_options(options)
             log.info("MediaPipe Hand Landmarker listo.")
+
+            # El cuerpo es opcional: si el modelo de pose no se puede cargar
+            # (p. ej. sin internet la primera vez), las manos y el alfabeto
+            # siguen funcionando igual, solo sin esqueleto.
+            if self._cfg.body_tracking:
+                try:
+                    self._body_tracker = BodyTracker(self._cfg.pose_model, models_dir)
+                    log.info("MediaPipe Pose Landmarker (%s) listo.", self._cfg.pose_model)
+                except Exception:
+                    log.exception("No se pudo iniciar MediaPipe Pose; se sigue sin esqueleto del cuerpo")
+                    self._body_tracker = None
+
             self.model_loaded_signal.emit()
             return True
         except Exception as e:
@@ -1231,6 +1267,11 @@ class HandTrackingThread(QThread):
 
     def _render(self, frame: np.ndarray, detections: FrameDetections) -> np.ndarray:
         out = frame.copy()
+
+        # Antes que las manos (y antes del return de "sin manos"): el
+        # esqueleto se ve aunque no haya ninguna mano en cuadro.
+        if detections.body is not None and self._cfg.draw_body:
+            draw_body_skeleton(out, detections.body, detections.hands)
 
         if detections.num_hands == 0:
             cv2.putText(
@@ -1333,6 +1374,11 @@ class HandTrackingThread(QThread):
         if self._hands_solution is not None:
             try:
                 self._hands_solution.close()
+            except Exception:
+                pass
+        if self._body_tracker is not None:
+            try:
+                self._body_tracker.close()
             except Exception:
                 pass
 
@@ -1597,6 +1643,17 @@ class SignLanguageApp(QMainWindow):
         self.cb_connections.setChecked(self.cfg.draw_connections)
         self.cb_connections.toggled.connect(self._on_draw_connections)
         side.addWidget(self.cb_connections)
+
+        self.cb_body = QCheckBox("Dibujar esqueleto del cuerpo")
+        self.cb_body.setChecked(self.cfg.draw_body)
+        self.cb_body.setEnabled(self.cfg.body_tracking)
+        self.cb_body.setToolTip(
+            "Hombros, brazos y cara (MediaPipe Pose). En magenta, los puntos de\n"
+            "referencia para ubicar las manos: centro de hombros y de la boca.\n"
+            "Desactivado si body_tracking es false en la configuracion."
+        )
+        self.cb_body.toggled.connect(self._on_draw_body)
+        side.addWidget(self.cb_body)
 
         side.addSpacing(8)
 
@@ -1865,6 +1922,11 @@ class SignLanguageApp(QMainWindow):
         self.cfg.draw_connections = checked
         if self.ai_thread is not None:
             self.ai_thread.set_draw_connections(checked)
+
+    def _on_draw_body(self, checked: bool) -> None:
+        self.cfg.draw_body = checked
+        if self.ai_thread is not None:
+            self.ai_thread.set_draw_body(checked)
 
     def _on_stable_frames_changed(self, value: int) -> None:
         self.stable_frames_value_label.setText(str(value))
