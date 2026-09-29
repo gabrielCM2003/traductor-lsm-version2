@@ -1,0 +1,982 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<style>:root{color-scheme:light;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}body{margin:0}img{max-width:100%}[hidden]{display:none!important}</style>
+</head>
+<body>
+<title>Ensamblaje del guante Hall</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600&family=Barlow+Semi+Condensed:wght@600;700&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+:root {
+  --paper: #EEF2F5;
+  --panel: #FFFFFF;
+  --grid: #E3E9EE;
+  --ink: #15202B;
+  --ink-2: #475866;
+  --ink-3: #718190;
+  --line: #D2DBE2;
+  --accent: #3446D8;
+  --accent-ink: #FFFFFF;
+  --accent-soft: #E7EAFC;
+  --warn-bg: #FFF3D6;
+  --warn-ink: #6E4700;
+  --fabric: #E6E9EC;
+  --fabric-edge: #A7B2BB;
+  --fabric-dark: #D3DAE0;
+  --stitch: #98A4AE;
+  --sheath: #6E7A85;
+  --usb: #3A4450;
+  --mark: #3446D8;
+  --field: #6A5AE0;
+  --radio: #3446D8;
+  --fov: rgba(52, 70, 216, .08);
+  --fov-edge: rgba(52, 70, 216, .35);
+  --chip-bg: #FFFFFF;
+  --chip-line: #B9C4CD;
+  --font-display: "Barlow Semi Condensed", "Arial Narrow", "Helvetica Neue", Arial, sans-serif;
+  --font-body: "Barlow", "Helvetica Neue", Arial, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #0C1319;
+    --panel: #111B23;
+    --grid: #18242E;
+    --ink: #E3EAF0;
+    --ink-2: #A5B3BF;
+    --ink-3: #788896;
+    --line: #243340;
+    --accent: #8B97FF;
+    --accent-ink: #0C1319;
+    --accent-soft: #1C2452;
+    --warn-bg: #362809;
+    --warn-ink: #FFD58A;
+    --fabric: #D5DBE0;
+    --fabric-edge: #8B97A1;
+    --fabric-dark: #C0C8CF;
+    --stitch: #87939D;
+    --sheath: #66727D;
+    --usb: #9AA7B3;
+    --mark: #3446D8;
+    --field: #A195FF;
+    --radio: #8B97FF;
+    --fov: rgba(139, 151, 255, .08);
+    --fov-edge: rgba(139, 151, 255, .35);
+    --chip-bg: #16222C;
+    --chip-line: #33444F;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #0C1319;
+  --panel: #111B23;
+  --grid: #18242E;
+  --ink: #E3EAF0;
+  --ink-2: #A5B3BF;
+  --ink-3: #788896;
+  --line: #243340;
+  --accent: #8B97FF;
+  --accent-ink: #0C1319;
+  --accent-soft: #1C2452;
+  --warn-bg: #362809;
+  --warn-ink: #FFD58A;
+  --fabric: #D5DBE0;
+  --fabric-edge: #8B97A1;
+  --fabric-dark: #C0C8CF;
+  --stitch: #87939D;
+  --sheath: #66727D;
+  --usb: #9AA7B3;
+  --mark: #3446D8;
+  --field: #A195FF;
+  --radio: #8B97FF;
+  --fov: rgba(139, 151, 255, .08);
+  --fov-edge: rgba(139, 151, 255, .35);
+  --chip-bg: #16222C;
+  --chip-line: #33444F;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--font-body);
+  font-size: 16px;
+  line-height: 1.55;
+}
+.wrap { max-width: 1220px; margin: 0 auto; padding-inline: clamp(16px, 3vw, 32px); padding-block: 28px 56px; }
+
+header.top { display: grid; gap: 6px; margin-bottom: 22px; }
+.eyebrow { font-family: var(--font-mono); font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: var(--ink-3); }
+h1 { font-family: var(--font-display); font-weight: 700; font-size: clamp(30px, 4.4vw, 46px); line-height: 1.02; letter-spacing: -.01em; margin: 0; text-wrap: balance; }
+.lede { margin: 4px 0 0; color: var(--ink-2); max-width: 72ch; }
+.lede b { color: var(--ink); font-weight: 600; }
+
+.layout { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(300px, 1fr); gap: 20px; align-items: start; }
+@media (max-width: 920px) { .layout { grid-template-columns: 1fr; } }
+
+.sheet { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; overflow: hidden; }
+.drafting {
+  background-color: var(--panel);
+  background-image:
+    linear-gradient(var(--grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+  background-size: 20px 20px;
+  background-position: -1px -1px;
+}
+.sheet-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; padding: 12px 16px; border-bottom: 1px solid var(--line); background: var(--panel); }
+.sheet-head h2 { margin: 0; font-family: var(--font-display); font-weight: 600; font-size: 18px; letter-spacing: .01em; }
+.sheet-head .meta { font-family: var(--font-mono); font-size: 12px; color: var(--ink-3); }
+
+#stage { display: block; width: 100%; height: auto; }
+#stage text { font-family: var(--font-body); }
+#stage .callout text { font-size: 14px; font-weight: 500; fill: var(--ink-2); }
+#stage .callout path { stroke: var(--ink-3); stroke-width: 1; fill: none; stroke-dasharray: 3 3; }
+#stage .callout circle { fill: var(--ink-3); }
+#stage .callout.is-new text { fill: var(--accent); font-weight: 600; }
+#stage .callout.is-new path { stroke: var(--accent); }
+#stage .callout.is-new circle { fill: var(--accent); }
+#stage .tag rect { fill: var(--chip-bg); stroke: var(--accent); stroke-width: 1.2; }
+#stage .tag text { font-family: var(--font-mono); font-size: 11px; font-weight: 500; fill: var(--accent); }
+#stage .onboard { font-family: var(--font-mono); }
+#stage .sys text { font-family: var(--font-display); font-weight: 600; font-size: 17px; fill: var(--ink); }
+#stage .sys .small { font-family: var(--font-mono); font-size: 12px; font-weight: 400; fill: var(--ink-2); }
+#stage .sys .radio-lbl { font-family: var(--font-mono); font-size: 12px; font-weight: 500; fill: var(--radio); }
+#stage .sys .onpcb { font-family: var(--font-mono); font-size: 11px; font-weight: 500; fill: #E8EDF1; }
+#stage [data-step], #stage .callout, #stage .tag, #stage .onboard, #stage .sys { transition: opacity .45s ease; }
+#stage [data-anim="pop"] { transform-box: fill-box; transform-origin: center; }
+#stage .waves path { stroke: var(--radio); stroke-width: 1.6; fill: none; stroke-linecap: round; }
+@keyframes wave { 0%, 100% { opacity: .15; } 40% { opacity: 1; } }
+#stage .waves path { animation: wave 1.6s ease-in-out infinite; }
+#stage .waves path:nth-child(2) { animation-delay: .2s; }
+#stage .waves path:nth-child(3) { animation-delay: .4s; }
+@media (prefers-reduced-motion: reduce) { #stage .waves path { animation: none; opacity: .8; } }
+@media (max-width: 560px) { #stage .callout, #stage .tag { display: none; } }
+
+.legend { display: flex; flex-wrap: wrap; gap: 8px 16px; padding: 12px 16px; border-top: 1px solid var(--line); font-size: 13px; color: var(--ink-2); background: var(--panel); }
+.legend span { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.legend i { display: inline-block; width: 18px; height: 4px; border-radius: 2px; }
+.legend i.dot { width: 10px; height: 10px; border-radius: 50%; }
+.legend i.dash { background: repeating-linear-gradient(90deg, var(--radio) 0 4px, transparent 4px 7px); }
+
+.side { display: grid; gap: 16px; position: sticky; top: calc(env(safe-area-inset-top, 0px) + 16px); }
+@media (max-width: 920px) { .side { position: static; } }
+
+.stepcard { padding: 18px 18px 16px; display: grid; gap: 10px; }
+.stepcard .count { font-family: var(--font-mono); font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: var(--accent); }
+.stepcard h3 { margin: 0; font-family: var(--font-display); font-weight: 700; font-size: 28px; line-height: 1.08; text-wrap: balance; }
+.stepcard p { margin: 0; color: var(--ink-2); }
+.note { display: grid; grid-template-columns: auto 1fr; gap: 8px; align-items: start; background: var(--warn-bg); color: var(--warn-ink); border-radius: 10px; padding: 10px 12px; font-size: 14.5px; line-height: 1.45; }
+.note svg { margin-top: 2px; }
+.note[hidden] { display: none; }
+.progress { height: 4px; background: var(--grid); border-radius: 2px; overflow: hidden; }
+.progress > div { height: 100%; width: 0; background: var(--accent); transition: width .5s ease; }
+
+.controls { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 8px; padding: 0 18px 18px; }
+.controls .btn { justify-content: center; }
+.controls .primary span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+button { font: inherit; cursor: pointer; }
+.btn { display: inline-flex; align-items: center; gap: 8px; border: 1px solid var(--line); background: var(--panel); color: var(--ink); padding: 9px 14px; border-radius: 10px; font-weight: 600; font-size: 15px; }
+.btn:hover { border-color: var(--ink-3); }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+.btn.primary:hover { filter: brightness(1.06); }
+.btn:disabled { opacity: .45; cursor: default; }
+.btn:focus-visible, .steps button:focus-visible, input[type="range"]:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.steps { list-style: none; margin: 0; padding: 6px; display: grid; gap: 2px; }
+.steps button { width: 100%; display: grid; grid-template-columns: 34px 1fr; gap: 8px; align-items: center; text-align: left; background: transparent; border: 0; border-radius: 8px; padding: 7px 10px; color: var(--ink-2); font-size: 15px; }
+.steps button:hover { background: var(--grid); color: var(--ink); }
+.steps .n { font-family: var(--font-mono); font-size: 12px; color: var(--ink-3); }
+.steps button.done .n { color: var(--ink-2); }
+.steps button[aria-current="step"] { background: var(--accent-soft); color: var(--ink); font-weight: 600; }
+.steps button[aria-current="step"] .n { color: var(--accent); }
+
+.mech { margin-top: 20px; }
+.mech-body { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(220px, 1fr); gap: 0; }
+@media (max-width: 700px) { .mech-body { grid-template-columns: 1fr; } }
+#side { display: block; width: 100%; height: auto; }
+.readout { padding: 14px 16px; display: grid; gap: 10px; border-left: 1px solid var(--line); background: var(--panel); }
+@media (max-width: 700px) { .readout { border-left: 0; border-top: 1px solid var(--line); } }
+.rrow { display: grid; gap: 4px; }
+.rrow .lbl { font-size: 13px; color: var(--ink-3); display: flex; justify-content: space-between; gap: 8px; }
+.rrow .val { font-family: var(--font-mono); font-size: 20px; font-weight: 500; font-variant-numeric: tabular-nums; color: var(--ink); }
+.bar { position: relative; height: 8px; background: var(--grid); border-radius: 4px; overflow: visible; }
+.bar > .fill { position: absolute; left: 0; top: 0; bottom: 0; background: var(--accent); border-radius: 4px; width: 0; }
+.bar > .tick { position: absolute; top: -3px; bottom: -3px; width: 2px; background: var(--ink-3); border-radius: 1px; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip { font-family: var(--font-mono); font-size: 12px; padding: 3px 8px; border-radius: 999px; border: 1px solid var(--chip-line); color: var(--ink-2); background: var(--chip-bg); transition: background .3s, color .3s, border-color .3s; }
+.chip.hot { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+.slider { padding: 10px 16px 14px; display: grid; gap: 6px; border-top: 1px solid var(--line); background: var(--panel); }
+.slider-row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+.slider label { font-size: 14px; color: var(--ink-2); }
+input[type="range"] { flex: 1 1 200px; accent-color: var(--accent); min-width: 0; }
+#mechStatus { font-size: 14px; color: var(--ink-2); min-height: 1.45em; }
+
+footer.fine { margin-top: 26px; font-size: 13.5px; color: var(--ink-3); max-width: 90ch; }
+</style>
+
+<div class="wrap">
+  <header class="top">
+    <div class="eyebrow">Indivisa Ingenium 2026 · Propuesta con sensores Hall</div>
+    <h1>Ensamblaje del guante Hall</h1>
+    <p class="lede"><b>Un SS49E y un imán de 3 × 1 mm por dedo, dos guantes inalámbricos y una Raspberry Pi con cámara.</b> Cada guante envía sus lecturas por ESP-NOW a una ESP32 receptora conectada a la Pi, que ejecuta el programa con la cámara y los guantes al mismo tiempo. Recorre el montaje paso a paso o arrastra el control de la vista lateral para ver cómo cambia la lectura al doblar un dedo.</p>
+  </header>
+
+  <div class="layout">
+    <div>
+      <section class="sheet" aria-labelledby="stageTitle">
+        <div class="sheet-head">
+          <h2 id="stageTitle">Vista dorsal · mano derecha</h2>
+          <span class="meta" id="stageMeta">Guante terminado</span>
+        </div>
+        <div class="drafting">
+          <svg id="stage" viewBox="0 0 600 640" role="img" aria-label="Guante con sensores Hall, imanes, ESP32, batería, IMU, contactos y vibradores; al final, los dos guantes enviando datos a una Raspberry Pi con cámara"></svg>
+        </div>
+        <div class="legend" aria-label="Código de colores">
+          <span><i style="background:#D23F3F"></i>3,3 V</span>
+          <span><i style="background:#2A2D31;outline:1px solid var(--ink-3)"></i>GND</span>
+          <span><i style="background:#E2B100"></i>Señal Hall</span>
+          <span><i style="background:#6E7A85"></i>Cable agrupado</span>
+          <span><i style="background:#C9793B"></i>Contactos</span>
+          <span><i style="background:#7A5FD0"></i>Vibradores</span>
+          <span><i style="background:#F0C65A"></i>Batería</span>
+          <span><i class="dash"></i>ESP-NOW</span>
+          <span><i class="dot" style="background:#D6DBE0;outline:1px solid #6D7780"></i>Imán</span>
+        </div>
+      </section>
+
+      <section class="sheet mech" aria-labelledby="mechTitle">
+        <div class="sheet-head">
+          <h2 id="mechTitle">Vista lateral de un dedo</h2>
+          <span class="meta">SS49E fijo · imán en la falange de al lado</span>
+        </div>
+        <div class="mech-body">
+          <div class="drafting">
+            <svg id="side" viewBox="0 0 420 250" role="img" aria-label="Dedo de perfil: el sensor en la falange proximal y el imán en la falange media, que gira al doblar el dedo">
+              <g>
+                <rect x="10" y="90" width="64" height="58" rx="12" fill="var(--fabric)" stroke="var(--fabric-edge)" stroke-width="1.5"/>
+                <rect x="44" y="104" width="160" height="28" rx="14" fill="var(--fabric)" stroke="var(--fabric-edge)" stroke-width="1.5"/>
+                <g id="midSeg">
+                  <g id="distSeg">
+                    <rect x="290" y="107" width="66" height="22" rx="11" fill="var(--fabric)" stroke="var(--fabric-edge)" stroke-width="1.5"/>
+                  </g>
+                  <rect x="198" y="105" width="98" height="26" rx="13" fill="var(--fabric)" stroke="var(--fabric-edge)" stroke-width="1.5"/>
+                  <g fill="none" stroke="var(--field)" stroke-width="1.2" stroke-dasharray="2 3" opacity=".55">
+                    <ellipse cx="220" cy="101" rx="15" ry="9"/>
+                    <ellipse cx="220" cy="101" rx="25" ry="15"/>
+                    <ellipse cx="220" cy="101" rx="36" ry="22" opacity=".6"/>
+                  </g>
+                  <rect x="211" y="95" width="18" height="12" rx="5" fill="#CFE0EA" stroke="#8DB0C3" stroke-width="1"/>
+                  <rect id="magTop" x="214" y="97.4" width="12" height="3.4" fill="#D65A52"/>
+                  <rect id="magBot" x="214" y="100.8" width="12" height="3.4" fill="#4C79C4"/>
+                  <circle cx="204" cy="118" r="2.4" fill="var(--stitch)"/>
+                  <circle cx="296" cy="118" r="2.2" fill="var(--stitch)"/>
+                </g>
+                <g stroke-linecap="round">
+                  <line x1="162" y1="95.5" x2="18" y2="95.5" stroke="#D23F3F" stroke-width="1.6"/>
+                  <line x1="162" y1="98.5" x2="18" y2="98.5" stroke="#E2B100" stroke-width="1.6"/>
+                  <line x1="162" y1="101.5" x2="18" y2="101.5" stroke="#2A2D31" stroke-width="1.6"/>
+                  <line x1="172" y1="95.5" x2="162" y2="95.5" stroke="#A7AFB6" stroke-width="1.3"/>
+                  <line x1="172" y1="98.5" x2="162" y2="98.5" stroke="#A7AFB6" stroke-width="1.3"/>
+                  <line x1="172" y1="101.5" x2="162" y2="101.5" stroke="#A7AFB6" stroke-width="1.3"/>
+                </g>
+                <rect x="172" y="92" width="16" height="12" rx="1.6" fill="#1C1F23"/>
+                <line x1="174" y1="95" x2="186" y2="95" stroke="#3B4148" stroke-width="1"/>
+                <text x="180" y="80" text-anchor="middle" font-family="var(--font-mono)" font-size="12" fill="var(--ink-2)">SS49E</text>
+                <line x1="180" y1="84" x2="180" y2="91" stroke="var(--ink-3)" stroke-width="1"/>
+                <text x="212" y="80" text-anchor="start" font-family="var(--font-mono)" font-size="12" fill="var(--ink-2)">imán</text>
+                <text x="60" y="154" font-family="var(--font-body)" font-size="13" fill="var(--ink-3)">falange proximal</text>
+                <text x="292" y="80" font-family="var(--font-body)" font-size="13" fill="var(--ink-3)">falange media</text>
+              </g>
+            </svg>
+          </div>
+          <div class="readout" aria-live="off">
+            <div class="rrow">
+              <div class="lbl"><span>Flexión</span></div>
+              <div class="val" id="rTheta">30°</div>
+            </div>
+            <div class="rrow">
+              <div class="lbl"><span>Salida del SS49E</span><span>sin campo ≈ 1,65 V</span></div>
+              <div class="val" id="rVolt">— V</div>
+              <div class="bar"><div class="fill" id="bVolt"></div><div class="tick" style="left:50%"></div></div>
+            </div>
+            <div class="rrow">
+              <div class="lbl"><span>ADC1 · 12 bits</span><span>0–4095</span></div>
+              <div class="val" id="rAdc">—</div>
+            </div>
+            <div class="rrow">
+              <div class="lbl"><span>d calibrado</span><span>0 abierto · 1 puño</span></div>
+              <div class="val" id="rD">—</div>
+              <div class="bar"><div class="fill" id="bD"></div></div>
+            </div>
+            <div class="chips">
+              <span class="chip" id="cOpen">abierto —</span>
+              <span class="chip" id="cClosed">puño —</span>
+              <span class="chip" id="cFlip">N hacia el sensor</span>
+            </div>
+          </div>
+        </div>
+        <div class="slider">
+          <div class="slider-row">
+            <label for="theta">Doblar el dedo</label>
+            <input id="theta" type="range" min="0" max="90" step="1" value="30" aria-describedby="mechStatus">
+            <button class="btn" id="flipBtn" type="button">Invertir imán</button>
+            <button class="btn" id="calBtn" type="button">Calibrar</button>
+          </div>
+          <div id="mechStatus" aria-live="polite">Arrastra el control para doblar el dedo. Los valores son ilustrativos: la curva real se mide con el guante puesto.</div>
+        </div>
+      </section>
+    </div>
+
+    <aside class="side">
+      <section class="sheet" aria-live="polite">
+        <div class="stepcard">
+          <div class="count" id="sCount">Resultado final</div>
+          <h3 id="sTitle">Guante terminado</h3>
+          <p id="sText"></p>
+          <div class="note" id="sNote" hidden>
+            <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1.5 15 14H1z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="M8 6v4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><circle cx="8" cy="12" r=".9" fill="currentColor"/></svg>
+            <span id="sNoteText"></span>
+          </div>
+          <div class="progress" aria-hidden="true"><div id="prog"></div></div>
+        </div>
+        <div class="controls">
+          <button class="btn" id="prevBtn" type="button" aria-label="Paso anterior">
+            <svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true"><path d="M9 2 4 7l5 5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>Anterior
+          </button>
+          <button class="btn primary" id="playBtn" type="button">
+            <svg id="playIcon" width="14" height="14" viewBox="0 0 14 14" aria-hidden="true"><path d="M3.5 2v10l8-5z" fill="currentColor"/></svg><span id="playText">Reproducir montaje</span>
+          </button>
+          <button class="btn" id="nextBtn" type="button" aria-label="Paso siguiente">Siguiente
+            <svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true"><path d="m5 2 5 5-5 5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+        </div>
+      </section>
+
+      <section class="sheet" aria-label="Pasos del montaje">
+        <ol class="steps" id="stepList"></ol>
+      </section>
+    </aside>
+  </div>
+
+  <footer class="fine">Basado en la propuesta técnica «Guante LSM con sensores Hall» del 25 de septiembre de 2026 y en el diseño inalámbrico con LiPo de la guía técnica v2. Ilustración esquemática: la separación y la orientación finales de cada imán se eligen con lecturas reales, y los valores de la vista lateral son ilustrativos. Teclado: flechas para cambiar de paso, espacio para reproducir o pausar.</footer>
+</div>
+
+<script>
+(() => {
+  const NS = 'http://www.w3.org/2000/svg';
+  const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const $ = (id) => document.getElementById(id);
+  function el(tag, attrs, parent) {
+    const e = document.createElementNS(NS, tag);
+    if (attrs) for (const k in attrs) if (attrs[k] != null) e.setAttribute(k, attrs[k]);
+    if (parent) parent.appendChild(e);
+    return e;
+  }
+
+  const STEPS = [
+    { t: 'Guante terminado', text: 'Cada dedo lleva un sensor Hall lineal SS49E en la falange proximal y un imán de neodimio de 3 × 1 mm en la falange de al lado. La ESP32 de la muñeca lee los sensores, la IMU y los contactos, maneja los vibradores y envía todo sin cables. El último paso muestra el sistema completo: los dos guantes, la ESP32 receptora y la Raspberry Pi con cámara.' },
+    { t: 'Preparar el guante', text: 'Usa un guante delgado y de color claro. Con el guante puesto, marca en el dorso de cada dedo la falange proximal y la siguiente: ahí irán el sensor y el imán.', note: 'Marca con el guante puesto: sobre la mesa, las falanges no quedan donde parece.' },
+    { t: 'Probar una pareja Hall–imán', text: 'Antes de coser, fija de forma provisional un solo SS49E y su imán en el índice. Mide con la mano abierta, a media flexión y en puño, y prueba el imán en las dos orientaciones. La vista lateral repite la prueba.', note: 'Verifica con el multímetro el orden de las patillas antes de alimentar: cambia entre fabricantes. Usa solo sensores lineales 49E/SS49E, no interruptores A3144 ni KY-003.', dwell: 9800, mech: 'bench' },
+    { t: 'Sensores en la falange proximal', text: 'Con la posición ya probada, fija un SS49E en el dorso de la falange proximal de cada dedo, dentro de una funda de tela o un soporte aislante. En el pulgar también va en la falange proximal.', note: 'El sensor no debe presionar la articulación ni estorbar al cerrar la mano.' },
+    { t: 'Imanes en la falange de al lado', text: 'Encapsula cada imán para que no pueda soltarse y fíjalo en la falange que sigue a su sensor: la media en los dedos largos y la distal en el pulgar.', note: 'La distancia y la orientación finales se eligen con lecturas reales. Un imán más grande puede saturar el sensor y afectar a los dedos vecinos.' },
+    { t: 'Cables con holgura', text: 'Cada sensor lleva tres hilos: 3,3 V, GND y señal. Agrúpalos en un cable por dedo y llévalos por el dorso hasta la muñeca, con holgura en el nudillo y alivio de tensión en las patillas.', note: 'Mantén el cableado lejos de los imanes de los dedos vecinos.' },
+    { t: 'ESP32 en la muñeca', text: 'Conecta la señal de cada sensor a una entrada del ADC1: pulgar GPIO 36, índice 39, medio 34, anular 35 y meñique 32. Los cinco sensores comparten 3,3 V y GND.', note: 'Usa solo el ADC1: el ADC2 deja de leer mientras el WiFi está activo, y ESP-NOW usa el WiFi. Si hay ruido, un capacitor de 100 nF entre cada entrada y GND.' },
+    { t: 'Batería en el antebrazo', text: 'Sin cable, cada guante necesita su propia energía. Dentro de una funda en el antebrazo: LiPo 1S de 1000 mAh, cargador TP4056, interruptor y elevador MT3608 que entrega 5,0 V a VIN de la ESP32. Un divisor de 100 kΩ / 100 kΩ hacia GPIO 33 permite medir la batería.', note: 'Ajusta el MT3608 a 5,0 V con el multímetro antes de conectar la ESP32 y verifica la polaridad del conector JST. Nunca conectes a la vez el USB y la batería.' },
+    { t: 'Enlace inalámbrico y calibración', text: 'La ESP32 del guante envía sus lecturas unas 50 veces por segundo por ESP-NOW a la ESP32 receptora. Cada mensaje lleva de qué guante viene (izquierdo o derecho) y un número de secuencia. Después calibra con la mano abierta y en puño: d = (lectura − abierto) / (cerrado − abierto).', note: 'ESP-NOW deja que una sola receptora escuche a los dos guantes con poco retraso. Con Bluetooth también se puede, pero atender dos guantes a la vez desde una ESP32 requiere más código.', dwell: 9000, mech: 'calib' },
+    { t: 'Contactos en las yemas', text: 'Pega cinta de cobre en las yemas. El pulgar va a GND; índice, medio y anular van a GPIO 25, 26 y 27 con pull-up interno: al tocar el pulgar, la entrada lee LOW.' },
+    { t: 'IMU en el dorso', text: 'El MPU6050 va plano y bien fijo en el centro del dorso, sobre una base rígida. Se conecta por I²C: SDA a GPIO 21 y SCL a GPIO 22.' },
+    { t: 'Vibradores y driver', text: 'Un vibrador por dedo sobre el dorso de la mano, lejos de los sensores, y el ULN2003 junto a la ESP32. Acciona cada motor y comprueba que ningún Hall cambie más del 20 % de su rango útil.', note: 'Cada vibrador tiene un imán interno. Revisa también el voltaje admisible de los motores antes de alimentarlos.' },
+    { t: 'Segundo guante', text: 'Cuando el primer guante calibre de forma estable, arma el segundo en espejo: su propia ESP32, su batería y su identificador. Guarda una calibración por mano.', note: 'Junta y acerca las manos en las posturas de las señas: los imanes de un guante no deben mover las lecturas del otro más del 20 % del rango.' },
+    { t: 'Estación Raspberry Pi', text: 'La ESP32 receptora va por USB a la Raspberry Pi 5. En la Pi, el programa lee la cámara y los dos guantes en paralelo, en hilos separados, y combina todo para evaluar la seña. La respuesta vuelve por el mismo enlace: vibración en el dedo que falla, además de pantalla y voz.', note: 'Coloca la cámara frente al usuario, a la altura del pecho: debe ver las dos manos y el torso para distinguir dónde se hace cada seña.' },
+  ];
+  const LAST = STEPS.length - 1;
+  const PAIR = LAST - 1;
+
+  // ---------- Geometría del guante (vista dorsal, mano derecha) ----------
+  const FINGERS = [
+    { x: 208, w: 44, T: 100, h: 175, cx: 230, pip: 182, dip: 139, sY: 202, mY: 167, padY: 112, pin: 278, gpio: '39', cgpio: '25' },
+    { x: 258, w: 44, T: 76, h: 199, cx: 280, pip: 172, dip: 121, sY: 192, mY: 157, padY: 88, pin: 300, gpio: '34', cgpio: '26' },
+    { x: 308, w: 44, T: 96, h: 179, cx: 330, pip: 181, dip: 136, sY: 201, mY: 166, padY: 108, pin: 322, gpio: '35', cgpio: '27' },
+    { x: 358, w: 42, T: 146, h: 129, cx: 379, pip: 203, dip: 173, sY: 223, mY: 188, padY: null, pin: 344, gpio: '32' },
+  ];
+  const TH = { cx: 222, ip: 312, sY: 334, mY: 296, padY: 262 };
+  const THUMB_ROT = 'rotate(-40 222 400)';
+  const A = -40 * Math.PI / 180;
+  const rotPt = (x, y) => { const dx = x - 222, dy = y - 400; return [222 + dx * Math.cos(A) - dy * Math.sin(A), 400 + dx * Math.sin(A) + dy * Math.cos(A)]; };
+
+  const svg = $('stage');
+  const fov = el('g', { class: 'sys', opacity: 0 }, svg);
+  const world = el('g', { id: 'world' }, svg);
+  const gR = el('g', { id: 'gR' }, world);
+  const glove = el('g', { id: 'gloveR' }, gR);
+  const gL = el('g', { id: 'gL', transform: 'translate(310 20) scale(-0.5 0.5)', opacity: 0 }, world);
+  el('use', { href: '#gloveR' }, gL);
+
+  const L = {};
+  ['base', 'marks', 'fundas', 'motorWires', 'copperWires', 'sheaths', 'conductors', 'sensors', 'magnets', 'pads', 'motors', 'imu', 'board', 'power']
+    .forEach((k) => { L[k] = el('g', { 'data-layer': k }, glove); });
+  const thumbLayer = (k) => el('g', { transform: THUMB_ROT }, L[k]);
+
+  function part(parent, step, anim, order, extra) {
+    return el('g', Object.assign({ 'data-step': step, 'data-anim': anim, 'data-order': order || 0 }, extra || {}), parent);
+  }
+
+  // Base del guante
+  const fab = { fill: 'var(--fabric)', stroke: 'var(--fabric-edge)', 'stroke-width': 1.5 };
+  el('rect', Object.assign({ x: 206, y: 420, width: 186, height: 182, rx: 16 }, fab), L.base);
+  el('path', { d: 'M212 438 H386', stroke: 'var(--stitch)', 'stroke-width': 1, 'stroke-dasharray': '4 4', fill: 'none' }, L.base);
+  FINGERS.forEach((f) => el('rect', Object.assign({ x: f.x, y: f.T, width: f.w, height: f.h, rx: f.w / 2 }, fab), L.base));
+  el('rect', Object.assign({ x: 199, y: 250, width: 46, height: 165, rx: 23, transform: THUMB_ROT }, fab), L.base);
+  el('rect', Object.assign({ x: 202, y: 240, width: 204, height: 200, rx: 36 }, fab), L.base);
+
+  // Paso 1: marcas de falanges
+  const markAttrs = { stroke: 'var(--mark)', 'stroke-width': 1.4, 'stroke-dasharray': '3 3', fill: 'none' };
+  FINGERS.forEach((f, i) => {
+    const g = part(L.marks, 1, 'fade', i, { 'data-kind': 'mark' });
+    el('line', Object.assign({ x1: f.x + 6, x2: f.x + f.w - 6, y1: f.pip, y2: f.pip }, markAttrs), g);
+    el('line', Object.assign({ x1: f.x + 8, x2: f.x + f.w - 8, y1: f.dip, y2: f.dip, opacity: .55 }, markAttrs), g);
+    el('circle', Object.assign({ cx: f.cx, cy: f.sY, r: 11 }, markAttrs), g);
+    el('circle', Object.assign({ cx: f.cx, cy: f.mY, r: 9 }, markAttrs), g);
+  });
+  {
+    const g = part(thumbLayer('marks'), 1, 'fade', 4, { 'data-kind': 'mark' });
+    el('line', Object.assign({ x1: 205, x2: 239, y1: TH.ip, y2: TH.ip }, markAttrs), g);
+    el('circle', Object.assign({ cx: TH.cx, cy: TH.sY, r: 11 }, markAttrs), g);
+    el('circle', Object.assign({ cx: TH.cx, cy: TH.mY, r: 9 }, markAttrs), g);
+  }
+
+  // Fundas, sensores e imanes
+  function funda(parent, cx, cy) {
+    el('rect', { x: cx - 13, y: cy - 15, width: 26, height: 30, rx: 5, fill: 'var(--fabric-dark)', stroke: 'var(--stitch)', 'stroke-width': 1, 'stroke-dasharray': '2 2' }, parent);
+  }
+  function sensor(parent, cx, cy) {
+    el('rect', { x: cx - 6, y: cy - 8, width: 12, height: 10, rx: 1.5, fill: '#1C1F23' }, parent);
+    el('line', { x1: cx - 5, x2: cx + 5, y1: cy - 5.5, y2: cy - 5.5, stroke: '#3B4148', 'stroke-width': 1 }, parent);
+    [-3.5, 0, 3.5].forEach((o) => el('line', { x1: cx + o, x2: cx + o, y1: cy + 2, y2: cy + 9, stroke: '#A7AFB6', 'stroke-width': 1.4 }, parent));
+  }
+  function magnet(parent, cx, cy) {
+    el('circle', { cx, cy, r: 9, fill: '#CFE0EA', 'fill-opacity': .8, stroke: '#8DB0C3', 'stroke-width': 1 }, parent);
+    el('circle', { cx, cy, r: 5, fill: '#D6DBE0', stroke: '#6D7780', 'stroke-width': 1 }, parent);
+    el('path', { d: `M${cx - 2.8} ${cy - 1.2} a3 3 0 0 1 2.6 -2.4`, stroke: '#FFFFFF', 'stroke-width': 1, fill: 'none', 'stroke-linecap': 'round' }, parent);
+  }
+  FINGERS.forEach((f, i) => {
+    const s = i === 0 ? 2 : 3;
+    funda(part(L.fundas, s, 'pop', i === 0 ? 0 : i - 1), f.cx, f.sY);
+    sensor(part(L.sensors, s, 'drop', i === 0 ? 0 : i - 1), f.cx, f.sY);
+    magnet(part(L.magnets, i === 0 ? 2 : 4, 'pop', i === 0 ? 2 : i - 1), f.cx, f.mY);
+  });
+  funda(part(thumbLayer('fundas'), 3, 'pop', 3), TH.cx, TH.sY);
+  sensor(part(thumbLayer('sensors'), 3, 'drop', 3), TH.cx, TH.sY);
+  magnet(part(thumbLayer('magnets'), 4, 'pop', 3), TH.cx, TH.mY);
+
+  // Paso 5: conductores y cables agrupados
+  const COND = [['#D23F3F', -3.5], ['#E2B100', 0], ['#2A2D31', 3.5]];
+  FINGERS.forEach((f, i) => {
+    const g = part(L.conductors, 5, 'draw', i);
+    COND.forEach(([c, o]) => el('line', { x1: f.cx + o, x2: f.cx + o, y1: f.sY + 9, y2: 256, stroke: c, 'stroke-width': 1.4, 'stroke-linecap': 'round' }, g));
+    const s = part(L.sheaths, 5, 'draw', i + 1);
+    el('path', { d: `M${f.cx} 252 V318 C${f.cx} 360 ${f.pin} 360 ${f.pin} 400 V446`, stroke: 'var(--sheath)', 'stroke-width': 7, fill: 'none', 'stroke-linecap': 'round' }, s);
+  });
+  {
+    const g = part(thumbLayer('conductors'), 5, 'draw', 4);
+    COND.forEach(([c, o]) => el('line', { x1: TH.cx + o, x2: TH.cx + o, y1: TH.sY + 9, y2: 372, stroke: c, 'stroke-width': 1.4, 'stroke-linecap': 'round' }, g));
+    const [tx, ty] = rotPt(TH.cx, 372);
+    const s = part(L.sheaths, 5, 'draw', 5);
+    el('path', { d: `M${tx.toFixed(1)} ${ty.toFixed(1)} C222 392 256 392 256 414 V446`, stroke: 'var(--sheath)', 'stroke-width': 7, fill: 'none', 'stroke-linecap': 'round' }, s);
+  }
+
+  // Paso 6: ESP32
+  {
+    const g = part(L.board, 6, 'drop', 0);
+    el('rect', { x: 240, y: 446, width: 120, height: 54, rx: 3, fill: '#1E252D', stroke: '#0F1419', 'stroke-width': 1 }, g);
+    el('rect', { x: 250, y: 455, width: 46, height: 36, rx: 2, fill: '#BAC2C9', stroke: '#8E979F', 'stroke-width': 1 }, g);
+    el('path', { d: 'M253 459 h8 v5 h-5 v5 h5 v5 h-5 v5', stroke: '#7F8891', 'stroke-width': 1, fill: 'none' }, g);
+    for (let x = 248; x <= 352; x += 8) {
+      el('circle', { cx: x, cy: 450.5, r: 1.4, fill: '#C9A94E' }, g);
+      el('circle', { cx: x, cy: 495.5, r: 1.4, fill: '#C9A94E' }, g);
+    }
+    el('rect', { x: 292, y: 498, width: 16, height: 7, rx: 1, fill: '#9AA3AB' }, g);
+  }
+
+  // Paso 7: módulo de energía en el antebrazo
+  {
+    const pouch = part(L.power, 7, 'pop', 0);
+    el('rect', { x: 250, y: 550, width: 100, height: 46, rx: 8, fill: 'var(--fabric-dark)', stroke: 'var(--stitch)', 'stroke-width': 1, 'stroke-dasharray': '2 2' }, pouch);
+    const cell = part(L.power, 7, 'drop', 1);
+    el('rect', { x: 258, y: 557, width: 42, height: 32, rx: 3, fill: '#F0C65A', stroke: '#9A6B00', 'stroke-width': 1 }, cell);
+    el('line', { x1: 264, x2: 294, y1: 566, y2: 566, stroke: '#C99A2E', 'stroke-width': 1 }, cell);
+    el('line', { x1: 300, x2: 306, y1: 563, y2: 563, stroke: '#D23F3F', 'stroke-width': 1.4 }, cell);
+    el('line', { x1: 300, x2: 306, y1: 568, y2: 568, stroke: '#2A2D31', 'stroke-width': 1.4 }, cell);
+    const mods = part(L.power, 7, 'drop', 2);
+    el('rect', { x: 306, y: 557, width: 26, height: 16, rx: 2, fill: '#2F6FB5', stroke: '#1E4F86', 'stroke-width': 1 }, mods);
+    el('rect', { x: 330, y: 561, width: 5, height: 7, rx: 1, fill: '#AAB2B9' }, mods);
+    el('rect', { x: 337, y: 559, width: 10, height: 12, rx: 2, fill: '#3A4048' }, mods);
+    el('rect', { x: 339, y: 561, width: 6, height: 4, rx: 1, fill: '#C8CDD2' }, mods);
+    el('rect', { x: 306, y: 577, width: 34, height: 12, rx: 2, fill: '#2F6FB5', stroke: '#1E4F86', 'stroke-width': 1 }, mods);
+    el('rect', { x: 330, y: 579, width: 7, height: 7, rx: 1, fill: '#4B8AD8' }, mods);
+    const leads = part(L.power, 7, 'draw', 3);
+    el('path', { d: 'M326 550 V501', stroke: '#D23F3F', 'stroke-width': 1.8, fill: 'none', 'stroke-linecap': 'round' }, leads);
+    el('path', { d: 'M332 550 V501', stroke: '#2A2D31', 'stroke-width': 1.8, fill: 'none', 'stroke-linecap': 'round' }, leads);
+  }
+
+  // Paso 8: ondas del enlace inalámbrico
+  {
+    const w = part(L.board, 8, 'fade', 0, { class: 'waves' });
+    el('path', { d: 'M244 452 A12 12 0 0 1 256 440' }, w);
+    el('path', { d: 'M236 452 A20 20 0 0 1 256 432' }, w);
+    el('path', { d: 'M228 452 A28 28 0 0 1 256 424' }, w);
+  }
+
+  // Paso 9: contactos de cobre
+  const COPPER = '#C9793B';
+  const padAttrs = { width: 18, height: 10, rx: 3, fill: COPPER, stroke: '#9A5626', 'stroke-width': .8 };
+  FINGERS.slice(0, 3).forEach((f, i) => el('rect', Object.assign({ x: f.cx - 9, y: f.padY - 5 }, padAttrs), part(L.pads, 9, 'pop', i)));
+  el('rect', Object.assign({ x: TH.cx - 9, y: TH.padY - 5 }, padAttrs), part(thumbLayer('pads'), 9, 'pop', 3));
+  const cw = { stroke: COPPER, 'stroke-width': 1.5, fill: 'none', 'stroke-linejoin': 'round', 'stroke-linecap': 'round' };
+  [
+    'M221 114 H215 V476 H240',
+    'M271 90 H265 V295 H218 V470 H240',
+    'M321 110 H315 V298 H221 V464 H240',
+  ].forEach((d, i) => el('path', Object.assign({ d }, cw), part(L.copperWires, 9, 'draw', i)));
+  {
+    const g = part(thumbLayer('copperWires'), 9, 'draw', 3);
+    el('path', Object.assign({ d: `M231 ${TH.padY + 3} H242 V380` }, cw), g);
+    const [x2, y2] = rotPt(242, 380);
+    const g2 = part(L.copperWires, 9, 'draw', 4);
+    el('path', Object.assign({ d: `M${x2.toFixed(1)} ${y2.toFixed(1)} L224.4 ${(y2 + 6).toFixed(1)} V458 H240` }, cw), g2);
+  }
+
+  // Paso 10: IMU
+  {
+    const g = part(L.imu, 10, 'drop', 0);
+    el('rect', { x: 289, y: 304, width: 32, height: 24, rx: 2, fill: '#2A5DA6', stroke: '#1D4680', 'stroke-width': 1 }, g);
+    el('rect', { x: 300, y: 311, width: 10, height: 10, rx: 1, fill: '#15181C' }, g);
+    for (let x = 294; x <= 316; x += 7.3) el('circle', { cx: x, cy: 325, r: 1.3, fill: '#C9A94E' }, g);
+    const c = part(L.sheaths, 10, 'draw', 1);
+    el('path', { d: 'M311 330 V446', stroke: 'var(--sheath)', 'stroke-width': 5, fill: 'none', 'stroke-linecap': 'round' }, c);
+  }
+
+  // Paso 11: vibradores, driver y cableado
+  const MOTOR = '#7A5FD0';
+  function motor(parent, cx, cy) {
+    el('circle', { cx, cy, r: 8, fill: '#B5BDC4', stroke: '#6F7880', 'stroke-width': 1 }, parent);
+    el('circle', { cx, cy, r: 4.5, fill: 'none', stroke: '#8C959D', 'stroke-width': 1 }, parent);
+  }
+  FINGERS.forEach((f, i) => motor(part(L.motors, 11, 'pop', i), f.cx + 14, 272));
+  motor(part(thumbLayer('motors'), 11, 'pop', 4), 206, 372);
+  {
+    const g = part(L.motorWires, 11, 'draw', 0);
+    const mw = { stroke: MOTOR, 'stroke-width': 1.5, fill: 'none', 'stroke-linecap': 'round', 'stroke-linejoin': 'round' };
+    FINGERS.forEach((f) => el('path', Object.assign({ d: `M${f.cx + 14} 280 V284` }, mw), g));
+    el('path', Object.assign({ d: 'M244 284 H388 V473 H384' }, mw), g);
+    const [mx, my] = rotPt(206, 380);
+    el('path', Object.assign({ d: `M${mx.toFixed(1)} ${my.toFixed(1)} C205 420 212 440 212 450 V540 H377 V494` }, mw), g);
+    const u = part(L.board, 11, 'drop', 1);
+    el('rect', { x: 370, y: 452, width: 14, height: 42, rx: 1.5, fill: '#1C1F23' }, u);
+    for (let y = 456; y <= 490; y += 5) {
+      el('line', { x1: 367, x2: 370, y1: y, y2: y, stroke: '#A7AFB6', 'stroke-width': 1 }, u);
+      el('line', { x1: 384, x2: 387, y1: y, y2: y, stroke: '#A7AFB6', 'stroke-width': 1 }, u);
+    }
+  }
+
+  // ---------- Sistema completo (paso final) ----------
+  const sys = el('g', { class: 'sys', opacity: 0 }, svg);
+  el('polygon', { points: '430,474 70,36 560,36', fill: 'var(--fov)', stroke: 'var(--fov-edge)', 'stroke-width': 1, 'stroke-dasharray': '5 5' }, fov);
+  const linkL = el('path', { d: 'M182 250 C182 380 260 440 292 470', stroke: 'var(--radio)', 'stroke-width': 1.6, 'stroke-dasharray': '6 5', fill: 'none' }, sys);
+  const linkR = el('path', { d: 'M418 250 C418 380 340 440 308 470', stroke: 'var(--radio)', 'stroke-width': 1.6, 'stroke-dasharray': '6 5', fill: 'none' }, sys);
+  const st = (x, y, t, cls, anchor) => { const e = el('text', { x, y, 'text-anchor': anchor || 'middle', class: cls || null }, sys); e.textContent = t; return e; };
+  st(210, 404, 'ESP-NOW', 'radio-lbl', 'end');
+  st(390, 404, 'ESP-NOW', 'radio-lbl', 'start');
+  // ESP32 receptora
+  el('rect', { x: 262, y: 470, width: 76, height: 32, rx: 3, fill: '#1E252D', stroke: '#0F1419', 'stroke-width': 1 }, sys);
+  el('rect', { x: 268, y: 476, width: 30, height: 20, rx: 2, fill: '#BAC2C9', stroke: '#8E979F', 'stroke-width': 1 }, sys);
+  st(254, 485, 'ESP32 receptora', 'small', 'end');
+  el('path', { d: 'M300 502 V540', stroke: 'var(--usb)', 'stroke-width': 4, fill: 'none', 'stroke-linecap': 'round' }, sys);
+  // Cámara
+  el('path', { d: 'M430 490 L416 532 M430 490 L444 532 M430 490 V532', stroke: 'var(--usb)', 'stroke-width': 2, fill: 'none', 'stroke-linecap': 'round' }, sys);
+  el('rect', { x: 404, y: 466, width: 52, height: 24, rx: 12, fill: '#2B3138', stroke: '#15191D', 'stroke-width': 1 }, sys);
+  el('circle', { cx: 430, cy: 478, r: 7, fill: '#0F1216', stroke: '#6E7A85', 'stroke-width': 1.5 }, sys);
+  el('circle', { cx: 446, cy: 472, r: 1.8, fill: '#6BD28A' }, sys);
+  st(462, 482, 'Cámara USB', 'small', 'start');
+  el('path', { d: 'M416 500 C410 540 408 556 402 560', stroke: 'var(--usb)', 'stroke-width': 3, fill: 'none', 'stroke-linecap': 'round' }, sys);
+  // Raspberry Pi
+  el('rect', { x: 200, y: 540, width: 200, height: 70, rx: 7, fill: '#1E7A4D', stroke: '#134F32', 'stroke-width': 1 }, sys);
+  for (let x = 212; x <= 388; x += 8) el('circle', { cx: x, cy: 546, r: 1.4, fill: '#D8C27A' }, sys);
+  el('rect', { x: 252, y: 556, width: 34, height: 34, rx: 3, fill: '#A7AFB6', stroke: '#7D868E', 'stroke-width': 1 }, sys);
+  el('rect', { x: 400, y: 552, width: 12, height: 16, rx: 1.5, fill: '#B9C1C8', stroke: '#8E979F', 'stroke-width': 1 }, sys);
+  el('rect', { x: 400, y: 574, width: 12, height: 16, rx: 1.5, fill: '#B9C1C8', stroke: '#8E979F', 'stroke-width': 1 }, sys);
+  st(338, 580, 'Raspberry Pi 5', 'onpcb');
+  st(300, 630, 'señas.py: cámara y guantes en paralelo', 'small');
+  // Paquetes animados sobre los enlaces
+  const packets = [];
+  [linkL, linkR].forEach((path, i) => {
+    for (let k = 0; k < 3; k++) packets.push({ path, dir: 1, phase: k / 3 + i * .17, speed: .42, node: el('circle', { r: 3.6, fill: 'var(--radio)' }, sys) });
+    packets.push({ path, dir: -1, phase: i * .5, speed: .28, node: el('circle', { r: 3.6, fill: MOTOR }, sys) });
+  });
+
+  // Rótulos de los dos guantes (pasos 12 y 13)
+  const pairLabels = el('g', { class: 'sys', opacity: 0 }, svg);
+  [[160, 'Guante izquierdo'], [440, 'Guante derecho']].forEach(([x, t]) => {
+    const e = el('text', { x, y: 42, 'text-anchor': 'middle' }, pairLabels); e.textContent = t;
+  });
+
+  // ---------- Etiquetas (no se reflejan con el segundo guante) ----------
+  const labels = el('g', { id: 'labels' }, svg);
+  function callout(step, text, lx, ly, tx, ty, anchor) {
+    const g = el('g', { class: 'callout', 'data-cstep': step }, labels);
+    const start = anchor === 'end' ? lx + 6 : lx - 6;
+    el('path', { d: `M${start} ${ly} L${tx} ${ty}` }, g);
+    el('circle', { cx: tx, cy: ty, r: 2.2 }, g);
+    const lines = Array.isArray(text) ? text : [text];
+    lines.forEach((t, i) => {
+      const tt = el('text', { x: lx, y: ly + 5 + (i - (lines.length - 1) / 2) * 17, 'text-anchor': anchor || 'start' }, g);
+      tt.textContent = t;
+    });
+  }
+  callout(2, ['Primera pareja', 'de prueba'], 150, 150, 216, 184, 'end');
+  callout(3, 'SS49E · Hall lineal', 452, 226, 394, 224);
+  callout(4, 'Imán 3 × 1 mm', 452, 184, 390, 188);
+  callout(5, 'Cable de 3 hilos', 452, 300, 386, 300);
+  callout(6, ['ESP32 emisora', 'una por guante'], 452, 460, 362, 460);
+  callout(7, ['Batería LiPo', 'y módulo de carga'], 452, 572, 352, 572);
+  callout(8, ['Enlace', 'ESP-NOW'], 150, 440, 232, 442, 'end');
+  callout(9, 'Cinta de cobre', 452, 108, 341, 108);
+  callout(10, 'MPU6050 (IMU)', 452, 340, 323, 318);
+  callout(11, 'Vibrador por dedo', 452, 262, 402, 270);
+  callout(11, 'ULN2003', 452, 506, 387, 482);
+
+  const onboard = el('text', { class: 'onboard', x: 330, y: 480, 'text-anchor': 'middle', 'font-size': 11, fill: '#E8EDF1' }, labels);
+  onboard.textContent = 'ESP32';
+
+  function tag(step, text, x, y, w) {
+    const g = el('g', { class: 'tag', 'data-tstep': step }, labels);
+    el('rect', { x, y, width: w, height: 16, rx: 4 }, g);
+    const t = el('text', { x: x + w / 2, y: y + 12, 'text-anchor': 'middle' }, g);
+    t.textContent = text;
+  }
+  FINGERS.forEach((f) => tag(6, f.gpio, f.cx + 12, f.sY - 9, 24));
+  const [tsx, tsy] = rotPt(TH.cx, TH.sY);
+  tag(6, '36', tsx - 40, tsy - 8, 24);
+  tag(7, '5,0 V', 354, 580, 42);
+  tag(7, 'GPIO 33 · batería', 206, 606, 112);
+  tag(8, 'ID: derecho', 236, 506, 76);
+  FINGERS.slice(0, 3).forEach((f) => tag(9, f.cgpio, f.cx - 12, f.T - 21, 24));
+  const [ttx, tty] = rotPt(TH.cx, 250);
+  tag(9, 'GND', ttx - 44, tty - 12, 34);
+  tag(10, 'I²C 21 · 22', 326, 330, 76);
+
+  // ---------- Motor de animación ----------
+  const parts = Array.from(glove.querySelectorAll('[data-step]'));
+  const callouts = Array.from(labels.querySelectorAll('.callout'));
+  const tags = Array.from(labels.querySelectorAll('.tag'));
+  const running = new Set();
+
+  function geomChildren(g) {
+    return Array.from(g.querySelectorAll('path, line, rect, circle')).filter((n) => n.getTotalLength);
+  }
+  function stopAnims() { running.forEach((a) => { try { a.finish(); } catch (e) {} }); running.clear(); }
+
+  function enter(p) {
+    const kind = p.dataset.anim;
+    const delay = (+p.dataset.order || 0) * (reduce ? 0 : 150);
+    const track = (a) => { running.add(a); a.onfinish = () => running.delete(a); return a; };
+    if (reduce) { track(p.animate([{ opacity: 0 }, { opacity: 1 }], { duration: 250, delay, fill: 'backwards' })); return; }
+    if (kind === 'drop') {
+      track(p.animate([{ transform: 'translateY(-70px)', opacity: 0 }, { transform: 'translateY(0)', opacity: 1 }], { duration: 900, delay, easing: 'cubic-bezier(.2,.8,.25,1)', fill: 'backwards' }));
+    } else if (kind === 'pop') {
+      track(p.animate([{ transform: 'scale(.2)', opacity: 0 }, { transform: 'scale(1.15)', opacity: 1, offset: .7 }, { transform: 'scale(1)', opacity: 1 }], { duration: 650, delay, easing: 'ease-out', fill: 'backwards' }));
+    } else if (kind === 'draw') {
+      geomChildren(p).forEach((g) => {
+        const len = g.getTotalLength();
+        if (!len) return;
+        g.style.strokeDasharray = len;
+        const a = track(g.animate([{ strokeDashoffset: len }, { strokeDashoffset: 0 }], { duration: 1300, delay, easing: 'ease-in-out', fill: 'backwards' }));
+        a.onfinish = () => { running.delete(a); g.style.strokeDasharray = ''; };
+      });
+    } else {
+      track(p.animate([{ opacity: 0 }, { opacity: 1 }], { duration: 700, delay, fill: 'backwards' }));
+    }
+  }
+
+  let current = 0;
+  let worldMode = 'one';
+  let worldAnim = null;
+  const ONE = { tx: 0, ty: 0, s: 1 }, TWO = { tx: 290, ty: 20, s: .5 };
+
+  function setWorld(mode, animate) {
+    if (mode === worldMode) return;
+    worldMode = mode;
+    if (worldAnim) cancelAnimationFrame(worldAnim);
+    const from = mode === 'two' ? ONE : TWO;
+    const to = mode === 'two' ? TWO : ONE;
+    const dur = animate && !reduce ? 1100 : 0;
+    const t0 = performance.now();
+    const ease = (t) => t < .5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+    const tick = (now) => {
+      const k = dur ? Math.min(1, (now - t0) / dur) : 1;
+      const e = ease(k);
+      gR.setAttribute('transform', `translate(${from.tx + (to.tx - from.tx) * e} ${from.ty + (to.ty - from.ty) * e}) scale(${from.s + (to.s - from.s) * e})`);
+      const fade = mode === 'two' ? e : 1 - e;
+      gL.setAttribute('opacity', fade);
+      pairLabels.setAttribute('opacity', fade);
+      if (k < 1) worldAnim = requestAnimationFrame(tick);
+    };
+    worldAnim = requestAnimationFrame(tick);
+  }
+
+  // Paquetes: solo corren en el paso final
+  let pktRAF = null;
+  function placePackets(t) {
+    packets.forEach((p) => {
+      const len = p.path.getTotalLength();
+      let u = (p.phase + t * p.speed) % 1;
+      if (p.dir < 0) u = 1 - u;
+      const pt = p.path.getPointAtLength(u * len);
+      p.node.setAttribute('cx', pt.x.toFixed(1));
+      p.node.setAttribute('cy', pt.y.toFixed(1));
+    });
+  }
+  function startPackets() {
+    if (pktRAF) return;
+    if (reduce) { placePackets(0); return; }
+    const t0 = performance.now();
+    const loop = (now) => { placePackets((now - t0) / 1000); pktRAF = requestAnimationFrame(loop); };
+    pktRAF = requestAnimationFrame(loop);
+  }
+  function stopPackets() { if (pktRAF) cancelAnimationFrame(pktRAF); pktRAF = null; }
+  placePackets(0);
+
+  function applyStep(n, animate) {
+    stopAnims();
+    const finished = n === 0 || n >= PAIR;
+    parts.forEach((p) => {
+      const s = +p.dataset.step;
+      const mark = p.dataset.kind === 'mark';
+      let op;
+      if (finished) op = mark ? 0 : 1;
+      else if (s > n) op = 0;
+      else if (s === n) op = 1;
+      else op = mark ? .22 : .42;
+      p.style.opacity = op;
+      if (!finished && s === n && animate) enter(p);
+    });
+    callouts.forEach((c) => {
+      const s = +c.dataset.cstep;
+      const vis = n === 0 || (n < PAIR && s <= n);
+      c.style.opacity = vis ? 1 : 0;
+      c.classList.toggle('is-new', n !== 0 && s === n);
+    });
+    tags.forEach((t) => { t.style.opacity = (+t.dataset.tstep === n) ? 1 : 0; });
+    onboard.style.opacity = (n === 0 || (n >= 6 && n < PAIR)) ? 1 : 0;
+    setWorld(n >= PAIR ? 'two' : 'one', animate);
+    const showSys = n === LAST;
+    sys.style.opacity = showSys ? 1 : 0;
+    fov.style.opacity = showSys ? 1 : 0;
+    if (showSys) startPackets(); else stopPackets();
+  }
+
+  // ---------- Tarjeta de paso y lista ----------
+  const list = $('stepList');
+  STEPS.forEach((s, i) => {
+    const li = document.createElement('li');
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.innerHTML = `<span class="n">${i === 0 ? '✓' : String(i).padStart(2, '0')}</span><span></span>`;
+    b.lastChild.textContent = s.t;
+    b.addEventListener('click', () => { stopPlay(); go(i, true); });
+    li.appendChild(b);
+    list.appendChild(li);
+  });
+  const stepButtons = Array.from(list.querySelectorAll('button'));
+
+  function renderCard(n) {
+    const s = STEPS[n];
+    $('sCount').textContent = n === 0 ? 'Resultado final' : `Paso ${n} de ${LAST}`;
+    $('sTitle').textContent = s.t;
+    $('sText').textContent = s.text;
+    $('sNote').hidden = !s.note;
+    $('sNoteText').textContent = s.note || '';
+    $('prog').style.width = `${(n / LAST) * 100}%`;
+    $('stageTitle').textContent = n === LAST ? 'Sistema completo' : (n === PAIR ? 'Vista dorsal · los dos guantes' : 'Vista dorsal · mano derecha');
+    $('stageMeta').textContent = n === 0 ? 'Guante terminado' : `Paso ${n} · ${s.t}`;
+    stepButtons.forEach((b, i) => {
+      if (i === n) b.setAttribute('aria-current', 'step'); else b.removeAttribute('aria-current');
+      b.classList.toggle('done', i > 0 && i < n);
+    });
+    $('prevBtn').disabled = n === 0;
+    $('nextBtn').disabled = n === LAST;
+  }
+
+  function go(n, animate) {
+    current = Math.max(0, Math.min(LAST, n));
+    renderCard(current);
+    applyStep(current, animate);
+    const m = STEPS[current].mech;
+    if (m === 'bench') runBench();
+    else if (m === 'calib') runCalib();
+    else {
+      cancelMech(true);
+      if (mech.flip || mech.open == null || mech.closed == null) { mech.flip = false; capture('open'); capture('closed'); renderMech(); }
+    }
+    schedule();
+  }
+
+  // ---------- Reproducción automática ----------
+  let playing = false;
+  let timer = null;
+  function setPlayUI() {
+    $('playText').textContent = playing ? 'Pausa' : (current === LAST ? 'Repetir' : (current === 0 ? 'Reproducir montaje' : 'Continuar'));
+    $('playIcon').innerHTML = playing
+      ? '<rect x="3" y="2" width="3" height="10" rx="1" fill="currentColor"/><rect x="8" y="2" width="3" height="10" rx="1" fill="currentColor"/>'
+      : '<path d="M3.5 2v10l8-5z" fill="currentColor"/>';
+  }
+  function schedule() {
+    clearTimeout(timer);
+    if (playing) {
+      if (current >= LAST) { playing = false; }
+      else timer = setTimeout(() => go(current + 1, true), STEPS[current].dwell || 4800);
+    }
+    setPlayUI();
+  }
+  function stopPlay() { playing = false; clearTimeout(timer); setPlayUI(); }
+  $('playBtn').addEventListener('click', () => {
+    if (playing) { stopPlay(); return; }
+    playing = true;
+    if (current === 0 || current === LAST) go(1, true); else schedule();
+  });
+  $('prevBtn').addEventListener('click', () => { stopPlay(); go(current - 1, true); });
+  $('nextBtn').addEventListener('click', () => { stopPlay(); go(current + 1, true); });
+  document.addEventListener('keydown', (e) => {
+    if (e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA')) return;
+    if (e.key === 'ArrowRight') { stopPlay(); go(current + 1, true); }
+    else if (e.key === 'ArrowLeft') { stopPlay(); go(current - 1, true); }
+    else if (e.key === ' ' && e.target === document.body) { e.preventDefault(); $('playBtn').click(); }
+  });
+
+  // ---------- Vista lateral: modelo ilustrativo ----------
+  const J = [204, 118], S = [180, 98.5], M0 = [220, 101];
+  function magPos(th) {
+    const a = th * Math.PI / 180, dx = M0[0] - J[0], dy = M0[1] - J[1];
+    return [J[0] + dx * Math.cos(a) - dy * Math.sin(a), J[1] + dx * Math.sin(a) + dy * Math.cos(a)];
+  }
+  const dist = (th) => { const p = magPos(th); return Math.hypot(p[0] - S[0], p[1] - S[1]); };
+  const R0 = dist(0);
+  const volts = (th, flip) => 1.65 + (flip ? -1 : 1) * 1.25 * Math.pow(R0 / dist(th), 3);
+  const counts = (v) => Math.round(Math.max(0, Math.min(3.3, v)) / 3.3 * 4095);
+
+  const mech = { theta: 30, flip: false, open: null, closed: null };
+  function capture(which) { mech[which] = volts(which === 'open' ? 0 : 90, mech.flip); }
+  capture('open'); capture('closed');
+
+  function renderMech() {
+    const th = mech.theta;
+    $('midSeg').setAttribute('transform', `rotate(${th} 204 118)`);
+    $('distSeg').setAttribute('transform', `rotate(${th * 0.75} 296 118)`);
+    const v = volts(th, mech.flip);
+    $('theta').value = Math.round(th);
+    $('rTheta').textContent = `${Math.round(th)}°`;
+    $('rVolt').textContent = `${v.toFixed(2).replace('.', ',')} V`;
+    $('bVolt').style.width = `${(v / 3.3) * 100}%`;
+    $('rAdc').textContent = `${counts(v)}`;
+    if (mech.open != null && mech.closed != null && Math.abs(mech.closed - mech.open) > 1e-6) {
+      const d = Math.max(0, Math.min(1, (v - mech.open) / (mech.closed - mech.open)));
+      $('rD').textContent = d.toFixed(2).replace('.', ',');
+      $('bD').style.width = `${d * 100}%`;
+    } else {
+      $('rD').textContent = 'falta calibrar';
+      $('bD').style.width = '0%';
+    }
+    $('cOpen').textContent = mech.open == null ? 'abierto —' : `abierto ${counts(mech.open)}`;
+    $('cClosed').textContent = mech.closed == null ? 'puño —' : `puño ${counts(mech.closed)}`;
+    $('cFlip').textContent = mech.flip ? 'S hacia el sensor' : 'N hacia el sensor';
+    $('magTop').setAttribute('fill', mech.flip ? '#4C79C4' : '#D65A52');
+    $('magBot').setAttribute('fill', mech.flip ? '#D65A52' : '#4C79C4');
+  }
+
+  let mechToken = 0;
+  const status = (t) => { $('mechStatus').textContent = t; };
+  const DEFAULT_STATUS = 'Arrastra el control para doblar el dedo. Los valores son ilustrativos: la curva real se mide con el guante puesto.';
+  function cancelMech(resetStatus) {
+    mechToken++;
+    ['cOpen', 'cClosed', 'cFlip'].forEach((id) => $(id).classList.remove('hot'));
+    if (resetStatus !== false) status(DEFAULT_STATUS);
+  }
+  function wait(ms, tok) { return new Promise((res, rej) => setTimeout(() => (tok === mechToken ? res() : rej()), reduce ? Math.min(ms, 200) : ms)); }
+  function tweenTheta(to, ms, tok) {
+    return new Promise((res, rej) => {
+      const from = mech.theta, t0 = performance.now(), dur = reduce ? 1 : ms;
+      const step = (now) => {
+        if (tok !== mechToken) { rej(); return; }
+        const k = Math.min(1, (now - t0) / dur);
+        const e = k < .5 ? 2 * k * k : 1 - Math.pow(-2 * k + 2, 2) / 2;
+        mech.theta = from + (to - from) * e;
+        renderMech();
+        if (k < 1) requestAnimationFrame(step); else res();
+      };
+      requestAnimationFrame(step);
+    });
+  }
+  const hot = (id, on) => $(id).classList.toggle('hot', on);
+
+  async function runBench() {
+    const tok = ++mechToken;
+    try {
+      mech.flip = false; capture('open'); capture('closed'); renderMech();
+      status('Prueba 1: polo N hacia el sensor. Abierta, media flexión y puño.');
+      hot('cFlip', true);
+      await tweenTheta(0, 500, tok); await wait(400, tok);
+      await tweenTheta(45, 900, tok); await wait(500, tok);
+      await tweenTheta(90, 900, tok); await wait(600, tok);
+      await tweenTheta(0, 900, tok); await wait(400, tok);
+      mech.flip = true; mech.open = null; mech.closed = null; renderMech();
+      status('Prueba 2: imán invertido. La lectura cruza al otro lado de 1,65 V.');
+      await wait(500, tok);
+      await tweenTheta(90, 1300, tok); await wait(500, tok);
+      await tweenTheta(0, 1000, tok); await wait(300, tok);
+      mech.flip = false; capture('open'); capture('closed'); hot('cFlip', false);
+      await tweenTheta(30, 600, tok);
+      status('Elige la orientación que dé más diferencia entre abierto y puño, y anótala.');
+    } catch (e) { /* cancelado */ }
+  }
+
+  async function runCalib() {
+    const tok = ++mechToken;
+    try {
+      mech.open = null; mech.closed = null; renderMech();
+      status('Mano abierta: promediando 2–3 s…');
+      await tweenTheta(0, 700, tok); hot('cOpen', true); await wait(1200, tok);
+      capture('open'); renderMech(); hot('cOpen', false);
+      status('Puño: promediando 2–3 s…');
+      await tweenTheta(90, 1400, tok); hot('cClosed', true); await wait(1200, tok);
+      capture('closed'); renderMech(); hot('cClosed', false);
+      status('Calibrado: d va de 0 (abierto) a 1 (puño) para este dedo.');
+      await tweenTheta(45, 1000, tok);
+    } catch (e) { /* cancelado */ }
+  }
+
+  $('theta').addEventListener('input', (e) => {
+    cancelMech(true);
+    mech.theta = +e.target.value;
+    renderMech();
+  });
+  $('flipBtn').addEventListener('click', () => {
+    cancelMech(false);
+    mech.flip = !mech.flip; mech.open = null; mech.closed = null;
+    renderMech();
+    status('Imán invertido: hay que volver a calibrar este dedo.');
+  });
+  $('calBtn').addEventListener('click', () => { runCalib(); });
+
+  renderMech();
+  go(0, false);
+})();
+</script>
+
+</body>
+</html>
