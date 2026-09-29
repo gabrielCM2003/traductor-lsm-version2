@@ -48,6 +48,15 @@ El documento de Code dice: *"ya existe también una primera versión funcional d
 
 **Verificar antes de usar:** revisar si `datos_palabras/dataset_palabras.csv` todavía tiene `quien_grabo: mock_generator` en sus filas — si sí, el modelo de palabras sigue siendo falso.
 
+### 🆕 Integrado, pero todavía sin probar con varias personas
+
+- **Esqueleto del cuerpo (MediaPipe Pose, `body_tracker.py`)** para ubicar las manos respecto a la persona, que es lo que las palabras necesitan y el vector de 126 no tiene.
+  - `senas.py` dibuja hombros, brazos, cuello y cara (casilla "Dibujar esqueleto del cuerpo").
+  - Los recolectores guardan **9 valores de ubicación** además del vector de 126: columnas `b0..b8` en el CSV, `body_frames` en el JSON y los 33 puntos crudos en el `.npz`.
+  - **Ningún modelo los usa todavía**: `entrenar_palabras.py` sigue leyendo solo `v0..v125`.
+  - Probado con una persona real y con movimiento simulado: sin retraso (la pose usa tiempo real, no el contador de +1 ms de las manos) y con los brazos completos aunque los codos queden cerca del borde de la imagen.
+- **Ojo con el CSV de prueba:** `recolector_estatico.py` se niega a escribir en un `dataset_palabras.csv` con las columnas viejas (sin `b0..b8`), para no desalinearlo. Si alguien todavía tiene el CSV mock, hay que renombrarlo o moverlo antes de grabar vocabulario real.
+
 ### ❌ No empezado
 
 - **Adaptador del guante**: solo diseñado en el patrón de arquitectura (adaptador intercambiable que entrega un vector al mismo núcleo), pero **no hay ni una línea de código escrita para él**, porque el protocolo de datos de meca sigue sin definirse.

@@ -22,6 +22,13 @@ Documento de estado para el equipo, no un diario de trabajo. Describe el resulta
 - **Recolectores de datos** listos para que el equipo grabe su propio vocabulario de palabras:
   - `recolector_estatico.py` — palabras de postura fija (una o dos manos).
   - `recolector_dinamico.py` — palabras/señas con movimiento (inicio/fin explícitos con la tecla `g`, confirmación de guardar/descartar en pantalla).
+- **Esqueleto del cuerpo (MediaPipe Pose)** para saber dónde están las manos respecto a la persona, que las palabras necesitan y el vector de 126 no tiene (normalizar en la muñeca borra la posición). Vive en `body_tracker.py`:
+  - `senas.py` dibuja el esqueleto (casilla "Dibujar esqueleto del cuerpo"). Con `"body_tracking": false` en la configuración ni siquiera se carga el modelo.
+  - Los dos recolectores guardan, además del vector de 126, **9 valores de ubicación** por muestra o frame: columnas `b0..b8` en el CSV, `body_frames` en el JSON y los 33 puntos crudos del cuerpo en el `.npz`.
+  - El vector de 126 no cambió: el alfabeto, el DTW y `lsm_words.onnx` funcionan igual.
+  - La pose usa **tiempo real** (clase `BodyTracker`), no el contador de +1 ms por frame que se le pasa al detector de manos. Con +1 ms, el suavizado interno de MediaPipe atrasaba el esqueleto unos 4 frames (~130 ms). A las manos ese contador no les afecta.
+  - Modelo de pose `full` por defecto (tiembla menos). En la Raspberry, si hace falta CPU, se cambia con `"pose_model": "lite"` en la configuración.
+  - Se eligió sobre YOLOv8-pose porque viene en el mismo paquete `mediapipe` (sin torch ni ultralytics, que reinstala `opencv-python` encima de `opencv-contrib-python`) y tiene puntos de la boca.
 - Ya existe también una primera versión funcional del **reconocimiento de palabras** (modelo ONNX propio, `word_classifier.py` + `lsm_words.onnx` + `word_labels.json`), probada con 3 palabras de ejemplo (HOLA, GRACIAS, BUENOS_DIAS). Lo que falta es el vocabulario real del equipo (ver sección 5).
 - **Confiabilidad real por letra**, medida con varias personas distintas (no solo quien programó):
   - **J, Ñ, X: sólidas.** Se comprometen con la regla normal de confianza (≥55%).
@@ -99,11 +106,18 @@ Si no quieres activar el entorno, se puede invocar el Python del venv directamen
 venv\Scripts\python.exe senas.py
 ```
 
+**OpenCV duplicado en entornos ya creados.** `requirements.txt` ahora pide `opencv-contrib-python` (el que ya trae `mediapipe`) en vez de `opencv-python`. Tener los dos instalados hace que ambos escriban la misma carpeta `cv2`, y desinstalar o actualizar uno rompe al otro. En un `venv` creado antes de este cambio, dejar solo uno:
+
+```bat
+venv\Scripts\pip uninstall -y opencv-python opencv-contrib-python
+venv\Scripts\pip install opencv-contrib-python
+```
+
 ---
 
 ## 5. Qué falta (en orden de prioridad)
 
-1. **Vocabulario de palabras + grabación en equipo.** La arquitectura y el modelo de palabras ya funcionan (probado con HOLA/GRACIAS/BUENOS_DIAS), pero falta decidir el vocabulario real de la competencia y grabarlo con `recolector_estatico.py`/`recolector_dinamico.py` entre todo el equipo (más personas grabando = mejor generalización, como ya se vio con las letras dinámicas).
+1. **Vocabulario de palabras + grabación en equipo.** La arquitectura y el modelo de palabras ya funcionan (probado con HOLA/GRACIAS/BUENOS_DIAS), pero falta decidir el vocabulario real de la competencia y grabarlo con `recolector_estatico.py`/`recolector_dinamico.py` entre todo el equipo (más personas grabando = mejor generalización, como ya se vio con las letras dinámicas). Al grabar, que se vean **hombros y boca**: los recolectores muestran "Cuerpo: visible / NO visible", y si no se ven, la ubicación de esa muestra queda en ceros. Con el vocabulario grabado, falta que `entrenar_palabras.py` y `word_classifier.py` usen las columnas `b0..b8`; hoy solo leen `v0..v125` y las ignoran sin problema.
 2. **Protocolo de datos del guante con mecatrónica.** Definir cómo van a entregar sus lecturas (formato, frecuencia, qué sensores) para poder integrarlas al mismo esquema de features o a uno paralelo.
 3. **Integración fluida de los 3 modos sin Ctrl+D** (estático, dinámico, palabras) — si alcanza el tiempo. Hoy el cambio de modo es manual; lo ideal sería que el sistema detecte solo qué tipo de seña se está haciendo.
 
