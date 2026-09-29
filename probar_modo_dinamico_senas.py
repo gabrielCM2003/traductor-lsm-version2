@@ -149,6 +149,13 @@ def wait_for_result(thread, timeout_s: float = CLASSIFY_TIMEOUT_S) -> tuple[str,
     return text, conf, max_call_ms
 
 
+def _letra_del_estado(text: str) -> str:
+    """Letra de un resultado del Estado. senas.py muestra "J (81%)" o
+    "Z 62.5% (margen alto)" al comprometer: antes estas pruebas comparaban el
+    texto completo con "J" y fallaban aunque la letra fuera la correcta."""
+    return text.split(" ")[0] if text else ""
+
+
 # =========================================================================== #
 # 1. Hueco corto a mitad de una seña larga -> debe seguir siendo UNA sola seña
 # =========================================================================== #
@@ -209,7 +216,7 @@ def test_two_consecutive_cycles(thread, committed: list[str], pick: list[tuple[s
         feed_gap(thread, (senas.DYN_NO_HAND_MS_TO_END / 1000.0) + 0.15)
         text, conf, max_call_ms = wait_for_result(thread)
         print(f"  resultado: '{text}' ({conf * 100:.1f}%), llamada mas lenta: {max_call_ms:.1f}ms")
-        matched = text == letter and max_call_ms < 500
+        matched = _letra_del_estado(text) == letter and max_call_ms < 500
         ok = ok and matched
         print(f"  -> {'OK' if matched else 'FALLO'}")
     print(f"\nLetras comprometidas hasta ahora via letter_committed_signal: {committed}")
@@ -272,7 +279,7 @@ def test_discard_while_classifying(
         # Esperar el resultado real de A (el unico que deberia llegar).
         text, conf, max_call_ms = wait_for_result(thread)
         print(f"  resultado que llega: '{text}' ({conf * 100:.1f}%) - deberia ser el de A ('{letter_a}')")
-        ok_resultado_es_de_a = text == letter_a
+        ok_resultado_es_de_a = _letra_del_estado(text) == letter_a
     finally:
         thread._dtw_recognizer.predict_topk = original_predict_topk
 
@@ -283,7 +290,7 @@ def test_discard_while_classifying(
     feed_gap(thread, (senas.DYN_NO_HAND_MS_TO_END / 1000.0) + 0.15)
     text, conf, max_call_ms_c = wait_for_result(thread)
     print(f"  ciclo C ('{letter_c}') tras el descarte -> resultado: '{text}' ({conf * 100:.1f}%)")
-    ok_recupera = text == letter_c
+    ok_recupera = _letra_del_estado(text) == letter_c
 
     ok = ok_descartado and ok_sin_segunda_clasificacion and ok_resultado_es_de_a and ok_recupera
     print(f"    -> {'OK' if ok else 'FALLO'}")

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import unicodedata
 from pathlib import Path
 from typing import Any, List, Optional, Tuple, Union
 
@@ -43,7 +44,11 @@ N_FEATURES = 126
 # =========================================================================== #
 
 if HAVE_NUMBA:
-    @njit(fastmath=True)
+    # nogil: senas.py clasifica en un hilo aparte para no congelar el video;
+    # sin soltar el candado de Python, ese hilo lo acaparaba igual durante los
+    # varios segundos que tarda en maquinas lentas (y el watchdog reiniciaba
+    # el hilo de deteccion a medio reconocimiento).
+    @njit(fastmath=True, nogil=True)
     def _dtw_dp_numba(cost_matrix: np.ndarray) -> float:
         """Cálculo DTW y longitud de path con Numba a nivel de C."""
         n, m = cost_matrix.shape
@@ -243,7 +248,11 @@ class DTWRecognizer:
             if not word_dir.is_dir():
                 continue
 
-            word = word_dir.name
+            # macOS puede entregar el nombre de la carpeta "Ñ" descompuesto
+            # (N + tilde combinable): sin normalizar, esa etiqueta no era
+            # igual a la "Ñ" de senas.py (DYN_NORMAL_LETTERS) y se ordenaba
+            # distinto que en Windows.
+            word = unicodedata.normalize("NFC", word_dir.name)
             samples: list[np.ndarray] = []
 
             # 1. Buscar archivos JSON (formato estándar de recolector_dinamico.py)
