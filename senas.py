@@ -118,6 +118,25 @@ DYN_EXPERIMENTAL_LETTERS = {"K", "Q", "Z"}
 DYN_EXPERIMENTAL_MIN_MARGIN = 0.12
 DYN_EXPERIMENTAL_MIN_CONF = 0.30
 
+# Caso puntual, diagnostico 2026-09-29: Ñ nunca tuvo muestras propias reales
+# (a diferencia de J/K/Q/Z), asi que en vivo (fuera de las condiciones de
+# laboratorio de datos_dinamicas/) sus consultas se desvian mas de lo que
+# LOSO sugiere (98.9%). El unico vecino con el que Ñ se confunde, incluso en
+# LOSO puro, es Q (evaluar_dtw.py: 1/93). El problema es que Q esta en el
+# grupo EXPERIMENTAL (compromete con solo 12pp de margen) mientras Ñ esta en
+# el grupo NORMAL (necesita conf>=55% o 20pp de margen), asi que cuando el
+# DTW en vivo empuja a una Ñ real hacia el territorio de Q, a Q le basta
+# mucho menos margen del que le costaria a la propia Ñ para comprometerse
+# primero. DYN_NQ_PAIR_MIN_MARGIN exige un margen reforzado SOLO cuando el
+# top-1 es Q Y el 2.º lugar es especificamente Ñ; si no se alcanza, no se
+# compromete ninguna de las dos letras por esa clasificacion. No afecta a Q
+# contra K/X/Z (siguen con DYN_EXPERIMENTAL_MIN_MARGIN de siempre) ni a Ñ
+# como top-1 (sigue con su regla NORMAL sin cambios, vea dynamic_commit_
+# decision). Mitigacion temporal mientras se graban muestras propias reales
+# de Ñ (que es la solucion de fondo); revisar si sigue haciendo falta una
+# vez exista esa galeria.
+DYN_NQ_PAIR_MIN_MARGIN = 0.22
+
 # DTWRecognizer.try_load() tarda ~2s en parsear las plantillas de
 # datos_dinamicas/ (cientos de JSON). HandTrackingThread se recrea cada vez
 # que el watchdog reinicia la IA por inactividad, y eso pasaba en el hilo de
@@ -789,6 +808,18 @@ def is_experimental_dynamic_letter(letter: str) -> bool:
     return letter in DYN_EXPERIMENTAL_LETTERS
 
 
+def is_nq_blocking_pair(topk: list[tuple[str, float]]) -> bool:
+    """True si el top-1 es Q y el 2.º lugar es especificamente Ñ.
+
+    Unico caso donde aplica el margen reforzado DYN_NQ_PAIR_MIN_MARGIN (ver
+    dynamic_commit_decision). Q contra cualquier otra letra (K, X, Z) sigue
+    con DYN_EXPERIMENTAL_MIN_MARGIN de siempre, sin cambios.
+    """
+    if len(topk) < 2:
+        return False
+    return topk[0][0] == "Q" and topk[1][0] == "Ñ"
+
+
 def dynamic_commit_decision(topk: list[tuple[str, float]]) -> tuple[bool, float, str]:
     """Decide si el top-1 de una clasificacion dinamica se compromete o no.
 
@@ -799,23 +830,34 @@ def dynamic_commit_decision(topk: list[tuple[str, float]]) -> tuple[bool, float,
         top-2 (confianza_1 - confianza_2) alcanza DYN_NORMAL_MIN_MARGIN,
         lo que se cumpla primero. La via de margen existe porque, igual que
         con K/Q/Z, un margen amplio es señal solida de acierto aunque la
-        confianza absoluta se quede corta.
+        confianza absoluta se quede corta. Esta regla se usa TAL CUAL cuando
+        el top-1 es Ñ, sin importar quien quede en 2.º lugar (el ajuste de
+        abajo es unidireccional: solo protege a Ñ de perder el commit contra
+        Q, nunca al reves).
       - Grupo EXPERIMENTAL (DYN_EXPERIMENTAL_LETTERS, hoy K, Q, Z): su
         confianza absoluta nunca cruza ~45% aunque el top-1 sea correcto (las
         6 clases quedan muy juntas en distancia DTW), asi que DYN_MIN_CONF
         las bloquearia siempre. Se comprometen si el margen sobre el 2.º
         lugar supera DYN_EXPERIMENTAL_MIN_MARGIN, con DYN_EXPERIMENTAL_
         MIN_CONF como piso minimo de cordura (no la condicion principal).
+        Caso especial dentro de este grupo (ver is_nq_blocking_pair y
+        DYN_NQ_PAIR_MIN_MARGIN): si el top-1 es Q y el 2.º lugar es
+        especificamente Ñ, se exige el margen reforzado DYN_NQ_PAIR_MIN_
+        MARGIN en vez de DYN_EXPERIMENTAL_MIN_MARGIN. Si no se alcanza, no
+        se compromete ni Q ni Ñ por esa clasificacion. Q contra K/X/Z no
+        cambia.
 
     Se centraliza aqui para que _process_dynamic_frame (que decide si se
     agrega la letra) y _on_diagnostic_update en la GUI (que solo explica por
     que no se agrego) usen exactamente el mismo criterio.
 
     Devuelve (se_compromete, margen, regla), donde regla es una de:
-      "confianza"    -> grupo normal, comprometio por DYN_MIN_CONF.
-      "margen"       -> grupo normal, comprometio por DYN_NORMAL_MIN_MARGIN.
-      "experimental" -> grupo experimental, comprometio por margen amplio.
-      ""             -> no se comprometio.
+      "confianza"       -> grupo normal, comprometio por DYN_MIN_CONF.
+      "margen"          -> grupo normal, comprometio por DYN_NORMAL_MIN_MARGIN.
+      "experimental"    -> grupo experimental, comprometio por margen amplio.
+      "experimental_nq" -> Q comprometio contra Ñ en 2.º lugar, con el margen
+                            reforzado DYN_NQ_PAIR_MIN_MARGIN.
+      ""                -> no se comprometio.
     """
     if not topk:
         return False, 0.0, ""
@@ -824,6 +866,9 @@ def dynamic_commit_decision(topk: list[tuple[str, float]]) -> tuple[bool, float,
     margin = conf1 - topk[1][1] if len(topk) > 1 else conf1
 
     if is_experimental_dynamic_letter(letra1):
+        if is_nq_blocking_pair(topk):
+            should_commit = conf1 >= DYN_EXPERIMENTAL_MIN_CONF and margin >= DYN_NQ_PAIR_MIN_MARGIN
+            return should_commit, margin, "experimental_nq" if should_commit else ""
         should_commit = conf1 >= DYN_EXPERIMENTAL_MIN_CONF and margin >= DYN_EXPERIMENTAL_MIN_MARGIN
         return should_commit, margin, "experimental" if should_commit else ""
 
@@ -1315,6 +1360,18 @@ class HandTrackingThread(QThread):
                     "[dinamico] top-3: %s -> agregada por regla EXPERIMENTAL (margen=%.1fpp >= %.0fpp)",
                     top_str, margin * 100, DYN_EXPERIMENTAL_MIN_MARGIN * 100,
                 )
+            elif rule == "experimental_nq":
+                # Q comprometida contra Ñ en 2.º lugar, con el margen
+                # reforzado DYN_NQ_PAIR_MIN_MARGIN (ver dynamic_commit_decision
+                # e is_nq_blocking_pair): un margen tan amplio sobre Ñ
+                # especificamente es señal solida incluso con el umbral mas
+                # estricto de este par.
+                self._commit_letter(letter)
+                self._dynamic_idle_text = f"{letter} {conf * 100:.1f}% (margen alto, par Ñ/Q)"
+                log.info(
+                    "[dinamico] top-3: %s -> agregada por regla EXPERIMENTAL reforzada, par Ñ/Q (margen=%.1fpp >= %.0fpp)",
+                    top_str, margin * 100, DYN_NQ_PAIR_MIN_MARGIN * 100,
+                )
             elif rule == "margen":
                 # Grupo normal comprometido por margen amplio aunque la
                 # confianza absoluta no llegara a DYN_MIN_CONF.
@@ -1330,14 +1387,19 @@ class HandTrackingThread(QThread):
                 log.info("[dinamico] top-3: %s -> agregada (confianza=%.1f%%)", top_str, conf * 100)
             elif is_experimental_dynamic_letter(letter):
                 # K, Q y Z (grupo experimental): no alcanzaron el margen de
-                # la regla experimental. Se siguen mostrando en el top-3 para
-                # poder seguir evaluandolas.
-                self._dynamic_idle_text = f"¿{letter}? ({conf * 100:.0f}%) - modo experimental, no se agregó"
+                # la regla experimental (o, si es el par Ñ/Q, el margen
+                # reforzado DYN_NQ_PAIR_MIN_MARGIN). Se siguen mostrando en
+                # el top-3 para poder seguir evaluandolas.
+                nq_pair = is_nq_blocking_pair(topk)
+                sufijo = " - modo experimental, no se agregó (par Ñ/Q)" if nq_pair else " - modo experimental, no se agregó"
+                self._dynamic_idle_text = f"¿{letter}? ({conf * 100:.0f}%){sufijo}"
                 motivos = []
                 if conf < DYN_EXPERIMENTAL_MIN_CONF:
                     motivos.append(f"confianza {conf * 100:.1f}% < {DYN_EXPERIMENTAL_MIN_CONF * 100:.0f}%")
-                if margin < DYN_EXPERIMENTAL_MIN_MARGIN:
-                    motivos.append(f"margen {margin * 100:.1f}pp < {DYN_EXPERIMENTAL_MIN_MARGIN * 100:.0f}pp")
+                margen_requerido = DYN_NQ_PAIR_MIN_MARGIN if nq_pair else DYN_EXPERIMENTAL_MIN_MARGIN
+                if margin < margen_requerido:
+                    etiqueta_margen = "margen (par Ñ/Q, reforzado)" if nq_pair else "margen"
+                    motivos.append(f"{etiqueta_margen} {margin * 100:.1f}pp < {margen_requerido * 100:.0f}pp")
                 log.info(
                     "[dinamico] top-3: %s -> NO agregada (modo experimental, %s)",
                     top_str, "; ".join(motivos) or "umbral no alcanzado",
@@ -2440,12 +2502,17 @@ class SignLanguageApp(QMainWindow):
             should_commit, margin, rule = dynamic_commit_decision(topk)
             if rule == "experimental":
                 lines.append(f"→ agregada por regla experimental (margen {margin * 100:.1f}pp)")
+            elif rule == "experimental_nq":
+                lines.append(f"→ agregada por regla experimental reforzada, par Ñ/Q (margen {margin * 100:.1f}pp)")
             elif rule == "margen":
                 lines.append(f"→ agregada por margen amplio (margen {margin * 100:.1f}pp)")
             elif rule == "confianza":
                 lines.append(f"→ agregada (confianza {topk[0][1] * 100:.1f}%)")
             elif is_experimental_dynamic_letter(topk[0][0]):
-                lines.append("→ modo experimental, no se agregó")
+                if is_nq_blocking_pair(topk):
+                    lines.append("→ par Ñ/Q: margen insuficiente, no se agregó (regla reforzada)")
+                else:
+                    lines.append("→ modo experimental, no se agregó")
             else:
                 lines.append("→ baja confianza, no se agregó")
             self.diagnostic_label.show()

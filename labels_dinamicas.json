@@ -1,0 +1,12 @@
+{
+  "labels": [
+    "J",
+    "K",
+    "Q",
+    "X",
+    "Z",
+    "Ñ"
+  ],
+  "n_features": 126,
+  "normalization": "wrist_centered_middle_scaled"
+}

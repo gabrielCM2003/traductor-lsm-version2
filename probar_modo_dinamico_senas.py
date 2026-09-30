@@ -27,13 +27,23 @@ Historial de bugs que cubre (no solo el ciclo unico feliz):
    de la secuencia y no formaba parte de la identidad de mano(s) del primer
    frame se debe ignorar (dejarse en ceros) al construir el vector de 126,
    en vez de tratarse como una postura de dos manos.
+8. Diagnostico 2026-09-29 (Ñ sin muestras propias, falsos positivos hacia Q
+   en vivo): el par Ñ/Q tiene un margen reforzado DYN_NQ_PAIR_MIN_MARGIN que
+   solo aplica cuando el top-1 es Q Y el 2.º lugar es especificamente Ñ (ver
+   is_nq_blocking_pair en senas.py). Con ese margen intermedio (entre
+   DYN_EXPERIMENTAL_MIN_MARGIN y DYN_NQ_PAIR_MIN_MARGIN), Q NO debe
+   comprometerse si Ñ es el 2.º lugar, pero SI debe comprometerse igual que
+   siempre si el 2.º lugar es X o K (la regla experimental normal no cambia
+   para ningun otro par). Ñ como top-1 contra Q en 2.º lugar sigue con su
+   regla NORMAL sin cambios (el ajuste es unidireccional).
 
 Las pruebas 1-3 usan a proposito letras del grupo NORMAL (J, Ñ, X) para los
 ciclos de "funcionamiento normal": asi committed sigue siendo un buen
 indicador de que un ciclo se completo de principio a fin. La prueba 5
-ejercita especificamente el etiquetado por grupo/regla; las pruebas 6 y 7 son
-pruebas puras (sin camara ni DTW) para la regla de margen del grupo normal y
-para el aislamiento de la mano intrusa, respectivamente.
+ejercita especificamente el etiquetado por grupo/regla; las pruebas 6, 6b y 7
+son pruebas puras (sin camara ni DTW) para la regla de margen del grupo
+normal, el margen reforzado del par Ñ/Q (bug 8 del historial arriba) y el
+aislamiento de la mano intrusa, respectivamente.
 
 No usa camara real: alimenta HandTrackingThread._process_dynamic_frame() con
 FrameDetections sinteticos, sustituyendo build_dynamic_feature_vector para
@@ -377,6 +387,70 @@ def test_normal_group_margin_rule() -> bool:
 
 
 # =========================================================================== #
+# 6b (bug 8 del historial arriba). Margen reforzado especifico del par Ñ/Q
+#    (pura, sin camara ni DTW: igual que la prueba 6, alimenta
+#    dynamic_commit_decision directamente).
+# =========================================================================== #
+
+def test_nq_pair_margin_rule() -> bool:
+    print("\n=== Prueba 6b: margen reforzado del par Ñ/Q (DYN_NQ_PAIR_MIN_MARGIN) ===")
+    print(f"    DYN_EXPERIMENTAL_MIN_MARGIN={senas.DYN_EXPERIMENTAL_MIN_MARGIN}  "
+          f"DYN_NQ_PAIR_MIN_MARGIN={senas.DYN_NQ_PAIR_MIN_MARGIN}")
+
+    ok = True
+    conf1 = senas.DYN_EXPERIMENTAL_MIN_CONF + 0.10  # por encima del piso de cordura
+
+    # Caso 1: Q top-1, Ñ muy cerca en 2.º lugar - margen intermedio, suficiente
+    # para la regla experimental normal (>=12pp) pero NO para la reforzada
+    # (>=22pp). Debe bloquear el commit de Q (y no comprometer Ñ tampoco,
+    # porque Ñ ni siquiera es el top-1 aqui).
+    margen_intermedio = (senas.DYN_EXPERIMENTAL_MIN_MARGIN + senas.DYN_NQ_PAIR_MIN_MARGIN) / 2
+    topk = [("Q", conf1), ("Ñ", conf1 - margen_intermedio), ("X", 0.01)]
+    should_commit, margin, rule = senas.dynamic_commit_decision(topk)
+    correcto = should_commit is False and rule == ""
+    print(f"  Q top1 / Ñ top2, margen={margin*100:.1f}pp (>= normal, < reforzado) "
+          f"-> should_commit={should_commit}, regla='{rule}' -> {'OK' if correcto else 'FALLO'}")
+    ok = ok and correcto
+
+    # Caso 2: mismo margen intermedio, pero el 2.º lugar es X (no Ñ) - debe
+    # comprometer igual que antes de este cambio (regla experimental normal
+    # intacta para cualquier par que no sea Ñ/Q).
+    for rival in ("X", "K"):
+        topk = [("Q", conf1), (rival, conf1 - margen_intermedio), ("Ñ", 0.01)]
+        should_commit, margin, rule = senas.dynamic_commit_decision(topk)
+        correcto = should_commit is True and rule == "experimental"
+        print(f"  Q top1 / {rival} top2 (mismo margen) "
+              f"-> should_commit={should_commit}, regla='{rule}' "
+              f"-> {'OK' if correcto else 'FALLO'} (no debe cambiar respecto a antes)")
+        ok = ok and correcto
+
+    # Caso 3: Q top-1, Ñ top-2, margen ya por encima del reforzado - Q gano
+    # con margen solido incluso contra su vecino mas dificil, SI debe
+    # comprometer (con la regla nueva "experimental_nq").
+    margen_amplio = senas.DYN_NQ_PAIR_MIN_MARGIN + 0.05
+    topk = [("Q", conf1), ("Ñ", conf1 - margen_amplio), ("X", 0.01)]
+    should_commit, margin, rule = senas.dynamic_commit_decision(topk)
+    correcto = should_commit is True and rule == "experimental_nq"
+    print(f"  Q top1 / Ñ top2, margen={margin*100:.1f}pp (>= reforzado) "
+          f"-> should_commit={should_commit}, regla='{rule}' -> {'OK' if correcto else 'FALLO'}")
+    ok = ok and correcto
+
+    # Caso 4: Ñ top-1, Q top-2 - la regla NORMAL de Ñ sigue aplicando sin
+    # cambios (el ajuste es unidireccional: solo protege a Ñ de perder el
+    # commit contra Q, nunca al reves).
+    conf1_n = senas.DYN_MIN_CONF - 0.05
+    margen_n = senas.DYN_NORMAL_MIN_MARGIN + 0.05
+    topk = [("Ñ", conf1_n), ("Q", max(0.0, conf1_n - margen_n)), ("X", 0.01)]
+    should_commit, margin, rule = senas.dynamic_commit_decision(topk)
+    correcto = should_commit is True and rule == "margen"
+    print(f"  Ñ top1 / Q top2, margen={margin*100:.1f}pp (regla NORMAL de Ñ, sin cambios) "
+          f"-> should_commit={should_commit}, regla='{rule}' -> {'OK' if correcto else 'FALLO'}")
+    ok = ok and correcto
+
+    return ok
+
+
+# =========================================================================== #
 # 7. Aislar la mano que no forma parte de la identidad de la secuencia (pura,
 #    inspecciona que hands_by_side llega a build_dynamic_feature_vector).
 # =========================================================================== #
@@ -490,6 +564,7 @@ def main() -> int:
         )
         resultados["letter_groups"] = test_letter_groups(thread, committed, templates)
         resultados["normal_group_margin_rule"] = test_normal_group_margin_rule()
+        resultados["nq_pair_margin_rule"] = test_nq_pair_margin_rule()
         resultados["hand_identity_filter"] = test_hand_identity_filter(thread)
 
         print("\n=== RESUMEN ===")
