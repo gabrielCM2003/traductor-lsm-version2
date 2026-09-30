@@ -150,5 +150,52 @@ class TestVentana(unittest.TestCase):
         self.assertEqual(w.start_button.text().strip(), "▶  Iniciar".strip())
 
 
+class TestMenuYManual(unittest.TestCase):
+    def setUp(self):
+        self.win = senas.SignLanguageApp(senas.AppConfig(), Path(tempfile.mkdtemp()) / "config.json")
+        self.started = []
+        self.win.start_system = lambda: self.started.append(1)     # sin camara en las pruebas
+
+    def tearDown(self):
+        self.win.close()
+
+    def test_menu_manual_traductor(self):
+        w = self.win
+        self.assertIs(w.stack.currentWidget(), w.start_page)
+        w.start_page.start_requested.emit()          # "Iniciar programa" muestra primero el manual
+        self.assertIs(w.stack.currentWidget(), w._manual_page)
+        self.assertEqual(self.started, [])
+        w._manual_page.continue_requested.emit()     # "Continuar al traductor" enciende la camara
+        self.assertIs(w.stack.currentWidget(), w.app_page)
+        self.assertEqual(self.started, [1])
+
+    def test_manual_con_el_traductor_corriendo(self):
+        w = self.win
+        w.enter_translator()
+        w.open_manual()
+        self.assertTrue(w._manual_window.isVisible())
+        self.assertFalse(w._manual_window.isModal())
+        self.assertIs(w.stack.currentWidget(), w.app_page)   # el traductor sigue en pantalla
+
+    def test_manual_trae_todo_el_abecedario_y_las_palabras(self):
+        manual = ui.ManualWidget(senas.MANUAL_DIR, {"HOLA": "a la altura de la cabeza"})
+        letras = manual.tabs.widget(0).widget()
+        textos = [lbl.text() for lbl in letras.findChildren(ui.QLabel)]
+        for letra in ui.ALPHABET:
+            self.assertIn(letra, textos)
+        self.assertEqual(textos.count("Ilustración pendiente"),
+                         sum(1 for l in ui.ALPHABET if not (senas.MANUAL_DIR / "letras" / f"{l}.png").exists()))
+        self.assertEqual(len(manual._sprites.get(0, [])), 6)       # J K Ñ Q X Z animadas
+        self.assertEqual(len(manual._sprites.get(1, [])), 5)       # 5 palabras animadas
+
+    def test_animacion_solo_con_el_manual_visible(self):
+        manual = ui.ManualWidget(senas.MANUAL_DIR, {})
+        self.assertFalse(manual._timer.isActive())
+        manual.show()
+        self.assertTrue(manual._timer.isActive())
+        manual.hide()
+        self.assertFalse(manual._timer.isActive())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -20,7 +20,9 @@ El repositorio incluye también la documentación del **guante instrumentado** d
 | Archivo | Qué es |
 |---|---|
 | `senas.py` | Aplicación (PyQt6): cámara, MediaPipe, modo automático (letras estáticas, dinámicas y palabras), ventana y voz |
-| `interfaz_lsm.py` | Tema visual, componentes de la ventana y textos de retroalimentación (qué corregir de cada seña) |
+| `interfaz_lsm.py` | Tema visual, menú inicial, manual de señas, componentes de la ventana y textos de retroalimentación (qué corregir de cada seña) |
+| `manual/` | Ilustraciones del manual de señas: `letras/` (abecedario) y `palabras/`, cada una con los puntos de donde se dibujó (.json) |
+| `generar_manual.py` | Genera las ilustraciones de `manual/` a partir de datos reales (videos del equipo y plantillas del CICESE) |
 | `sign_classifier.py` | Clasificador ONNX del alfabeto estático, suavizado de predicciones y confirmación de letras y espacios |
 | `dtw_recognizer.py` | Reconocedor DTW del alfabeto dinámico (J, K, Ñ, Q, X, Z) y de las palabras (con la ubicación respecto al cuerpo) |
 | `extraer_palabras_videos.py` | Saca las plantillas JSON de palabras de una carpeta de videos (una subcarpeta por palabra). Corre en la computadora o en Google Colab |
@@ -93,9 +95,27 @@ La línea punteada del video es la **línea de reposo** (a la altura del ombligo
 - Al bajar las manos, la seña completa se compara con las letras dinámicas y con las palabras. Si en ella se fijaron 3 letras estáticas o más, fue deletreo y se respeta.
 - La tarjeta **Seña** muestra el top-3 de cada seña con movimiento, y **Retroalimentación** dice si salió bien y, si no, qué corregir.
 
+### Menú inicial y manual de señas
+
+Al abrir el programa aparece un menú. **Iniciar programa** muestra primero el **manual de señas** y, con **Continuar al traductor**, enciende la cámara. Con el traductor corriendo, **📖 Manual** (o F1) abre el manual en su propia ventana, sin detener la cámara.
+
+El manual tiene tres pestañas:
+
+- **Abecedario:** las 27 letras, en espejo, como te verás en la pantalla. Las letras fijas vienen de un video del equipo deletreando el abecedario: cada una se tomó de una pausa en la que el clasificador del programa la reconoce con confianza y que respeta el orden alfabético. Las letras con movimiento (J, K, Ñ, Q, X, Z) son la plantilla más representativa de cada una (dataset del CICESE, CC BY 4.0), animada; esas plantillas están centradas en la muñeca, así que muestran la forma y el giro de la mano, no el recorrido en el aire.
+- **Palabras:** una figura dibujada, sin cara, a partir del esqueleto y las manos del video más representativo de cada palabra, animada y con la trayectoria de la mano.
+- **Cómo usar:** los pasos para signar frente al traductor.
+
+La **E** y la **P** todavía no tienen ilustración: en el video del abecedario no se sostuvieron el tiempo suficiente, y no se dibujan de memoria para no enseñar una forma equivocada. Para agregarlas, graba un video corto sosteniendo la letra y corre:
+
+```bash
+python generar_manual.py --letra E --video e.mp4
+```
+
+Para regenerar todo: `python generar_manual.py --abecedario VIDEO --dinamicas --palabras CARPETA_DE_VIDEOS`, o `--redibujar` para volver a dibujar desde los `.json` sin los videos.
+
 ### La interfaz
 
-- **Encabezado:** cámara, ❔ Guía (F1, cómo se hace cada seña), ⚙ Ajustes (Ctrl+,: umbrales, mano que deletrea, voz, dibujo y diagnóstico) y ▶ Iniciar / ■ Detener.
+- **Encabezado:** cámara, 📖 Manual (F1), ⚙ Ajustes (Ctrl+,: umbrales, mano que deletrea, voz, dibujo y diagnóstico) y ▶ Iniciar / ■ Detener.
 - **Video:** el marco cambia de color según lo que pasa: gris en reposo, azul mientras haces la seña, morado mientras la reconoce, verde si la reconoció y ámbar si hay que repetirla.
 - **Seña:** la letra que se está formando o la última letra o palabra reconocida, con sus 3 candidatas.
 - **Texto traducido:** las palabras terminadas en gris, la palabra en curso en blanco y, subrayadas en azul, las letras que la seña en curso todavía puede cambiar. Botones para borrar, terminar la palabra, leer en voz alta, guardar y limpiar.
@@ -151,7 +171,7 @@ En modo palabras, la seña termina al bajar las manos por debajo de la línea de
 | Atajo (en macOS, Cmd en lugar de Ctrl) | Acción |
 |---|---|
 | Ctrl+R / Ctrl+T | Iniciar / detener |
-| F1 | Guía rápida |
+| F1 | Manual de señas |
 | Ctrl+, | Ajustes |
 | Retroceso | Borrar la última letra |
 | Ctrl+Retroceso | Borrar la palabra |

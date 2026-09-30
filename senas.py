@@ -32,13 +32,16 @@ from PyQt6.QtGui import QImage, QPixmap, QAction, QKeySequence
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QMessageBox, QSlider, QComboBox,
-    QFileDialog, QStatusBar, QSizePolicy, QCheckBox,
+    QFileDialog, QStatusBar, QSizePolicy, QCheckBox, QStackedWidget,
 )
 
 from interfaz_lsm import (
-    COLORS, PHASE_STYLE, STYLESHEET, Card, CandidateBars, FeedbackPanel, GuideDialog, Pill,
-    SettingsDialog, big_button, feedback_for_result, guidance_feedback, how_to_sign, sentence_html,
+    COLORS, PHASE_STYLE, STYLESHEET, Card, CandidateBars, FeedbackPanel, ManualPage, ManualWindow, Pill,
+    SettingsDialog, StartPage, big_button, feedback_for_result, guidance_feedback, how_to_sign, sentence_html,
 )
+
+# Ilustraciones del manual de senas (las genera generar_manual.py).
+MANUAL_DIR = Path(__file__).resolve().parent / "manual"
 
 try:
     import mediapipe as mp
@@ -2489,6 +2492,8 @@ class SignLanguageApp(QMainWindow):
         self._flash_timer.setSingleShot(True)
         self._flash_timer.timeout.connect(lambda: self._apply_phase_style(self._phase))
         self._settings_dialog: Optional[SettingsDialog] = None
+        self._manual_window: Optional[ManualWindow] = None
+        self._manual_page: Optional[ManualPage] = None
 
         self.setWindowTitle("Traductor LSM")
         self.setMinimumSize(QSize(1180, 760))
@@ -2510,6 +2515,7 @@ class SignLanguageApp(QMainWindow):
         self._build_status_bar()
         self._render_sentence()
         self._apply_phase_style("detenido")
+        self.statusBar().setVisible(False)       # se abre en el menu inicial
 
     def _build_actions(self) -> None:
         """Atajos de teclado (sin barra de herramientas: los botones estan en
@@ -2529,7 +2535,7 @@ class SignLanguageApp(QMainWindow):
         action("Borrar palabra", ["Ctrl+Backspace"], self.clear_current_word)
         action("Terminar palabra", [Qt.Key.Key_Return, Qt.Key.Key_Enter, "Ctrl+Space"], self.insert_space)
         action("Ajustes", ["Ctrl+,"], self.open_settings)
-        action("Guía", ["F1"], self.open_guide)
+        action("Manual de señas", ["F1"], self.open_manual)
 
     def _build_controls(self) -> None:
         """Controles de ajustes tecnicos. Viven en la ventana de Ajustes, pero
@@ -2609,8 +2615,21 @@ class SignLanguageApp(QMainWindow):
         return row
 
     def _build_central_widget(self) -> None:
+        # Tres pantallas: menu inicial -> manual de senas -> traductor.
+        self.stack = QStackedWidget()
+        self.setCentralWidget(self.stack)
+        self.start_page = StartPage()
+        self.start_page.start_requested.connect(self.show_manual_page)
+        self.start_page.manual_requested.connect(self.show_manual_page)
+        self.start_page.quit_requested.connect(self.close)
+        self.stack.addWidget(self.start_page)
+
         central = QWidget()
-        self.setCentralWidget(central)
+        self.app_page = central
+        self.stack.addWidget(central)
+        # La barra de estado (camara, FPS...) solo tiene sentido en el traductor.
+        self.stack.currentChanged.connect(
+            lambda _i: self.statusBar().setVisible(self.stack.currentWidget() is self.app_page))
         root = QVBoxLayout(central)
         root.setContentsMargins(18, 14, 18, 10)
         root.setSpacing(14)
@@ -2632,9 +2651,9 @@ class SignLanguageApp(QMainWindow):
         self.refresh_cameras_btn = QPushButton("↻")
         self.refresh_cameras_btn.setToolTip("Buscar cámaras conectadas")
         self.refresh_cameras_btn.clicked.connect(self._refresh_cameras)
-        guide_btn = QPushButton("❔ Guía")
-        guide_btn.setToolTip("Cómo hacer las señas (F1)")
-        guide_btn.clicked.connect(self.open_guide)
+        guide_btn = QPushButton("📖 Manual")
+        guide_btn.setToolTip("Cómo se hace cada seña; se puede consultar con la cámara encendida (F1)")
+        guide_btn.clicked.connect(self.open_manual)
         settings_btn = QPushButton("⚙ Ajustes")
         settings_btn.setToolTip("Ajustes de cámara, reconocimiento y voz (Ctrl+,)")
         settings_btn.clicked.connect(self.open_settings)
@@ -2748,10 +2767,33 @@ class SignLanguageApp(QMainWindow):
         self._settings_dialog.show()
         self._settings_dialog.raise_()
 
-    def open_guide(self) -> None:
-        profiles = word_profiles()
-        lines = [how_to_sign(label, prof) for label, prof in sorted(profiles.items())]
-        GuideDialog(lines, self).exec()
+    def _word_descriptions(self) -> dict[str, str]:
+        """{PALABRA: 'con una mano, a la altura de la cabeza (~2 s).'}"""
+        return {label: how_to_sign(label, prof).split(": ", 1)[-1]
+                for label, prof in word_profiles().items()}
+
+    def show_manual_page(self) -> None:
+        """Despues del menu: el manual a pantalla completa, con el boton para
+        seguir al traductor. Se construye la primera vez que se pide."""
+        if self._manual_page is None:
+            self._manual_page = ManualPage(MANUAL_DIR, self._word_descriptions())
+            self._manual_page.back_requested.connect(lambda: self.stack.setCurrentWidget(self.start_page))
+            self._manual_page.continue_requested.connect(self.enter_translator)
+            self.stack.addWidget(self._manual_page)
+        self.stack.setCurrentWidget(self._manual_page)
+
+    def enter_translator(self) -> None:
+        self.stack.setCurrentWidget(self.app_page)
+        if self.camera_thread is None and self.ai_thread is None:
+            self.start_system()
+
+    def open_manual(self) -> None:
+        """El manual en su propia ventana, para consultarlo sin detener la camara."""
+        if self._manual_window is None:
+            self._manual_window = ManualWindow(MANUAL_DIR, self._word_descriptions(), self)
+        self._manual_window.show()
+        self._manual_window.raise_()
+        self._manual_window.activateWindow()
 
     # ---- estado visual ----------------------------------------------------
 
@@ -2823,6 +2865,7 @@ class SignLanguageApp(QMainWindow):
             return
 
         self.cfg.camera_index = int(self.camera_combo.currentData())
+        self.stack.setCurrentWidget(self.app_page)   # p. ej. Ctrl+R desde el menu
 
         self.action_start.setEnabled(False)
         self.status_camera.setText("● Conectando...")

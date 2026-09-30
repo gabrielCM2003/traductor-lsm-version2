@@ -20,10 +20,13 @@ import html
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Sequence
 
-from PyQt6.QtCore import Qt
+from pathlib import Path
+
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import (
-    QDialog, QFrame, QHBoxLayout, QLabel, QProgressBar, QPushButton,
-    QScrollArea, QSizePolicy, QVBoxLayout, QWidget,
+    QDialog, QFrame, QGridLayout, QHBoxLayout, QLabel, QProgressBar, QPushButton,
+    QScrollArea, QSizePolicy, QTabWidget, QVBoxLayout, QWidget,
 )
 
 # --------------------------------------------------------------------------- #
@@ -100,6 +103,14 @@ QScrollArea {{ border: none; background: transparent; }}
 QScrollArea > QWidget > QWidget {{ background: transparent; }}
 QPlainTextEdit {{ background: {COLORS['card_alt']}; border: 1px solid {COLORS['border']}; border-radius: 8px; }}
 QStatusBar {{ background: {COLORS['card']}; color: {COLORS['muted']}; }}
+QTabWidget::pane {{ border: none; }}
+QTabBar::tab {{
+    background: {COLORS['card']}; color: {COLORS['muted']}; padding: 9px 18px; margin-right: 4px;
+    border-top-left-radius: 10px; border-top-right-radius: 10px; font-weight: 600;
+}}
+QTabBar::tab:selected {{ background: {COLORS['card_alt']}; color: {COLORS['text']}; }}
+QLabel#Hero {{ font-size: 40px; font-weight: 800; }}
+QPushButton#Big {{ font-size: 18px; padding: 14px 26px; }}
 QStatusBar QLabel {{ color: {COLORS['muted']}; padding: 0 8px; }}
 """
 
@@ -144,17 +155,17 @@ def zone_of(stats: Any) -> str:
 
 
 def hands_of(stats: Any) -> str:
-    two = _get(stats, "two_hands")
-    return "con las dos manos" if two >= 0.35 else "con una mano"
+    """"con las dos manos" solo si se vieron dos manos. Lo contrario no se
+    afirma: con las palmas juntas (POR FAVOR) MediaPipe suele ver una sola
+    mano, asi que no ver dos no quiere decir que se haga con una."""
+    return "con las dos manos" if _get(stats, "two_hands") >= 0.35 else ""
 
 
 def how_to_sign(label: str, profile: Any) -> str:
     """Una linea de la guia: como se hace la palabra segun sus plantillas."""
-    zone = zone_of(profile)
-    parts = [hands_of(profile)]
-    if zone:
-        parts.append(zone)
-    return f"{label}: {', '.join(parts)} (~{_get(profile, 'duration_s', 2.0):.0f} s)."
+    parts = [p for p in (hands_of(profile), zone_of(profile)) if p]
+    text = ", ".join(parts) or "haz la seña completa"
+    return f"{label}: {text[0].upper() + text[1:]} (~{_get(profile, 'duration_s', 2.0):.0f} s)."
 
 
 def compare_to(label: str, profile: Any, stats: Any) -> list[str]:
@@ -166,8 +177,7 @@ def compare_to(label: str, profile: Any, stats: Any) -> list[str]:
     want, got = _get(profile, "two_hands"), _get(stats, "two_hands")
     if want >= 0.35 and got < 0.15:
         tips.append(f"{label} se hace con las dos manos.")
-    elif want < 0.15 and got >= 0.35:
-        tips.append(f"{label} se hace con una sola mano.")
+    # Al reves ("se hace con una sola mano") no se dice: ver hands_of.
     zone_want, zone_got = zone_of(profile), zone_of(stats)
     if zone_want and zone_got and zone_want != zone_got:
         tips.append(f"Tu mano quedó {zone_got}; {label} se hace {zone_want}.")
@@ -427,39 +437,293 @@ def sentence_html(history: Sequence[str], current: str, pending: int, max_words:
     return f"{prev} {cur}" if prev else cur
 
 
-class GuideDialog(QDialog):
-    """Como signar: letras, letras con movimiento y cada palabra (medido de
-    sus plantillas)."""
-
-    def __init__(self, word_lines: Sequence[str], parent: Optional[QWidget] = None):
-        super().__init__(parent)
-        self.setWindowTitle("Guía rápida")
-        self.setMinimumWidth(520)
-        layout = QVBoxLayout(self)
-        steps = [
-            ("1. Colócate", "Que la cámara vea tu cara, tus hombros y tus manos. Si las manos "
-                            "están abajo, en reposo, no se reconoce nada."),
-            ("2. Letras A–Y", "Sube una mano sobre la línea punteada y mantenla quieta: "
+GUIDE_STEPS = [
+    ("1. Colócate", "Que la cámara vea tu cara, tus hombros y tus manos. Con las manos "
+                    "abajo, en reposo, no se reconoce nada."),
+    ("2. Letras fijas (A–Y)", "Sube una mano sobre la línea punteada y mantenla quieta: "
                               "la letra se escribe en un momento."),
-            ("3. J, K, Ñ, Q, X, Z", "Sube la mano, haz el movimiento de la letra de corrido y bájala."),
-            ("4. Palabras", "Sube las manos, haz la seña completa y bájalas: la palabra se escribe sola."),
-            ("5. Terminar una palabra", "Baja las manos un momento o presiona Enter."),
-        ]
-        for title, text in steps:
+    ("3. Letras con movimiento (J, K, Ñ, Q, X, Z)", "Sube la mano, haz el movimiento de la letra "
+                                                   "de corrido y bájala."),
+    ("4. Palabras", "Sube las manos, haz la seña completa y bájalas: la palabra se escribe sola."),
+    ("5. Terminar una palabra", "Baja las manos un momento o presiona Enter."),
+]
+
+ALPHABET = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "Ñ",
+            "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z"]
+DYNAMIC = {"J", "K", "Ñ", "Q", "X", "Z"}
+
+
+class SpriteLabel(QLabel):
+    """Imagen animada a partir de una tira horizontal de cuadros (los _anim.png
+    de manual/). Sin tira, muestra la imagen fija. La anima ManualWidget."""
+
+    def __init__(self, still: Optional[QPixmap], strip: Optional[QPixmap], height: int,
+                 parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setMinimumHeight(height)
+        self._frames: list[QPixmap] = []
+        self._i = 0
+        if strip is not None and still is not None and still.width() > 0:
+            fw = still.width()
+            for k in range(strip.width() // fw):
+                frame = strip.copy(k * fw, 0, fw, strip.height())
+                self._frames.append(frame.scaledToHeight(height, Qt.TransformationMode.SmoothTransformation))
+        self._still = still.scaledToHeight(height, Qt.TransformationMode.SmoothTransformation) if still else None
+        if self._still is not None:
+            self.setPixmap(self._still)
+
+    @property
+    def animated(self) -> bool:
+        return len(self._frames) > 1
+
+    def step(self) -> None:
+        if self._frames:
+            self._i = (self._i + 1) % len(self._frames)
+            self.setPixmap(self._frames[self._i])
+
+
+def _badge(text: str, color: str) -> QLabel:
+    lbl = QLabel(text)
+    lbl.setStyleSheet(
+        f"background: {rgba(color, 0.15)}; color: {color}; border-radius: 8px; padding: 2px 8px;"
+        "font-size: 12px; font-weight: 600;"
+    )
+    return lbl
+
+
+class ManualWidget(QWidget):
+    """Manual de señas: abecedario (fijas y con movimiento), palabras y cómo
+    usar el traductor. Las ilustraciones salen de manual/ (generar_manual.py)
+    y las animaciones solo corren mientras el manual se ve."""
+
+    def __init__(self, manual_dir: Path, word_descriptions: Mapping[str, str],
+                 parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self._manual_dir = manual_dir
+        self._sprites: dict[int, list[SpriteLabel]] = {}
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        note = QLabel("Las señas se ven en espejo, como te verás en la pantalla del traductor.")
+        note.setObjectName("Muted")
+        layout.addWidget(note)
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self._scroll(self._letters_page()), "Abecedario")
+        self.tabs.addTab(self._scroll(self._words_page(word_descriptions)), "Palabras")
+        self.tabs.addTab(self._scroll(self._guide_page()), "Cómo usar")
+        layout.addWidget(self.tabs, stretch=1)
+        credits = QLabel("Letras con movimiento: plantillas del dataset del CICESE (CC BY 4.0). "
+                         "Letras fijas y palabras: grabaciones del equipo Chili Mix.")
+        credits.setObjectName("Muted")
+        credits.setWordWrap(True)
+        credits.setStyleSheet("font-size: 12px;")
+        layout.addWidget(credits)
+        self._timer = QTimer(self)
+        self._timer.setInterval(110)
+        self._timer.timeout.connect(self._tick)
+
+    # ---- paginas ----------------------------------------------------------
+
+    def _scroll(self, inner: QWidget) -> QScrollArea:
+        area = QScrollArea()
+        area.setWidgetResizable(True)
+        area.setWidget(inner)
+        return area
+
+    def _pixmap(self, path: Path) -> Optional[QPixmap]:
+        if not path.exists():
+            return None
+        pm = QPixmap(str(path))
+        return None if pm.isNull() else pm
+
+    def _letters_page(self) -> QWidget:
+        page = QWidget()
+        grid = QGridLayout(page)
+        grid.setSpacing(12)
+        cols = 5
+        for n, letter in enumerate(ALPHABET):
             card = Card()
-            t = QLabel(f"<b>{html.escape(title)}</b><br>{html.escape(text)}")
-            t.setWordWrap(True)
-            card.body.addWidget(t)
-            layout.addWidget(card)
-        if word_lines:
-            card = Card("Palabras que reconoce")
-            for line in word_lines:
-                lbl = QLabel("• " + line)
-                lbl.setWordWrap(True)
-                card.body.addWidget(lbl)
+            card.setMinimumWidth(170)
+            top = QHBoxLayout()
+            big = QLabel(letter)
+            big.setStyleSheet("font-size: 34px; font-weight: 800;")
+            top.addWidget(big)
+            top.addStretch()
+            still = self._pixmap(self._manual_dir / "letras" / f"{letter}.png")
+            strip = self._pixmap(self._manual_dir / "letras" / f"{letter}_anim.png")
+            if letter in DYNAMIC:
+                top.addWidget(_badge("con movimiento", COLORS["accent"]))
+            elif still is not None:
+                top.addWidget(_badge("fija", COLORS["muted"]))
+            card.body.addLayout(top)
+            if still is None:
+                pending = QLabel("Ilustración pendiente")
+                pending.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                pending.setMinimumHeight(150)
+                pending.setObjectName("Muted")
+                card.body.addWidget(pending)
+            else:
+                sprite = SpriteLabel(still, strip if letter in DYNAMIC else None, 150)
+                card.body.addWidget(sprite)
+                if sprite.animated:
+                    self._sprites.setdefault(0, []).append(sprite)
+            hint = QLabel("Haz el movimiento de corrido" if letter in DYNAMIC else "Mantén la mano quieta")
+            hint.setObjectName("Muted")
+            hint.setStyleSheet("font-size: 12px;")
+            hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            card.body.addWidget(hint)
+            grid.addWidget(card, n // cols, n % cols)
+        return page
+
+    def _words_page(self, descriptions: Mapping[str, str]) -> QWidget:
+        page = QWidget()
+        grid = QGridLayout(page)
+        grid.setSpacing(12)
+        words_dir = self._manual_dir / "palabras"
+        files = sorted(words_dir.glob("*.png")) if words_dir.is_dir() else []
+        names = [f.stem for f in files if not f.stem.endswith("_anim")]
+        if not names:
+            empty = QLabel("Todavía no hay ilustraciones de palabras (generar_manual.py --palabras).")
+            empty.setObjectName("Muted")
+            grid.addWidget(empty, 0, 0)
+        for n, name in enumerate(names):
+            label = name.replace("_", " ")
+            card = Card()
+            title = QLabel(label)
+            title.setStyleSheet("font-size: 26px; font-weight: 800;")
+            card.body.addWidget(title)
+            sprite = SpriteLabel(self._pixmap(words_dir / f"{name}.png"),
+                                 self._pixmap(words_dir / f"{name}_anim.png"), 250)
+            card.body.addWidget(sprite)
+            if sprite.animated:
+                self._sprites.setdefault(1, []).append(sprite)
+            desc = descriptions.get(label, "")
+            if desc:
+                d = QLabel(desc)
+                d.setWordWrap(True)
+                d.setObjectName("Muted")
+                card.body.addWidget(d)
+            grid.addWidget(card, n // 3, n % 3)
+        return page
+
+    def _guide_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        for title, text in GUIDE_STEPS:
+            card = Card()
+            lbl = QLabel(f"<b>{html.escape(title)}</b><br>{html.escape(text)}")
+            lbl.setWordWrap(True)
+            card.body.addWidget(lbl)
             layout.addWidget(card)
         layout.addStretch()
+        return page
+
+    # ---- animacion --------------------------------------------------------
+
+    def _tick(self) -> None:
+        for sprite in self._sprites.get(self.tabs.currentIndex(), []):
+            sprite.step()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._timer.start()
+
+    def hideEvent(self, event) -> None:
+        super().hideEvent(event)
+        self._timer.stop()     # en la Raspberry Pi no se gasta CPU con el manual cerrado
+
+
+class ManualWindow(QDialog):
+    """El manual en su propia ventana, para consultarlo con el traductor
+    corriendo (no es modal: la camara sigue)."""
+
+    def __init__(self, manual_dir: Path, word_descriptions: Mapping[str, str], parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.setWindowTitle("Manual de señas")
+        self.setModal(False)
+        self.resize(1100, 780)
+        layout = QVBoxLayout(self)
+        self.manual = ManualWidget(manual_dir, word_descriptions)
+        layout.addWidget(self.manual, stretch=1)
         layout.addLayout(close_row(self))
+
+
+class StartPage(QWidget):
+    """Menu inicial."""
+
+    start_requested = pyqtSignal()
+    manual_requested = pyqtSignal()
+    quit_requested = pyqtSignal()
+
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        outer = QVBoxLayout(self)
+        outer.addStretch()
+        box = Card()
+        box.setMaximumWidth(620)
+        hero = QLabel("Traductor LSM")
+        hero.setObjectName("Hero")
+        hero.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        sub = QLabel("Lengua de Señas Mexicana a texto y voz")
+        sub.setObjectName("AppSubtitle")
+        sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        text = QLabel("Reconoce el abecedario completo y las palabras HOLA, GRACIAS, POR FAVOR, "
+                      "AYUDA y MAMÁ. Antes de empezar, revisa en el manual cómo se hace cada seña.")
+        text.setWordWrap(True)
+        text.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        box.body.addWidget(hero)
+        box.body.addWidget(sub)
+        box.body.addSpacing(10)
+        box.body.addWidget(text)
+        box.body.addSpacing(14)
+        for label, name, signal in (("▶  Iniciar programa", "Primary", self.start_requested),
+                                    ("📖  Ver manual de señas", "", self.manual_requested),
+                                    ("Salir", "", self.quit_requested)):
+            b = QPushButton(label)
+            b.setObjectName(name or "Big")
+            if name:
+                b.setStyleSheet("font-size: 18px; padding: 14px 26px;")
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.clicked.connect(signal.emit)
+            box.body.addWidget(b)
+        row = QHBoxLayout()
+        row.addStretch()
+        row.addWidget(box, stretch=1)
+        row.addStretch()
+        outer.addLayout(row)
+        outer.addStretch()
+
+
+class ManualPage(QWidget):
+    """El manual a pantalla completa, con los botones para volver al menu o
+    seguir al traductor (lo que se muestra despues de Iniciar programa)."""
+
+    back_requested = pyqtSignal()
+    continue_requested = pyqtSignal()
+
+    def __init__(self, manual_dir: Path, word_descriptions: Mapping[str, str], parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 14, 18, 14)
+        top = QHBoxLayout()
+        back = QPushButton("←  Menú")
+        back.clicked.connect(self.back_requested.emit)
+        title = QLabel("Manual de señas")
+        title.setObjectName("AppTitle")
+        go = QPushButton("Continuar al traductor  ▶")
+        go.setObjectName("Primary")
+        go.setMinimumWidth(240)
+        go.clicked.connect(self.continue_requested.emit)
+        for w in (back, go):
+            w.setCursor(Qt.CursorShape.PointingHandCursor)
+        top.addWidget(back)
+        top.addSpacing(12)
+        top.addWidget(title)
+        top.addStretch()
+        top.addWidget(go)
+        layout.addLayout(top)
+        self.manual = ManualWidget(manual_dir, word_descriptions)
+        layout.addWidget(self.manual, stretch=1)
 
 
 class SettingsDialog(QDialog):
