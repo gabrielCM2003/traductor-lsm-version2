@@ -55,6 +55,21 @@ except ImportError as e:
         "Alfabeto dinamico no disponible (%s). Instala fastdtw/scipy para habilitarlo.", e
     )
 
+try:
+    from body_tracker import BodyTracker, draw_body_skeleton, body_location_features
+except ImportError as e:
+    # Esqueleto de pose: puramente visual/diagnostico (checkbox "Dibujar
+    # esqueleto (Pose)"), ver body_tracker.py. NO alimenta al clasificador ni
+    # al segmentador de ninguna forma - si falta este modulo o su modelo, el
+    # alfabeto estatico y dinamico siguen funcionando exactamente igual, el
+    # checkbox simplemente no hace nada.
+    BodyTracker = None
+    draw_body_skeleton = None
+    body_location_features = None
+    logging.getLogger("sign_translator").warning(
+        "Esqueleto de pose no disponible (%s). body_tracker.py es opcional.", e
+    )
+
 # --------------------------------------------------------------------------- #
 # Parametros ajustables del alfabeto dinamico integrado en la GUI.
 #
@@ -113,6 +128,25 @@ DYN_EXPERIMENTAL_LETTERS = {"K", "Q", "Z"}
 DYN_EXPERIMENTAL_MIN_MARGIN = 0.12
 DYN_EXPERIMENTAL_MIN_CONF = 0.30
 
+# Caso puntual, diagnostico 2026-09-29: Ñ nunca tuvo muestras propias reales
+# (a diferencia de J/K/Q/Z), asi que en vivo (fuera de las condiciones de
+# laboratorio de datos_dinamicas/) sus consultas se desvian mas de lo que
+# LOSO sugiere (98.9%). El unico vecino con el que Ñ se confunde, incluso en
+# LOSO puro, es Q (evaluar_dtw.py: 1/93). El problema es que Q esta en el
+# grupo EXPERIMENTAL (compromete con solo 12pp de margen) mientras Ñ esta en
+# el grupo NORMAL (necesita conf>=55% o 20pp de margen), asi que cuando el
+# DTW en vivo empuja a una Ñ real hacia el territorio de Q, a Q le basta
+# mucho menos margen del que le costaria a la propia Ñ para comprometerse
+# primero. DYN_NQ_PAIR_MIN_MARGIN exige un margen reforzado SOLO cuando el
+# top-1 es Q Y el 2.º lugar es especificamente Ñ; si no se alcanza, no se
+# compromete ninguna de las dos letras por esa clasificacion. No afecta a Q
+# contra K/X/Z (siguen con DYN_EXPERIMENTAL_MIN_MARGIN de siempre) ni a Ñ
+# como top-1 (sigue con su regla NORMAL sin cambios, vea dynamic_commit_
+# decision). Mitigacion temporal mientras se graban muestras propias reales
+# de Ñ (que es la solucion de fondo); revisar si sigue haciendo falta una
+# vez exista esa galeria.
+DYN_NQ_PAIR_MIN_MARGIN = 0.22
+
 # DTWRecognizer.try_load() tarda ~2s en parsear las plantillas de
 # datos_dinamicas/ (cientos de JSON). HandTrackingThread se recrea cada vez
 # que el watchdog reinicia la IA por inactividad, y eso pasaba en el hilo de
@@ -158,6 +192,9 @@ DEFAULT_CONFIG = {
     "watchdog_timeout_s": 5.0,
     "draw_landmarks": True,
     "draw_connections": True,
+    # Puramente visual/diagnostico (ver body_tracker.py). Default False: es
+    # opcional, no debe costarle CPU/descarga de modelo a quien no lo activa.
+    "draw_body_skeleton": False,
 }
 
 
@@ -185,6 +222,7 @@ class AppConfig:
     watchdog_timeout_s: float = DEFAULT_CONFIG["watchdog_timeout_s"]
     draw_landmarks: bool = DEFAULT_CONFIG["draw_landmarks"]
     draw_connections: bool = DEFAULT_CONFIG["draw_connections"]
+    draw_body_skeleton: bool = DEFAULT_CONFIG["draw_body_skeleton"]
 
     @classmethod
     def load(cls, json_path: Optional[Path] = None) -> "AppConfig":
@@ -628,6 +666,18 @@ def is_experimental_dynamic_letter(letter: str) -> bool:
     return letter in DYN_EXPERIMENTAL_LETTERS
 
 
+def is_nq_blocking_pair(topk: list[tuple[str, float]]) -> bool:
+    """True si el top-1 es Q y el 2.º lugar es especificamente Ñ.
+
+    Unico caso donde aplica el margen reforzado DYN_NQ_PAIR_MIN_MARGIN (ver
+    dynamic_commit_decision). Q contra cualquier otra letra (K, X, Z) sigue
+    con DYN_EXPERIMENTAL_MIN_MARGIN de siempre, sin cambios.
+    """
+    if len(topk) < 2:
+        return False
+    return topk[0][0] == "Q" and topk[1][0] == "Ñ"
+
+
 def dynamic_commit_decision(topk: list[tuple[str, float]]) -> tuple[bool, float, str]:
     """Decide si el top-1 de una clasificacion dinamica se compromete o no.
 
@@ -638,23 +688,34 @@ def dynamic_commit_decision(topk: list[tuple[str, float]]) -> tuple[bool, float,
         top-2 (confianza_1 - confianza_2) alcanza DYN_NORMAL_MIN_MARGIN,
         lo que se cumpla primero. La via de margen existe porque, igual que
         con K/Q/Z, un margen amplio es señal solida de acierto aunque la
-        confianza absoluta se quede corta.
+        confianza absoluta se quede corta. Esta regla se usa TAL CUAL cuando
+        el top-1 es Ñ, sin importar quien quede en 2.º lugar (el ajuste de
+        abajo es unidireccional: solo protege a Ñ de perder el commit contra
+        Q, nunca al reves).
       - Grupo EXPERIMENTAL (DYN_EXPERIMENTAL_LETTERS, hoy K, Q, Z): su
         confianza absoluta nunca cruza ~45% aunque el top-1 sea correcto (las
         6 clases quedan muy juntas en distancia DTW), asi que DYN_MIN_CONF
         las bloquearia siempre. Se comprometen si el margen sobre el 2.º
         lugar supera DYN_EXPERIMENTAL_MIN_MARGIN, con DYN_EXPERIMENTAL_
         MIN_CONF como piso minimo de cordura (no la condicion principal).
+        Caso especial dentro de este grupo (ver is_nq_blocking_pair y
+        DYN_NQ_PAIR_MIN_MARGIN): si el top-1 es Q y el 2.º lugar es
+        especificamente Ñ, se exige el margen reforzado DYN_NQ_PAIR_MIN_
+        MARGIN en vez de DYN_EXPERIMENTAL_MIN_MARGIN. Si no se alcanza, no
+        se compromete ni Q ni Ñ por esa clasificacion. Q contra K/X/Z no
+        cambia.
 
     Se centraliza aqui para que _process_dynamic_frame (que decide si se
     agrega la letra) y _on_diagnostic_update en la GUI (que solo explica por
     que no se agrego) usen exactamente el mismo criterio.
 
     Devuelve (se_compromete, margen, regla), donde regla es una de:
-      "confianza"    -> grupo normal, comprometio por DYN_MIN_CONF.
-      "margen"       -> grupo normal, comprometio por DYN_NORMAL_MIN_MARGIN.
-      "experimental" -> grupo experimental, comprometio por margen amplio.
-      ""             -> no se comprometio.
+      "confianza"       -> grupo normal, comprometio por DYN_MIN_CONF.
+      "margen"          -> grupo normal, comprometio por DYN_NORMAL_MIN_MARGIN.
+      "experimental"    -> grupo experimental, comprometio por margen amplio.
+      "experimental_nq" -> Q comprometio contra Ñ en 2.º lugar, con el margen
+                            reforzado DYN_NQ_PAIR_MIN_MARGIN.
+      ""                -> no se comprometio.
     """
     if not topk:
         return False, 0.0, ""
@@ -663,6 +724,9 @@ def dynamic_commit_decision(topk: list[tuple[str, float]]) -> tuple[bool, float,
     margin = conf1 - topk[1][1] if len(topk) > 1 else conf1
 
     if is_experimental_dynamic_letter(letra1):
+        if is_nq_blocking_pair(topk):
+            should_commit = conf1 >= DYN_EXPERIMENTAL_MIN_CONF and margin >= DYN_NQ_PAIR_MIN_MARGIN
+            return should_commit, margin, "experimental_nq" if should_commit else ""
         should_commit = conf1 >= DYN_EXPERIMENTAL_MIN_CONF and margin >= DYN_EXPERIMENTAL_MIN_MARGIN
         return should_commit, margin, "experimental" if should_commit else ""
 
@@ -705,6 +769,12 @@ class HandTrackingThread(QThread):
         self._cfg = config
         self._run_flag = True
         self._hands_solution = None
+
+        # Esqueleto de pose: puramente visual/diagnostico, ver body_tracker.py
+        # y _get_body_tracker(). No participa en self._classifier ni en
+        # self._auto_segmenter/self._dtw_recognizer de ninguna forma.
+        self._body_tracker: Optional["BodyTracker"] = None
+        self._body_tracker_failed: bool = False
 
         self._keypoint_buffer: deque[np.ndarray] = deque(
             maxlen=config.keypoint_buffer_size
@@ -807,6 +877,26 @@ class HandTrackingThread(QThread):
     def set_draw_connections(self, value: bool) -> None:
         self._cfg.draw_connections = value
 
+    def set_draw_body_skeleton(self, value: bool) -> None:
+        self._cfg.draw_body_skeleton = value
+
+    def _get_body_tracker(self) -> Optional["BodyTracker"]:
+        """Crea BodyTracker (MediaPipe Pose) la primera vez que hace falta,
+        no al iniciar el hilo: es un diagnostico opcional (checkbox "Dibujar
+        esqueleto (Pose)"), no debe costarle descarga de modelo ni CPU a
+        quien nunca lo activa. Puramente visual - su resultado no se usa en
+        self._classifier ni en self._auto_segmenter/self._dtw_recognizer."""
+        if BodyTracker is None:
+            return None
+        if self._body_tracker is None and not self._body_tracker_failed:
+            try:
+                self._body_tracker = BodyTracker()
+                log.info("BodyTracker (MediaPipe Pose) listo para diagnostico visual.")
+            except Exception as e:
+                self._body_tracker_failed = True
+                log.exception("No se pudo inicializar BodyTracker (Pose): %s", e)
+        return self._body_tracker
+
     def reset_word_state(self) -> None:
         self._frames_without_hand = 0
         self._space_already_committed = False
@@ -881,7 +971,22 @@ class HandTrackingThread(QThread):
                 continue
 
             detections = self._parse_results(results)
-            annotated = self._render(frame, detections)
+
+            # Pose (esqueleto del cuerpo): en paralelo a las manos, puramente
+            # visual/diagnostico (ver body_tracker.py). Solo corre si el
+            # checkbox esta activado, y su resultado se usa UNICAMENTE dentro
+            # de _render() para dibujar - jamas llega a self._classifier, a
+            # self._smoother ni a self._auto_segmenter/_process_dynamic_frame.
+            body_detection = None
+            if self._cfg.draw_body_skeleton:
+                tracker = self._get_body_tracker()
+                if tracker is not None:
+                    try:
+                        body_detection = tracker.detect(mp_image)
+                    except Exception as e:
+                        log.exception("BodyTracker.detect() falló: %s", e)
+
+            annotated = self._render(frame, detections, body_detection)
 
             self._update_keypoint_buffer(detections)
             self._update_word_state(detections)
@@ -1031,6 +1136,19 @@ class HandTrackingThread(QThread):
                     "[dinamico] top-3: %s -> agregada por regla EXPERIMENTAL (margen=%.1fpp >= %.0fpp)",
                     top_str, margin * 100, DYN_EXPERIMENTAL_MIN_MARGIN * 100,
                 )
+            elif rule == "experimental_nq":
+                # Q comprometida contra Ñ en 2.º lugar, con el margen
+                # reforzado DYN_NQ_PAIR_MIN_MARGIN (ver dynamic_commit_decision
+                # e is_nq_blocking_pair): un margen tan amplio sobre Ñ
+                # especificamente es señal solida incluso con el umbral mas
+                # estricto de este par.
+                self.letter_committed_signal.emit(letter)
+                self._last_committed_label = letter
+                self._dynamic_idle_text = f"{letter} {conf * 100:.1f}% (margen alto, par Ñ/Q)"
+                log.info(
+                    "[dinamico] top-3: %s -> agregada por regla EXPERIMENTAL reforzada, par Ñ/Q (margen=%.1fpp >= %.0fpp)",
+                    top_str, margin * 100, DYN_NQ_PAIR_MIN_MARGIN * 100,
+                )
             elif rule == "margen":
                 # Grupo normal comprometido por margen amplio aunque la
                 # confianza absoluta no llegara a DYN_MIN_CONF.
@@ -1048,14 +1166,19 @@ class HandTrackingThread(QThread):
                 log.info("[dinamico] top-3: %s -> agregada (confianza=%.1f%%)", top_str, conf * 100)
             elif is_experimental_dynamic_letter(letter):
                 # K, Q y Z (grupo experimental): no alcanzaron el margen de
-                # la regla experimental. Se siguen mostrando en el top-3 para
-                # poder seguir evaluandolas.
-                self._dynamic_idle_text = f"¿{letter}? ({conf * 100:.0f}%) - modo experimental, no se agregó"
+                # la regla experimental (o, si es el par Ñ/Q, el margen
+                # reforzado DYN_NQ_PAIR_MIN_MARGIN). Se siguen mostrando en
+                # el top-3 para poder seguir evaluandolas.
+                nq_pair = is_nq_blocking_pair(topk)
+                sufijo = " - modo experimental, no se agregó (par Ñ/Q)" if nq_pair else " - modo experimental, no se agregó"
+                self._dynamic_idle_text = f"¿{letter}? ({conf * 100:.0f}%){sufijo}"
                 motivos = []
                 if conf < DYN_EXPERIMENTAL_MIN_CONF:
                     motivos.append(f"confianza {conf * 100:.1f}% < {DYN_EXPERIMENTAL_MIN_CONF * 100:.0f}%")
-                if margin < DYN_EXPERIMENTAL_MIN_MARGIN:
-                    motivos.append(f"margen {margin * 100:.1f}pp < {DYN_EXPERIMENTAL_MIN_MARGIN * 100:.0f}pp")
+                margen_requerido = DYN_NQ_PAIR_MIN_MARGIN if nq_pair else DYN_EXPERIMENTAL_MIN_MARGIN
+                if margin < margen_requerido:
+                    etiqueta_margen = "margen (par Ñ/Q, reforzado)" if nq_pair else "margen"
+                    motivos.append(f"{etiqueta_margen} {margin * 100:.1f}pp < {margen_requerido * 100:.0f}pp")
                 log.info(
                     "[dinamico] top-3: %s -> NO agregada (modo experimental, %s)",
                     top_str, "; ".join(motivos) or "umbral no alcanzado",
@@ -1229,8 +1352,37 @@ class HandTrackingThread(QThread):
 
         return det
 
-    def _render(self, frame: np.ndarray, detections: FrameDetections) -> np.ndarray:
+    def _render(
+        self,
+        frame: np.ndarray,
+        detections: FrameDetections,
+        body: Optional["BodyDetection"] = None,
+    ) -> np.ndarray:
         out = frame.copy()
+
+        # Esqueleto de pose: se dibuja ANTES del "return out" de "sin manos"
+        # de abajo, para que se vea aunque todavia no se levanten las manos.
+        # Puramente visual: no cambia nada de lo que sigue (deteccion de
+        # manos, clasificacion, ni el texto/banner de mas abajo).
+        if self._cfg.draw_body_skeleton and body is not None and draw_body_skeleton is not None:
+            try:
+                draw_body_skeleton(out, body, detections.hands)
+            except Exception:
+                log.exception("Error dibujando esqueleto de pose")
+
+            if self._diagnostic_mode and body_location_features is not None:
+                hands_by_side: dict[str, HandDetection] = {}
+                for h in detections.hands:
+                    if h.handedness not in hands_by_side:
+                        hands_by_side[h.handedness] = h
+                h_frame, w_frame = out.shape[:2]
+                vec = body_location_features(hands_by_side, body, w_frame, h_frame)
+                texto = "Pose (b0..b8): " + " ".join(f"{v:+.2f}" for v in vec)
+                y_texto = h_frame - 15
+                cv2.putText(out, texto, (10, y_texto), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.45, (0, 0, 0), 3, cv2.LINE_AA)
+                cv2.putText(out, texto, (10, y_texto), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.45, (0, 215, 255), 1, cv2.LINE_AA)
 
         if detections.num_hands == 0:
             cv2.putText(
@@ -1333,6 +1485,11 @@ class HandTrackingThread(QThread):
         if self._hands_solution is not None:
             try:
                 self._hands_solution.close()
+            except Exception:
+                pass
+        if self._body_tracker is not None:
+            try:
+                self._body_tracker.close()
             except Exception:
                 pass
 
@@ -1597,6 +1754,15 @@ class SignLanguageApp(QMainWindow):
         self.cb_connections.setChecked(self.cfg.draw_connections)
         self.cb_connections.toggled.connect(self._on_draw_connections)
         side.addWidget(self.cb_connections)
+
+        self.cb_body_skeleton = QCheckBox("Dibujar esqueleto (Pose)")
+        self.cb_body_skeleton.setToolTip(
+            "Solo visual/diagnostico (MediaPipe Pose). No afecta el "
+            "reconocimiento de letras estaticas ni dinamicas."
+        )
+        self.cb_body_skeleton.setChecked(self.cfg.draw_body_skeleton)
+        self.cb_body_skeleton.toggled.connect(self._on_draw_body_skeleton)
+        side.addWidget(self.cb_body_skeleton)
 
         side.addSpacing(8)
 
@@ -1866,6 +2032,11 @@ class SignLanguageApp(QMainWindow):
         if self.ai_thread is not None:
             self.ai_thread.set_draw_connections(checked)
 
+    def _on_draw_body_skeleton(self, checked: bool) -> None:
+        self.cfg.draw_body_skeleton = checked
+        if self.ai_thread is not None:
+            self.ai_thread.set_draw_body_skeleton(checked)
+
     def _on_stable_frames_changed(self, value: int) -> None:
         self.stable_frames_value_label.setText(str(value))
         self.cfg.stable_frames_to_commit = value
@@ -1911,12 +2082,17 @@ class SignLanguageApp(QMainWindow):
             should_commit, margin, rule = dynamic_commit_decision(topk)
             if rule == "experimental":
                 lines.append(f"→ agregada por regla experimental (margen {margin * 100:.1f}pp)")
+            elif rule == "experimental_nq":
+                lines.append(f"→ agregada por regla experimental reforzada, par Ñ/Q (margen {margin * 100:.1f}pp)")
             elif rule == "margen":
                 lines.append(f"→ agregada por margen amplio (margen {margin * 100:.1f}pp)")
             elif rule == "confianza":
                 lines.append(f"→ agregada (confianza {topk[0][1] * 100:.1f}%)")
             elif is_experimental_dynamic_letter(topk[0][0]):
-                lines.append("→ modo experimental, no se agregó")
+                if is_nq_blocking_pair(topk):
+                    lines.append("→ par Ñ/Q: margen insuficiente, no se agregó (regla reforzada)")
+                else:
+                    lines.append("→ modo experimental, no se agregó")
             else:
                 lines.append("→ baja confianza, no se agregó")
             self.diagnostic_label.show()
