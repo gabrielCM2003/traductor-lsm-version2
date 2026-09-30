@@ -27,9 +27,10 @@ con las letras, el modo dinamico de senas.py empezaria a confundirlas. Grabar
 con el mismo corte automatico que se usa al reconocer hace que las muestras y
 las senas en vivo se corten igual.
 
-El DTW sigue comparando solo los 126 valores de las manos: las plantillas de
-letras (CICESE) no tienen cuerpo, y para palabras el peso de la ubicacion se
-podra ajustar cuando haya vocabulario grabado. Por eso se guarda desde ahora.
+Las letras se comparan solo con los 126 valores de las manos (las plantillas
+del CICESE no tienen cuerpo). Las palabras se comparan tambien con los 9 de
+ubicacion, multiplicados por dtw_recognizer.WORD_BODY_WEIGHT, igual que el
+modo automatico de senas.py.
 
 Los umbrales se miden en tiempo real (ms), no en conteo de frames: un umbral
 en frames representa distinto tiempo real segun que tan rapido procese cada
@@ -201,8 +202,9 @@ def load_recognizer(palabras: bool):
         return None
     # Directo y sin auto_save_labels: try_load reescribiria labels_dinamicas.json
     # (la lista de LETRAS que usa senas.py) con las palabras.
+    from dtw_recognizer import WORD_BODY_WEIGHT
     try:
-        recognizer = DTWRecognizer(data_dir=PALABRAS_DIR, auto_save_labels=False)
+        recognizer = DTWRecognizer(data_dir=PALABRAS_DIR, auto_save_labels=False, body_weight=WORD_BODY_WEIGHT)
     except Exception as e:
         print(f"No se pudo cargar el reconocedor de palabras: {e}", file=sys.stderr)
         return None
@@ -376,7 +378,11 @@ def main() -> int:
                 else:
                     print(f"[fin] sena de {len(sequence)} frames, clasificando...")
                     try:
-                        topk = recognizer.predict_topk([c.hands_vec for c in sequence], k=args.k)
+                        if palabras:
+                            query = [np.concatenate([c.hands_vec, c.body_vec]) for c in sequence]
+                        else:
+                            query = [c.hands_vec for c in sequence]
+                        topk = recognizer.predict_topk(query, k=args.k)
                     except Exception as e:
                         status = "Error al clasificar"
                         print(f"  ERROR al clasificar: {e}")

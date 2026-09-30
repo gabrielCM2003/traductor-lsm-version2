@@ -168,11 +168,14 @@ class BodyDetection:
         )
 
 
-def parse_pose(results) -> Optional[BodyDetection]:
-    """Resultado de PoseLandmarker -> BodyDetection, o None si no hay nadie en cuadro."""
-    if not results.pose_landmarks:
+def parse_pose(results, index: int = 0) -> Optional[BodyDetection]:
+    """Resultado de PoseLandmarker -> BodyDetection, o None si no hay nadie en cuadro.
+
+    index elige la persona cuando el detector se creo con num_poses > 1
+    (extraer_palabras_videos.py, videos con mas gente en cuadro)."""
+    if not results.pose_landmarks or index >= len(results.pose_landmarks):
         return None
-    lms = results.pose_landmarks[0]
+    lms = results.pose_landmarks[index]
     image_xyz = np.array([[lm.x, lm.y, lm.z] for lm in lms], dtype=np.float32)
     # visibility/presence son Optional en la API de Tasks; sin dato cuenta como no visible.
     visibility = np.array(
@@ -184,9 +187,9 @@ def parse_pose(results) -> Optional[BodyDetection]:
         dtype=np.float32,
     )
     world_xyz = np.zeros((N_POSE_LANDMARKS, 3), dtype=np.float32)
-    if results.pose_world_landmarks:
+    if results.pose_world_landmarks and index < len(results.pose_world_landmarks):
         world_xyz = np.array(
-            [[lm.x, lm.y, lm.z] for lm in results.pose_world_landmarks[0]],
+            [[lm.x, lm.y, lm.z] for lm in results.pose_world_landmarks[index]],
             dtype=np.float32,
         )
     return BodyDetection(image_xyz=image_xyz, visibility=visibility, presence=presence, world_xyz=world_xyz)

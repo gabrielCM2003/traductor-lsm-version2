@@ -37,6 +37,19 @@ log = logging.getLogger("dtw_recognizer")
 DEFAULT_DATA_DIR = Path(__file__).resolve().parent / "datos_dinamicas"
 DEFAULT_LABELS_FILE = Path(__file__).resolve().parent / "labels_dinamicas.json"
 N_FEATURES = 126
+# Bloque de ubicacion respecto al cuerpo ("body_frames" de las muestras de
+# palabras): body_tracker.N_BODY_FEATURES. No se importa de alli porque ese
+# modulo carga mediapipe y este no lo necesita.
+N_BODY_FEATURES = 9
+
+# Palabras completas: plantillas en datos_palabras_dinamicas/<PALABRA>/ (las
+# graba segmentador_automatico.py --modo palabras --grabar o las extrae
+# extraer_palabras_videos.py). Se comparan con la ubicacion respecto al cuerpo
+# multiplicada por WORD_BODY_WEIGHT: deja-uno-fuera con las 59 muestras de
+# video de HOLA, GRACIAS, POR FAVOR, AYUDA y MAMA dio 89.8% solo con manos,
+# 93.2% con peso 1, 96.6% con 2 y 98.3% con 4.
+DEFAULT_WORDS_DIR = Path(__file__).resolve().parent / "datos_palabras_dinamicas"
+WORD_BODY_WEIGHT = 4.0
 
 
 # =========================================================================== #
@@ -138,13 +151,21 @@ def mirror_and_swap_hands(sequence: np.ndarray) -> np.ndarray:
     """Intercambia bloque izquierdo (63) y derecho (63) y refleja el eje X de cada mano.
     
     Permite comparar secuencias realizadas con la mano contraria a las plantillas.
+    Si la secuencia trae ademas el bloque de cuerpo (126 + 9 columnas), tambien
+    intercambia sus dos slots de mano y niega sus dx; la bandera queda igual.
     """
-    out = np.zeros_like(sequence)
-    out[:, :63] = sequence[:, 63:]
-    out[:, 63:] = sequence[:, :63]
+    out = np.array(sequence, copy=True)
+    out[:, :63] = sequence[:, 63:126]
+    out[:, 63:126] = sequence[:, :63]
     for i in range(21):
         out[:, i * 3] = -out[:, i * 3]
         out[:, 63 + i * 3] = -out[:, 63 + i * 3]
+    if sequence.shape[1] == N_FEATURES + N_BODY_FEATURES:
+        b = N_FEATURES
+        out[:, b:b + 4] = sequence[:, b + 4:b + 8]
+        out[:, b + 4:b + 8] = sequence[:, b:b + 4]
+        for col in (b, b + 2, b + 4, b + 6):
+            out[:, col] = -out[:, col]
     return out
 
 
@@ -161,6 +182,23 @@ def resample_sequence(sequence: np.ndarray, target_len: int) -> np.ndarray:
     return resampled
 
 
+def distances_to_topk(
+    distances: dict[str, float], k: int = 3, temperature: float = 1.0
+) -> list[tuple[str, float]]:
+    """{seña: distancia DTW} -> top-k [(seña, confianza)], con la confianza
+    como softmax de -distancia/temperatura (la distancia menor gana). Es lo
+    que devuelve predict_topk; separado para quien ya calculo las distancias
+    (el modo automatico de senas.py las necesita tambien crudas)."""
+    sorted_candidates = sorted(distances.items(), key=lambda item: item[1])
+    k = min(k, len(sorted_candidates))
+    words = [w for w, _ in sorted_candidates]
+    dists = np.array([d for _, d in sorted_candidates], dtype=np.float64)
+    logits = -dists / max(1e-4, temperature)
+    exp_logits = np.exp(logits - np.max(logits))
+    probs = exp_logits / np.sum(exp_logits)
+    return [(words[i], float(probs[i])) for i in range(k)]
+
+
 # =========================================================================== #
 # Clase principal de reconocimiento DTW
 # =========================================================================== #
@@ -175,6 +213,7 @@ class DTWRecognizer:
         auto_save_labels: bool = True,
         resample_len: Optional[int] = None,
         hand_agnostic: bool = False,
+        body_weight: Optional[float] = None,
     ):
         """Inicializa el reconocedor y carga en memoria todas las plantillas disponibles.
 
@@ -189,11 +228,20 @@ class DTWRecognizer:
             hand_agnostic: Si es True, evalúa la consulta tanto normal como en
                            espejo (con manos intercambiadas) y toma la menor distancia.
                            Por defecto es False.
+            body_weight: None (por defecto) compara solo los 126 de las manos,
+                         como el alfabeto dinamico. Con un numero, compara
+                         tambien la ubicacion respecto al cuerpo ("body_frames",
+                         9 por frame) multiplicada por ese peso: lo usan las
+                         palabras, que se distinguen por DONDE se hacen. Las
+                         consultas traen entonces 126 + 9 columnas y las
+                         plantillas sin "body_frames" se saltan.
         """
         self.data_dir = Path(data_dir) if data_dir else DEFAULT_DATA_DIR
         self.labels_path = Path(labels_path) if labels_path else DEFAULT_LABELS_FILE
         self.resample_len = resample_len
         self.hand_agnostic = hand_agnostic
+        self.body_weight = body_weight
+        self.n_features = N_FEATURES + (N_BODY_FEATURES if body_weight is not None else 0)
 
         # Diccionario con estructura: { 'palabra': [array(T1, 126), array(T2, 126), ...] }
         self._templates: dict[str, list[np.ndarray]] = {}
@@ -215,6 +263,7 @@ class DTWRecognizer:
         labels_path: Optional[Union[Path, str]] = None,
         resample_len: Optional[int] = None,
         hand_agnostic: bool = False,
+        body_weight: Optional[float] = None,
     ) -> Optional["DTWRecognizer"]:
         """Intenta instanciar DTWRecognizer de manera segura.
         
@@ -226,6 +275,7 @@ class DTWRecognizer:
                 labels_path=labels_path,
                 resample_len=resample_len,
                 hand_agnostic=hand_agnostic,
+                body_weight=body_weight,
             )
             if not recognizer.labels:
                 log.warning("DTWRecognizer no disponible: no se encontraron plantillas.")
@@ -261,10 +311,17 @@ class DTWRecognizer:
                     content = json.loads(json_file.read_text(encoding="utf-8"))
                     frames = content.get("frames", content.get("sequence", content))
                     arr = np.array(frames, dtype=np.float64)
-                    if arr.ndim == 2 and arr.shape[1] == N_FEATURES and len(arr) > 0:
-                        if self.resample_len is not None:
-                            arr = resample_sequence(arr, self.resample_len)
-                        samples.append(arr)
+                    if arr.ndim == 2 and arr.shape[1] == N_FEATURES and self.body_weight is not None:
+                        body = np.array(content.get("body_frames", []), dtype=np.float64)
+                        if body.shape != (len(arr), N_BODY_FEATURES):
+                            log.warning(
+                                "Archivo %s sin body_frames validos (%s): se salta",
+                                json_file.name, body.shape,
+                            )
+                            continue
+                        arr = np.hstack([arr, body])
+                    if arr.ndim == 2 and arr.shape[1] == self.n_features and len(arr) > 0:
+                        samples.append(self._prepare(arr))
                     else:
                         log.warning(
                             "Archivo %s con dimensiones no válidas: %s",
@@ -278,10 +335,8 @@ class DTWRecognizer:
             for npy_file in sorted(word_dir.glob("*.npy")):
                 try:
                     arr = np.load(str(npy_file)).astype(np.float64)
-                    if arr.ndim == 2 and arr.shape[1] == N_FEATURES and len(arr) > 0:
-                        if self.resample_len is not None:
-                            arr = resample_sequence(arr, self.resample_len)
-                        samples.append(arr)
+                    if arr.ndim == 2 and arr.shape[1] == self.n_features and len(arr) > 0:
+                        samples.append(self._prepare(arr))
                 except Exception as e:
                     log.warning("Error al leer %s: %s", npy_file, e)
 
@@ -289,15 +344,16 @@ class DTWRecognizer:
             for csv_file in sorted(word_dir.glob("*.csv")):
                 try:
                     arr = np.loadtxt(str(csv_file), delimiter=",").astype(np.float64)
-                    if arr.ndim == 2 and arr.shape[1] == N_FEATURES and len(arr) > 0:
-                        if self.resample_len is not None:
-                            arr = resample_sequence(arr, self.resample_len)
-                        samples.append(arr)
+                    if arr.ndim == 2 and arr.shape[1] == self.n_features and len(arr) > 0:
+                        samples.append(self._prepare(arr))
                 except Exception as e:
                     log.warning("Error al leer %s: %s", csv_file, e)
 
             if samples:
-                self._templates[word] = samples
+                # extend y no =: en Linux una carpeta "Ñ" compuesta y otra
+                # descompuesta son dos carpetas distintas con la misma
+                # etiqueta, y la segunda borraba las plantillas de la primera.
+                self._templates.setdefault(word, []).extend(samples)
                 log.debug("Cargadas %d plantillas para '%s'", len(samples), word)
 
         self._labels = sorted(list(self._templates.keys()))
@@ -324,17 +380,28 @@ class DTWRecognizer:
         target.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "labels": self._labels,
-            "n_features": N_FEATURES,
+            "n_features": self.n_features,
             "normalization": "wrist_centered_middle_scaled",
         }
         with target.open("w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2, ensure_ascii=False)
         log.info("Etiquetas dinámicas guardadas en: %s", target)
 
+    def _prepare(self, arr: np.ndarray) -> np.ndarray:
+        """Secuencia cruda (T, n_features) -> lo que compara el DTW: con el
+        bloque de cuerpo multiplicado por body_weight y, si se pidio,
+        remuestreada. Se aplica igual a plantillas y consultas."""
+        arr = np.array(arr, dtype=np.float64)
+        if self.body_weight is not None:
+            arr[:, N_FEATURES:] *= self.body_weight
+        if self.resample_len is not None:
+            arr = resample_sequence(arr, self.resample_len)
+        return arr
+
     def _validate_sequence(
         self, sequence: Union[np.ndarray, List[List[float]], List[np.ndarray]]
     ) -> np.ndarray:
-        """Convierte y valida que la secuencia de entrada tenga shape (T, 126)."""
+        """Convierte y valida que la secuencia de entrada tenga shape (T, n_features)."""
         if not isinstance(sequence, np.ndarray):
             arr = np.array(sequence, dtype=np.float64)
         else:
@@ -342,19 +409,16 @@ class DTWRecognizer:
 
         if arr.ndim != 2:
             raise ValueError(
-                f"La secuencia debe tener 2 dimensiones (T, {N_FEATURES}), recibido ndim={arr.ndim}"
+                f"La secuencia debe tener 2 dimensiones (T, {self.n_features}), recibido ndim={arr.ndim}"
             )
-        if arr.shape[1] != N_FEATURES:
+        if arr.shape[1] != self.n_features:
             raise ValueError(
-                f"Se esperaba {N_FEATURES} características por frame, recibido {arr.shape[1]}"
+                f"Se esperaba {self.n_features} características por frame, recibido {arr.shape[1]}"
             )
         if len(arr) == 0:
             raise ValueError("La secuencia recibida está vacía.")
 
-        if self.resample_len is not None:
-            arr = resample_sequence(arr, self.resample_len)
-
-        return arr
+        return self._prepare(arr)
 
     def compute_distances(self, sequence: np.ndarray) -> dict[str, float]:
         """Calcula la distancia DTW normalizada mínima hacia cada seña registrada.
@@ -362,7 +426,23 @@ class DTWRecognizer:
         Utiliza scipy.spatial.distance.cdist para precalcular la matriz de costos
         una sola vez por plantilla y programación dinámica compilada (Numba/NumPy).
         """
-        sec_arr = self._validate_sequence(sequence)
+        return self._distances(self._validate_sequence(sequence))
+
+    def leave_one_out(self) -> list[tuple[str, str]]:
+        """(etiqueta real, etiqueta predicha) de cada plantilla reconocida
+        contra todas las DEMAS: estima el acierto sin grabar datos aparte."""
+        results = []
+        for word, template_list in self._templates.items():
+            for i in range(len(template_list)):
+                query = template_list.pop(i)
+                try:
+                    distances = self._distances(query)
+                finally:
+                    template_list.insert(i, query)
+                results.append((word, min(distances, key=distances.get)))
+        return results
+
+    def _distances(self, sec_arr: np.ndarray) -> dict[str, float]:
         mirrored_arr = mirror_and_swap_hands(sec_arr) if self.hand_agnostic else None
         distances: dict[str, float] = {}
 
@@ -421,18 +501,7 @@ class DTWRecognizer:
         if return_distance:
             return [(word, dist) for word, dist in sorted_candidates[:k]]
 
-        # Conversión de distancias a probabilidades calibradas tipo softmax
-        words = [w for w, _ in sorted_candidates]
-        dists = np.array([d for _, d in sorted_candidates], dtype=np.float64)
-
-        # Distancia normalizada invertida mediante softmax con temperatura
-        # Usamos -dist / temp para que la distancia menor tenga la probabilidad más alta
-        logits = -dists / max(1e-4, temperature)
-        logits_shifted = logits - np.max(logits)
-        exp_logits = np.exp(logits_shifted)
-        probs = exp_logits / np.sum(exp_logits)
-
-        return [(words[i], float(probs[i])) for i in range(k)]
+        return distances_to_topk(distances, k, temperature)
 
     def predict(
         self,
