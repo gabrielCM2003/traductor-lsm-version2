@@ -1,0 +1,50 @@
+GOAL: get the RIGHT-HAND glove data ("h":"D") flowing into our Python code on
+this Raspberry Pi. Left hand comes later, ignore it for now. FIX what is broken
+on the Raspberry side; do not just diagnose.
+
+SETUP
+- This Raspberry is the WiFi hotspot: SSID GUANTE_LSM, 2.4 GHz, IP 10.42.0.1.
+- The right-hand ESP32 connects as a client and sends one JSON per UDP datagram,
+  ~25/s, straight to 10.42.0.1:4210. There is NO "hola" and NO reply to the ESP.
+  The old address 192.168.4.1 no longer exists.
+- Packet: {"n":12,"t":3400,"h":"D","err":0,"pulgar":[8],"indice":[8],"medio":[8],
+  "anular":[8],"menique":[8],"mano":[8]}. Each array of 8 = [ax,ay,az,gx,gy,gz,
+  pitch,roll]. Ignore packets with err != 0. Sensor order is fixed.
+- My teammates merged our glove scripts into senas.py and I don't know how the
+  code ended up. What you find in the code prevails over this description.
+
+STEPS
+1. Safety: git add -A && git commit -m "checkpoint before glove fix". Do not
+   touch venv/, models, datasets (dataset_guante.jsonl stays as is), or the
+   camera/DTW/segmenter logic.
+2. Check the network: hotspot up on 10.42.0.1 (ip a), 2.4 GHz band, and is the
+   ESP associated (iw dev <iface> station dump)? Then run
+   sudo tcpdump -i <iface> -n udp port 4210 -c 10 while the ESP is on.
+   - tcpdump sees packets  -> the fault is on the Pi. Continue to step 3.
+   - tcpdump sees nothing  -> the fault is the ESP or WiFi. STOP and tell me
+     exactly what to check on the ESP Serial Monitor (115200 baud) using these
+     codes: WiFi=NO code 1 = network not found, 4 = connection failed (password),
+     6 = disconnected/retrying; WiFi=SI but enviados=0 = MODO_PRUEBA is not 0.
+3. Fix the Pi side. Find every place that receives glove data (grep: socket,
+   bind, recvfrom, sendto, "hola", 192.168.4.1, 4210, SO_REUSEADDR, serial).
+   Then make it so that:
+   - exactly ONE receiver does bind(('0.0.0.0', 4210)), in a daemon thread that
+     never blocks the video;
+   - all "hola"/IP_ESP/reply logic is removed;
+   - SO_REUSEADDR is removed, so a busy port fails loudly ("Address already in
+     use"); find and stop any other process holding the port (ss -lunp | grep 4210);
+   - for now only packets with "h":"D" and err == 0 are accepted; corrupt JSON is
+     dropped without crashing;
+   - if ufw is active: sudo ufw allow 4210/udp.
+4. Verify: run the app's receiver (or a minimal listener if needed) and confirm
+   ~25 packets/s of "h":"D" with err 0 reach the code that builds the glove
+   vector. Print a short live line like "D 25.0 Hz, err 0". Also confirm the
+   camera still works with no glove data, and that the app does not crash if the
+   glove disconnects.
+
+RULES
+- Small changes, test after each one. Code comments in Spanish.
+- Do NOT bring the hotspot down without asking me (it disconnects the ESP and
+  cuts internet). If you need internet for a package, tell me first.
+- At the end report: what was broken, what you changed and in which files, the
+  commit hash to revert, and anything I must check on the ESP side.

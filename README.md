@@ -37,7 +37,11 @@ El repositorio incluye también la documentación del **guante instrumentado** d
 | `datos_palabras_dinamicas/` | Plantillas de palabras (una subcarpeta por palabra), sacadas de videos con `extraer_palabras_videos.py` o grabadas con el segmentador. Van aparte de las letras porque el DTW toma cada subcarpeta como una clase |
 | `lsm_alphabet.onnx`, `lsm_alphabet.onnx.data` | Modelo entrenado del alfabeto estático (red pequeña, 63 entradas: 21 puntos × 3) |
 | `lsm_labels.json` | Etiquetas del modelo estático y tipo de normalización |
-| `tests/` | Pruebas unitarias: configuración, alfabeto estático, modo automático, DTW con cuerpo, retroalimentación y ventana |
+| `guante.py` | Guante con ESP32: recibe los datos por WiFi (UDP), los compara con el dataset del guante y decide cuándo escribir la seña |
+| `grabar_guante.py` | Graba muestras del guante en `datos_guante/dataset_guante.jsonl` (`--probar` para reconocer sin grabar) |
+| `simular_guante.py` | ESP32 falsa: manda muestras del dataset por UDP para probar sin el guante |
+| `datos_guante/` | Dataset del guante (una línea JSON por muestra: persona, etiqueta y 2 s de lecturas) |
+| `tests/` | Pruebas unitarias: configuración, alfabeto estático, modo automático, DTW con cuerpo, retroalimentación, ventana y guante |
 | `probar_modo_dinamico_senas.py` | Pruebas de regresión del alfabeto dinámico integrado en `senas.py` |
 | `requirements.txt` | Dependencias de Python |
 | `Guante_LSM_Indivisa_Ingenium_2026.pdf` | Guía técnica del guante v2: enlace inalámbrico ESP-NOW, batería LiPo y estación Raspberry Pi |
@@ -92,7 +96,10 @@ La línea punteada del video es la **línea de reposo** (a la altura del ombligo
 - **Letras estáticas (A-Y):** se fijan cuando la mano está quieta un momento, sola y arriba de la línea. Una mano en movimiento no escribe letras. La primera letra de cada seña se muestra en la tarjeta **Seña** y se escribe al bajar la mano (o en cuanto llega la segunda letra, si estás deletreando): así, la pausa de una palabra (HOLA en la frente) no deja una letra suelta que luego se borra.
 - **Letras con movimiento (J, K, Ñ, Q, X, Z):** sube la mano, haz la letra y bájala.
 - **Palabras (HOLA, GRACIAS, POR FAVOR, AYUDA, MAMÁ):** sube las manos, haz la seña y bájalas. La palabra se escribe completa y se cierra sola. La confianza está calibrada con personas que no aparecen en las plantillas (temperatura 0.5), y basta un margen de 0.15 sobre la segunda palabra para escribirla.
+- **HOLA y MAMÁ:** si son las dos primeras, decide dónde quedó la punta del índice: MAMÁ se hace en la boca y HOLA en la frente (en las plantillas, la punta pasa cerca de la boca 0-20% del tiempo en HOLA y 71-98% en MAMÁ). Hace falta que se vean los hombros y la boca.
 - Al bajar las manos, la seña completa se compara con las letras dinámicas y con las palabras. Si en ella se fijaron 3 letras estáticas o más, fue deletreo y se respeta.
+- **Los tres tipos tienen la misma prioridad:** ninguno gana por su tipo. Si en la seña se fijaron 1 o 2 letras estáticas (la I al empezar la J, la R en la pausa de HOLA), una letra con movimiento o una palabra las reemplaza solo si lo demuestra: la letra con movimiento, con una distancia DTW de 1.0 o menos (ninguna letra fija sostenida baja de 1.15); la palabra, con el cuerpo a la vista (o, sin cuerpo, a 0.6 o menos). Si no, las letras fijas se quedan.
+- **Sin cuerpo visible** (no se ven hombros o boca), las palabras se comparan solo con las manos: con el cuerpo en ceros, todo se parecía a MAMÁ.
 - La tarjeta **Seña** muestra el top-3 de cada seña con movimiento, y **Retroalimentación** dice si salió bien y, si no, qué corregir.
 
 ### Menú inicial y manual de señas
@@ -136,6 +143,36 @@ Medido en la laptop de desarrollo; en la Pi 5 todo es unas 3-5 veces más lento,
 
 Pasando los 15 videos de prueba por la app como cámara, con pose lite, a 30 y a 15 cuadros por segundo, las 15 palabras salen bien en ambos casos. El único costo medido: de 90 letras dinámicas de prueba se escriben 82 en vez de 84 (si se quiere la precisión completa, `LETTER_TEMPLATE_STEP = 1` en `senas.py`).
 
+### Guante (ESP32)
+
+El guante lleva 6 sensores inerciales (pulgar, índice, medio, anular, meñique y dorso de la mano). La ESP32 crea la red WiFi `GUANTE_LSM` (IP `192.168.4.1`) y manda por UDP (puerto 4210) un JSON por lectura, unas 21 por segundo, al equipo que le dice `hola`:
+
+```json
+{"pulgar": [ax, ay, az, gx, gy, gz, pitch, roll], "indice": [...], "medio": [...], "anular": [...], "menique": [...], "mano": [...], "err": 0}
+```
+
+1. Conecta la Raspberry a la red del guante: `sudo nmcli device wifi connect GUANTE_LSM password lsm12345`
+2. Graba muestras de cada seña (6 o más por seña; mejor de varias personas): `python grabar_guante.py`. Cada muestra son 2 s tras la cuenta atrás (2, 1, ¡ya!). Las etiquetas de más de una letra son palabras (`POR FAVOR` se guarda como `POR_FAVOR`).
+3. Revisa cómo reconoce: `python grabar_guante.py --probar` (muestra cuántas acierta dejando cada muestra fuera y el umbral de distancia).
+4. El traductor conecta el guante solo al abrir; no hay botón ni opción para activarlo. Conectarlo no cambia la pantalla: solo la barra de estado y la caja **Sensores del guante**, que muestra la última lectura de cada sensor.
+
+**Cámara y guante juntos (una sola respuesta):**
+
+- Cuando la cámara ve la mano, su respuesta y la del guante se combinan y **tienen que coincidir**: si coinciden, se escribe con más confianza; si la cámara duda entre dos (A o B) y el guante siente una de ellas, esa se escribe; si cada uno dice otra seña, no se escribe nada y el panel dice «¿B o C? La cámara ve B y el guante siente C». Vale para las letras fijas (en cada momento) y para las letras con movimiento y las palabras (al bajar la mano, con lo que el guante sintió durante toda la seña).
+- El guante solo opina de las señas que tiene grabadas: si la cámara ve una letra que el guante no conoce (por ejemplo D), decide la cámara sola.
+- Si la cámara no reconoce la seña (no se parece a nada) y el guante está muy seguro (80% o más), se escribe lo del guante.
+- Si la cámara no ve la mano (el guante oscuro no se detecta, la mano sale de cuadro o la cámara está apagada), el guante escribe por su cuenta.
+- En el video, la mano con guante siempre muestra sus 21 puntos (aunque el dibujo esté apagado en Ajustes) y encima una flecha por sensor: la dirección es su roll y el largo baja con el pitch. Si la cámara no encuentra la mano, las flechas salen en un recuadro «Guante» abajo a la izquierda. La zona de la mano se aclara un poco; el resto de la imagen no cambia.
+- Para que el guante escriba palabras hay que grabarlas con `grabar_guante.py` (`HOLA`, `MAMA` o `MAMÁ`, `GRACIAS`...); se escriben igual que las de la cámara.
+
+- **Automático:** sostén la seña ~1 s y se escribe. Para repetir una letra (LL), cambia de postura un momento y vuelve a hacerla.
+- **Ctrl+G:** captura con cuenta atrás, igual que al grabar; útil para señas con movimiento o con el automático apagado (Ajustes → Guante).
+- El reconocimiento compara la ventana de los últimos 2 s con las muestras del dataset (vecinos más cercanos). Si la distancia a la seña más parecida supera el umbral (calibrado solo con el propio dataset), o si duda entre dos señas, no escribe nada.
+
+Sin el guante: `python simular_guante.py --senas L,A,Y` y, en otra terminal, `python senas.py --guante --glove-ip 127.0.0.1`.
+
+La IP, el puerto y el archivo del dataset se cambian en `~/.sign_translator/config.json` (`glove_ip`, `glove_port`, `glove_dataset`) o con `--glove-ip` y `--glove-dataset`.
+
 ### Crear las plantillas de palabras desde videos
 
 Pon los videos en una carpeta con una subcarpeta por palabra (el nombre de la subcarpeta es la palabra; `PORFAVOR` se guarda como `POR_FAVOR` y se muestra como "POR FAVOR"):
@@ -177,6 +214,7 @@ En modo palabras, la seña termina al bajar las manos por debajo de la línea de
 | Ctrl+Retroceso | Borrar la palabra |
 | Enter o Ctrl+Espacio | Terminar la palabra (espacio) |
 | Ctrl+S | Guardar captura |
+| Ctrl+G | Capturar una seña del guante con cuenta atrás |
 
 Para repetir una letra (LL, RR, EE), relaja la mano un instante (o bájala) y vuelve a hacerla.
 
@@ -195,9 +233,8 @@ Ver `ESTADO_PROYECTO_COMPLETO.md` para el detalle completo (qué está probado c
 
 - Alfabeto estático (21 letras) y alfabeto dinámico completo (J, K, Ñ, Q, X, Z) funcionales, probados con varias personas.
 - **Palabras completas:** 59 plantillas de 5 palabras, sacadas de videos de 3 personas del equipo. Reconociendo a cada persona solo con las plantillas de las otras dos (como un usuario nuevo): 56/59 bien, y se escriben 54 de esas 56 sin agregar errores; los 3 errores son AYUDA↔GRACIAS. Falta probar con más personas y cámaras. El modelo `lsm_words.onnx` sigue siendo de prueba y el modo automático no lo usa.
-- El adaptador de datos del guante (sensores de flexión) todavía no tiene código: el protocolo de datos de mecatrónica sigue sin definirse.
+- **Guante:** el lector (`guante.py`) y el reconocimiento están integrados en el traductor. El dataset actual tiene 30 muestras de una sola persona (A, B, C, L, Y); dejando cada muestra fuera acierta 30/30, pero falta grabar más señas y a más personas.
 - La precisión del alfabeto estático todavía no está medida con personas que no participaron en el entrenamiento original.
-- El guante está documentado, pero su firmware y el lector del guante en la aplicación aún no están escritos: según las reglas del concurso, la programación del dispositivo se hace durante el evento.
 - Todo el desarrollo y las métricas de latencia se midieron en la laptop de desarrollo, no en la Raspberry Pi 5 real.
 
 ## Autor

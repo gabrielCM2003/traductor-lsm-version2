@@ -193,6 +193,99 @@ class TestModoAutomatico(unittest.TestCase):
         self.assertEqual(self.retracted, [["R"]])
         self.assertEqual(self.committed, ["HOLA"])
 
+    def test_letra_dinamica_clara_reemplaza_su_letra_de_partida(self):
+        """Misma prioridad: la J reemplaza la I que se fijo al empezarla, si su
+        DTW es claro (distancia <= DYN_REPLACE_MAX_DISTANCE)."""
+        self.thread._auto_classifying = True
+        self.thread._auto_result_queue.put(
+            result("letra", [("J", 0.9), ("X", 0.05), ("Z", 0.05)], best=0.7, letters=["I"]))
+        self.frame([], False)
+        app.processEvents()
+        self.assertEqual(self.retracted, [["I"]])
+        self.assertEqual(self.committed, ["J"])
+
+    def test_letra_fija_sostenida_no_se_vuelve_dinamica(self):
+        """Una I sostenida se parece a la J (distancia > 1.0): se queda la I."""
+        self.thread._auto_classifying = True
+        self.thread._auto_result_queue.put(
+            result("letra", [("J", 0.9), ("X", 0.05), ("Z", 0.05)], best=1.6, letters=["I"]))
+        self.frame([], False)
+        app.processEvents()
+        self.assertEqual(self.retracted, [])
+        self.assertEqual(self.committed, [])
+        self.assertEqual(self.results[-1]["code"], "deletreo")
+
+    def test_palabra_sin_cuerpo_no_reemplaza_letra_sostenida(self):
+        self.thread._auto_classifying = True
+        r = result("palabra", [("MAMÁ", 0.9), ("HOLA", 0.06), ("AYUDA", 0.04)], best=1.4, letters=["W"])
+        r["body_frac"] = 0.0
+        self.thread._auto_result_queue.put(r)
+        self.frame([], False)
+        app.processEvents()
+        self.assertEqual(self.retracted, [])
+        self.assertEqual(self.committed, [])
+
+    def test_palabra_sin_cuerpo_muy_cercana_si_reemplaza(self):
+        self.thread._auto_classifying = True
+        r = result("palabra", [("POR_FAVOR", 0.9), ("HOLA", 0.06), ("AYUDA", 0.04)], best=0.4, letters=["B"])
+        r["body_frac"] = 0.0
+        self.thread._auto_result_queue.put(r)
+        self.frame([], False)
+        app.processEvents()
+        self.assertEqual(self.retracted, [["B"]])
+        self.assertEqual(self.committed, ["POR FAVOR"])
+
+    def test_guante_desempata_la_letra_dinamica(self):
+        self.thread.set_glove(object(), {"J", "Z"})
+        self.thread._auto_classifying = True
+        self.thread._pending_activity_glove = [("Z", 0.9), ("J", 0.1)]
+        self.thread._auto_result_queue.put(result("letra", [("J", 0.45), ("Z", 0.42), ("X", 0.13)]))
+        self.frame([], False)
+        self.assertEqual(self.committed, ["Z"])
+        self.assertEqual(self.results[-1]["glove_status"], "coinciden")
+
+    def test_camara_y_guante_no_coinciden_no_escribe(self):
+        self.thread.set_glove(object(), {"J", "Z"})
+        self.thread._auto_classifying = True
+        self.thread._pending_activity_glove = [("Z", 0.95)]
+        self.thread._auto_result_queue.put(result("letra", [("J", 0.9), ("X", 0.05), ("K", 0.05)]))
+        self.frame([], False)
+        self.assertEqual(self.committed, [])
+        self.assertEqual(self.results[-1]["glove_status"], "no_coinciden")
+
+    def test_camara_no_reconoce_y_guante_seguro(self):
+        self.thread.set_glove(object(), {"HOLA"})
+        self.thread._auto_classifying = True
+        self.thread._pending_activity_glove = [("HOLA", 0.95)]
+        self.thread._auto_result_queue.put(
+            result("palabra", [("AYUDA", 0.5), ("GRACIAS", 0.3), ("MAMÁ", 0.2)], best=40.0))
+        self.frame([], False)
+        app.processEvents()
+        self.assertEqual(self.committed, ["HOLA"])
+        self.assertEqual(self.results[-1]["glove_status"], "guante_solo")
+
+    def test_letra_fija_con_guante(self):
+        """Cada frame: si el guante siente otra letra que la camara, no se fija."""
+        self.thread.set_glove(object(), {"A", "B"})
+        for _ in range(40):
+            self.thread.set_glove_opinion([("B", 0.95), ("A", 0.05)])
+            self.frame([hand(0.5, 0.4)], True)
+        self.assertEqual(self.committed, [])
+        self.rest()
+        for _ in range(40):
+            self.thread.set_glove_opinion([("A", 0.95), ("B", 0.05)])
+            self.frame([hand(0.5, 0.4)], True)
+        self.assertEqual(self.committed, ["A"])
+
+    def test_rellena_cuerpo_faltante(self):
+        seq = np.zeros((5, 135))
+        seq[1, 126:135] = 1.0
+        seq[3, 126:135] = 2.0
+        out = senas.fill_missing_body(seq)
+        np.testing.assert_array_equal(out[:, 126], [1, 1, 1, 2, 2])
+        self.assertTrue((out[:, 134] > 0).all())
+        np.testing.assert_array_equal(senas.fill_missing_body(np.zeros((3, 135))), np.zeros((3, 135)))
+
     def test_deletreo_largo_no_se_reemplaza(self):
         self.thread._auto_classifying = True
         self.thread._auto_result_queue.put(

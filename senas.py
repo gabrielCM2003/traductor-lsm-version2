@@ -36,9 +36,21 @@ from PyQt6.QtWidgets import (
 )
 
 from interfaz_lsm import (
-    COLORS, PHASE_STYLE, STYLESHEET, Card, CandidateBars, FeedbackPanel, ManualPage, ManualWindow, Pill,
+    COLORS, PHASE_STYLE, STYLESHEET, Card, CandidateBars, Feedback, FeedbackPanel, ManualPage, ManualWindow, Pill,
     SettingsDialog, StartPage, big_button, feedback_for_result, guidance_feedback, how_to_sign, sentence_html,
 )
+
+from guante import (
+    DEFAULT_DATASET as GLOVE_DEFAULT_DATASET, GLOVE_IP, GLOVE_PORT, GloveClassifier, GloveReceiver, GloveSession,
+    format_reading, plain_label,
+)
+
+# Camara + guante. Si la camara vio una mano hace menos de esto (o la sena
+# esta en curso), el guante no escribe solo: su respuesta se combina con la de
+# la camara (fuse_topk) y tienen que coincidir. Si la camara no ve la mano
+# (guante oscuro, fuera de cuadro, camara apagada), el guante escribe por su
+# cuenta.
+GLOVE_CAMERA_HAND_S = 1.0
 
 # Ilustraciones del manual de senas (las genera generar_manual.py).
 MANUAL_DIR = Path(__file__).resolve().parent / "manual"
@@ -241,9 +253,49 @@ AUTO_SPEED_WINDOW = 6
 # las demas): 687/689 con 1.2, ~680/689 con 1.4. Se prefiere 1.4 porque las
 # palabras fallaban justo con gente nueva.
 AUTO_WORD_PREFERENCE = 1.4
-# Letras estaticas que una palabra puede reemplazar (ver arriba). Medido
-# pasando los videos por la app: HOLA fijaba una "R" en la pausa de la frente.
+# Letras estaticas que una palabra o letra con movimiento puede reemplazar
+# (ver arriba). Medido pasando los videos por la app: HOLA fijaba una "R" en
+# la pausa de la frente.
 AUTO_MAX_RETRACTED_LETTERS = 2
+
+# Misma prioridad para los tres tipos: una letra fija de la sena en curso solo
+# se reemplaza si la sena con movimiento lo demuestra, no por ser de otro tipo.
+# Pasando las plantillas por el clasificador estatico, casi todas las letras
+# con movimiento fijan antes su letra de partida (J->I, K->P, N->Ñ, Z->D,
+# X->G/L, Q->L; cota superior: sin la regla de mano quieta). Antes eso
+# bloqueaba siempre la letra con movimiento. Pero una letra fija SOSTENIDA
+# tambien se parece a una con movimiento (I->J, D->Z, N->Ñ pasan la regla de
+# escritura), asi que se exige distancia DTW <= DYN_REPLACE_MAX_DISTANCE:
+# ninguna de las 19 letras fijas sostenidas (poses de manual/letras) quedo por
+# debajo de 1.15, y 64% de las letras con movimiento bien escritas (cada
+# plantilla contra las demas) quedan por debajo de 1.0.
+DYN_REPLACE_MAX_DISTANCE = 1.0
+# Palabras sin cuerpo visible: comparando solo las manos, una letra fija
+# sostenida queda tan cerca de una palabra como una palabra real (letras
+# desde 0.65; palabras, mediana 1.42), asi que sin la ubicacion la palabra
+# solo reemplaza letras si esta muy cerca. Con cuerpo visible se reemplazan
+# como siempre (medido con los videos).
+WORD_NO_BODY_REPLACE_MAX = 0.6
+# Palabras con cuerpo en menos de esta fraccion de frames se comparan SOLO con
+# las manos. Con el bloque de cuerpo en ceros, el DTW con cuerpo se iba a
+# MAMA (su mano esta junto a la boca: su bloque es casi cero): sin cuerpo, las
+# 12 plantillas de HOLA salian MAMA y 39/59 palabras bien; solo con las manos,
+# 53/59 (cada plantilla contra las demas). Si falta el cuerpo en pocos frames,
+# se rellenan con el frame con cuerpo mas cercano.
+WORD_MIN_BODY_FRACTION = 0.5
+
+
+def fill_missing_body(seq: np.ndarray) -> np.ndarray:
+    """Frames sin cuerpo (bandera en 0) toman el bloque de cuerpo del frame
+    con cuerpo mas cercano. Sin ningun frame con cuerpo, la deja igual."""
+    ok = seq[:, 134] > 0
+    if ok.all() or not ok.any():
+        return seq
+    idx = np.flatnonzero(ok)
+    nearest = idx[np.abs(idx[None, :] - np.arange(len(seq))[:, None]).argmin(axis=1)]
+    out = seq.copy()
+    out[:, 126:135] = seq[nearest, 126:135]
+    return out
 
 # Palabras (DTW con cuerpo, peso WORD_BODY_WEIGHT; confianza con
 # WORD_TEMPERATURE). Medido reconociendo a cada persona de los videos solo con
@@ -256,6 +308,17 @@ WORD_MIN_MARGIN = 0.15
 # palabra. Con personas nuevas la mayor distancia de una palabra bien
 # reconocida fue 11.1 (con las mismas personas, 9.4).
 WORD_MAX_DISTANCE = 16.0
+
+# HOLA y MAMA se confunden en vivo (una mano, a la altura de la cara). Se
+# distinguen por donde queda la punta del indice: MAMA en la boca, HOLA en la
+# frente. Fraccion de frames con la punta a menos de 0.35 anchos de hombro de
+# la boca, en las 24 plantillas: HOLA 0.00-0.20, MAMA 0.71-0.98. Si HOLA y
+# MAMA son las 2 primeras, esa fraccion decide (<= HOLA_MAX_NEAR -> HOLA,
+# >= MAMA_MIN_NEAR -> MAMA; en medio no se toca). Hace falta ver el cuerpo.
+NEAR_MOUTH = 0.35
+HOLA_MAX_NEAR = 0.35
+MAMA_MIN_NEAR = 0.55
+HOLA_MAMA = ("HOLA", "MAMÁ")
 
 _word_recognizers: Optional[tuple["DTWRecognizer", "DTWRecognizer"]] = None
 _word_recognizers_load_attempted = False
@@ -295,6 +358,9 @@ class SignStats:
     two_hands: float = 0.0
     duration_s: float = 0.0
     has_body: bool = False
+    # Fraccion de frames con la punta del indice a menos de NEAR_MOUTH de la
+    # boca (desempata HOLA / MAMA, ver hola_mama_rule).
+    near_mouth: float = 0.0
 
 
 def sign_stats(sequence: np.ndarray, duration_s: float) -> SignStats:
@@ -312,13 +378,15 @@ def sign_stats(sequence: np.ndarray, duration_s: float) -> SignStats:
         return SignStats(two_hands=two, duration_s=duration_s)
     wrist = body[mask, off:off + 2]
     tip = body[mask, off + 2:off + 4]
+    tip_dist = np.linalg.norm(tip, axis=1)
     return SignStats(
         wrist_dx=float(np.median(wrist[:, 0])),
         wrist_dy=float(np.median(wrist[:, 1])),
-        tip_mouth=float(np.median(np.linalg.norm(tip, axis=1))),
+        tip_mouth=float(np.median(tip_dist)),
         two_hands=two,
         duration_s=duration_s,
         has_body=True,
+        near_mouth=float(np.mean(tip_dist < NEAR_MOUTH)),
     )
 
 
@@ -360,6 +428,27 @@ def _compute_word_profiles() -> dict[str, SignStats]:
 def word_display(label: str) -> str:
     """Etiqueta de carpeta -> texto: POR_FAVOR -> POR FAVOR."""
     return label.replace("_", " ")
+
+
+def hola_mama_rule(topk: list[tuple[str, float]], stats: Optional["SignStats"]) -> tuple[list[tuple[str, float]], str]:
+    """Desempate HOLA / MAMA por la distancia de la punta del indice a la
+    boca. Si decide, la ganadora queda primera con margen suficiente para
+    escribirse. Devuelve (topk, nota para el log; "" si no cambio nada)."""
+    if len(topk) < 2 or {topk[0][0], topk[1][0]} != set(HOLA_MAMA) or stats is None or not stats.has_body:
+        return topk, ""
+    if stats.near_mouth <= HOLA_MAX_NEAR:
+        winner = "HOLA"
+    elif stats.near_mouth >= MAMA_MIN_NEAR:
+        winner = "MAMÁ"
+    else:
+        return topk, ""
+    loser = HOLA_MAMA[1] if winner == "HOLA" else HOLA_MAMA[0]
+    total = topk[0][1] + topk[1][1]
+    p_win = max(topk[0][1] if topk[0][0] == winner else topk[1][1], total * 0.8)
+    new = [(winner, p_win), (loser, total - p_win)] + list(topk[2:])
+    if new[0][0] == topk[0][0] and abs(new[0][1] - topk[0][1]) < 1e-9:
+        return topk, ""
+    return new, f"desempate {winner} (punta del índice cerca de la boca {stats.near_mouth * 100:.0f}% del tiempo)"
 
 
 def word_commit_decision(topk: list[tuple[str, float]], best_distance: float) -> tuple[bool, float, str]:
@@ -430,6 +519,14 @@ DEFAULT_CONFIG = {
     # boca casi no se mueven en ese tiempo). Medido en la laptop: manos +
     # pose en serie 16.4 ms por frame, en paralelo ~8 ms (lo de las manos).
     "pose_async": True,
+    # Guante con ESP32 (guante.py). La ESP es punto de acceso (red
+    # GUANTE_LSM) y manda los datos por UDP. glove_dataset vacio = el de
+    # datos_guante/ (lo graba grabar_guante.py). glove_auto: escribe la sena
+    # en cuanto se sostiene; si no, solo con la captura (Ctrl+G).
+    "glove_ip": GLOVE_IP,
+    "glove_port": GLOVE_PORT,
+    "glove_dataset": "",
+    "glove_auto": True,
 }
 
 # Rangos validos al cargar config.json / CLI. Los que tienen slider usan su
@@ -448,6 +545,7 @@ CONFIG_RANGES: dict[str, tuple[float, float]] = {
     "keypoint_buffer_size": (5, 300),
     "queue_maxsize": (1, 10),
     "watchdog_timeout_s": (2.0, 60.0),
+    "glove_port": (1, 65535),
 }
 CONFIG_CHOICES: dict[str, tuple[str, ...]] = {
     "dominant_hand": ("Right", "Left"),
@@ -495,6 +593,10 @@ class AppConfig:
     draw_body: bool = DEFAULT_CONFIG["draw_body"]
     pose_model: str = DEFAULT_CONFIG["pose_model"]
     pose_async: bool = DEFAULT_CONFIG["pose_async"]
+    glove_ip: str = DEFAULT_CONFIG["glove_ip"]
+    glove_port: int = DEFAULT_CONFIG["glove_port"]
+    glove_dataset: str = DEFAULT_CONFIG["glove_dataset"]
+    glove_auto: bool = DEFAULT_CONFIG["glove_auto"]
 
     @classmethod
     def load(cls, json_path: Optional[Path] = None) -> "AppConfig":
@@ -806,11 +908,179 @@ LANDMARK_GROUP = {
 }
 
 
+# Mano con el guante puesto: el guante es oscuro y se pierde en el video.
+# Mientras el guante esta conectado, la zona de esa mano se aclara (antes de
+# detectar, para que MediaPipe distinga mejor los dedos, y asi se ve en
+# pantalla) y la mano se dibuja en colores claros.
+# Aclarado: lo mas claro de la zona (percentil 99) se lleva a blanco y luego
+# gamma 0.5, que levanta sobre todo lo oscuro. Nunca oscurece (estirar
+# tambien el percentil 1 a negro dejaba NEGRO un guante que fuera lo mas
+# oscuro de la zona). Con un guante oscuro simulado (mano al 22-35% de
+# brillo) en las 6 fotos de inspeccion_pose/, MediaPipe encontraba la mano en
+# 6/12; aclarando, en 8/12 (zona o frame completo).
+GLOVE_GAMMA = 0.5
+_GLOVE_GAMMA_LUT = np.array([255 * (i / 255) ** GLOVE_GAMMA for i in range(256)], dtype=np.float32)
+GLOVE_BOX_MARGIN = 0.35         # la zona crece 35% por lado (la mano se mueve entre frames)
+GLOVE_BOX_HOLD_S = 0.6          # si se pierde la mano, se sigue aclarando donde estaba
+# Colores de los dedos aclarados (mezcla con blanco) para la mano con guante.
+GLOVE_FINGER_COLORS = {
+    k: tuple(int(c + (255 - c) * 0.6) for c in v) for k, v in {
+        "thumb": (255, 102, 102), "index": (102, 255, 102), "middle": (255, 178, 102),
+        "ring": (178, 102, 255), "pinky": (102, 178, 255), "palm": (200, 200, 200),
+    }.items()
+}
+
+
+def hand_box(hand: HandDetection, w: int, h: int, margin: float = GLOVE_BOX_MARGIN) -> tuple[int, int, int, int]:
+    """Rectangulo (x0, y0, x1, y1) en pixeles alrededor de la mano, con margen."""
+    xs = hand.landmarks_2d[:, 0] * w
+    ys = hand.landmarks_2d[:, 1] * h
+    mx = (xs.max() - xs.min()) * margin + 10
+    my = (ys.max() - ys.min()) * margin + 10
+    x0, x1 = int(max(0, xs.min() - mx)), int(min(w, xs.max() + mx))
+    y0, y1 = int(max(0, ys.min() - my)), int(min(h, ys.max() + my))
+    return x0, y0, x1, y1
+
+
+def _glove_lut(image: np.ndarray) -> np.ndarray:
+    """LUT de aclarado para esta imagen: su percentil 99 pasa a 255 y luego
+    gamma. El percentil sale de 1 de cada 16 pixeles (rapido en la Raspberry
+    Pi)."""
+    gray = cv2.cvtColor(np.ascontiguousarray(image[::4, ::4]), cv2.COLOR_BGR2GRAY)
+    hi = max(1.0, float(np.percentile(gray, 99)))
+    idx = np.clip(np.arange(256) * 255.0 / hi, 0, 255).astype(np.uint8)
+    return _GLOVE_GAMMA_LUT[idx].astype(np.uint8)
+
+
+def _feather_mask(size: int = 64) -> np.ndarray:
+    """Elipse con borde difuminado (0-1), se escala al tamano de cada zona."""
+    mask = np.zeros((size, size), dtype=np.uint8)
+    cv2.ellipse(mask, (size // 2, size // 2), (size // 2 - 1, size // 2 - 1), 0, 0, 360, 255, -1)
+    return cv2.GaussianBlur(mask, (size // 4 + 1, size // 4 + 1), 0).astype(np.float32) / 255.0
+
+
+_GLOVE_MASK = _feather_mask()
+
+
+def brighten_regions(frame: np.ndarray, boxes: list[tuple[int, int, int, int]]) -> np.ndarray:
+    """Aclara las zonas dadas (borde difuminado, sin cortes visibles). Sin
+    zonas deja el frame igual: antes se aclaraba todo el frame para encontrar
+    la mano con guante, y la pantalla se ponia blanca al conectar el guante."""
+    if not boxes:
+        return frame
+    out = frame.copy()
+    for x0, y0, x1, y1 in boxes:
+        bw, bh = x1 - x0, y1 - y0
+        if bw < 4 or bh < 4:
+            continue
+        region = out[y0:y1, x0:x1]
+        alpha = cv2.resize(_GLOVE_MASK, (bw, bh), interpolation=cv2.INTER_LINEAR)
+        # Solo lo oscuro (el guante): el fondo claro alrededor casi no cambia.
+        gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        alpha = (alpha * np.clip((170.0 - gray) / 110.0, 0.0, 1.0))[..., None]
+        light = cv2.LUT(region, _glove_lut(region)).astype(np.float32)
+        out[y0:y1, x0:x1] = (region + (light - region) * alpha).astype(np.uint8)
+    return out
+
+
+# Flechas de los sensores del guante sobre la mano: una por sensor, desde el
+# nudillo de su dedo (el de la mano, desde la muneca). La direccion es el roll
+# del sensor (0 = hacia arriba) y el largo baja con el pitch (a 90° queda corta:
+# el sensor apunta hacia la camara o en contra).
+GLOVE_SENSOR_ANCHORS = {"pulgar": 2, "indice": 5, "medio": 9, "anular": 13, "menique": 17, "mano": 0}
+GLOVE_SENSOR_COLORS = {"pulgar": "thumb", "indice": "index", "medio": "middle",
+                       "anular": "ring", "menique": "pinky", "mano": "palm"}
+
+
+def draw_glove_vectors(image: np.ndarray, reading, anchors_px: Optional[np.ndarray] = None,
+                       hand_size_px: float = 60.0) -> None:
+    """Dibuja las flechas de los 6 sensores. anchors_px: los 21 puntos de la
+    mano en pixeles (si la camara la ve); sin ellos, un recuadro abajo a la
+    izquierda con las 6 flechas, para ver el guante aunque la camara no
+    encuentre la mano."""
+    from guante import SENSOR_NAMES, VALUES_PER_SENSOR
+    vals = np.asarray(reading, dtype=float).reshape(len(SENSOR_NAMES), VALUES_PER_SENSOR)
+    h, w = image.shape[:2]
+    if anchors_px is None:
+        box_w, box_h = 220, 90
+        x0, y0 = 10, h - box_h - 10
+        overlay = image.copy()
+        cv2.rectangle(overlay, (x0, y0), (x0 + box_w, y0 + box_h), (20, 20, 20), -1)
+        cv2.addWeighted(overlay, 0.6, image, 0.4, 0, dst=image)
+        cv2.putText(image, "Guante", (x0 + 8, y0 + 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (230, 230, 230), 1, cv2.LINE_AA)
+        step = box_w // len(SENSOR_NAMES)
+        origins = [(x0 + step // 2 + i * step, y0 + box_h - 18) for i in range(len(SENSOR_NAMES))]
+        length = 32.0
+    else:
+        origins = [tuple(int(v) for v in anchors_px[GLOVE_SENSOR_ANCHORS[n]]) for n in SENSOR_NAMES]
+        length = max(20.0, hand_size_px * 0.6)
+    for name, (ox, oy), v in zip(SENSOR_NAMES, origins, vals):
+        pitch, roll = np.radians(v[6]), np.radians(v[7])
+        size = length * (0.3 + 0.7 * abs(np.cos(pitch)))
+        tip = (int(ox + size * np.sin(roll)), int(oy - size * np.cos(roll)))
+        color = GLOVE_FINGER_COLORS[GLOVE_SENSOR_COLORS[name]]
+        cv2.arrowedLine(image, (ox, oy), tip, (30, 30, 30), 4, cv2.LINE_AA, tipLength=0.3)
+        cv2.arrowedLine(image, (ox, oy), tip, color, 2, cv2.LINE_AA, tipLength=0.3)
+
+
+# Camara + guante: una sola respuesta, en la que los dos coinciden.
+#   - El guante solo opina de las señas que tiene grabadas (vocab) y solo
+#     reordena las candidatas de la camara (nunca agrega otra).
+#   - Coinciden (la 1.a del guante es la 1.a de la camara, o una de sus
+#     candidatas y al combinarlas queda primera): se escribe con la confianza
+#     combinada. Asi el guante desempata a la camara (A 50% / B 40% y el guante
+#     dice B -> B).
+#   - No coinciden (el guante conoce la seña de la camara y dice otra, o la
+#     del guante esta entre las candidatas de la camara pero no gana): no se
+#     escribe nada, hay que repetir.
+#   - El guante no conoce ninguna candidata de la camara (una letra que no se
+#     ha grabado con el guante): decide la camara sola.
+# Combinacion: p_camara * (n * p_guante) ** GLOVE_FUSION_WEIGHT para las
+# señas del guante (n = cuantas tiene; en promedio el factor es 1), con un
+# piso para que el guante solo nunca borre una seña.
+GLOVE_FUSION_WEIGHT = 0.5
+GLOVE_FUSION_FLOOR = 0.02
+# Respuesta del guante que todavia vale para las letras fijas (cada frame).
+GLOVE_OPINION_FRESH_S = 0.75
+# Camara sin respuesta (la sena no se parece a nada) y guante muy seguro: se
+# escribe lo del guante (la camara vio algo, pero no lo reconocio).
+GLOVE_ALONE_MIN_PROB = 0.8
+
+
+def fuse_topk(camera: list[tuple[str, float]], glove: Optional[list[tuple[str, float]]],
+              vocab: set[str]) -> tuple[list[tuple[str, float]], str]:
+    """(top-k combinado, estado). Estado: "solo_camara" (el guante no opina
+    de estas candidatas), "coinciden" o "no_coinciden". Si no coinciden, el
+    top-k queda empatado entre la de la camara y la del guante, para que
+    ninguna regla de escritura lo acepte."""
+    if not camera or not glove or not vocab:
+        return camera, "solo_camara"
+    labels = [l for l, _ in camera]
+    ctop, gtop = labels[0], glove[0][0]
+    if not any(l in vocab for l in labels):
+        return camera, "solo_camara"
+    if gtop not in labels and ctop not in vocab:
+        return camera, "solo_camara"
+    g = dict(glove)
+    n = len(vocab)
+    scores = {}
+    for l, p in camera:
+        factor = (n * max(g.get(l, 0.0), GLOVE_FUSION_FLOOR)) ** GLOVE_FUSION_WEIGHT if l in vocab else 1.0
+        scores[l] = max(p, GLOVE_FUSION_FLOOR) * factor
+    total = sum(scores.values())
+    fused = sorted(((l, v / total) for l, v in scores.items()), key=lambda x: -x[1])
+    if fused[0][0] == gtop:
+        return fused, "coinciden"
+    tie = [(ctop, 0.45), (gtop, 0.45)] + [(l, 0.1 / max(1, len(labels) - 1)) for l in labels if l not in (ctop, gtop)]
+    return tie[: len(camera) if len(camera) > 1 else 2], "no_coinciden"
+
+
 def draw_hand_landmarks(
     image: np.ndarray,
     hand: HandDetection,
     draw_connections: bool = True,
     draw_points: bool = True,
+    light: bool = False,
 ) -> None:
     h, w = image.shape[:2]
     pts_px = np.zeros((21, 2), dtype=np.int32)
@@ -818,17 +1088,21 @@ def draw_hand_landmarks(
         pts_px[i, 0] = int(hand.landmarks_2d[i, 0] * w)
         pts_px[i, 1] = int(hand.landmarks_2d[i, 1] * h)
 
+    colors = GLOVE_FINGER_COLORS if light else FINGER_COLORS
     if draw_connections:
         for a, b in HAND_CONNECTIONS:
-            color = FINGER_COLORS[LANDMARK_GROUP[b]]
+            if light:   # contorno oscuro para que la linea clara resalte sobre el guante aclarado
+                cv2.line(image, tuple(pts_px[a]), tuple(pts_px[b]), (40, 40, 40), 4, cv2.LINE_AA)
+            color = colors[LANDMARK_GROUP[b]]
             cv2.line(image, tuple(pts_px[a]), tuple(pts_px[b]), color, 2, cv2.LINE_AA)
 
     if draw_points:
+        outline = (40, 40, 40) if light else (255, 255, 255)
         for i in range(21):
-            color = FINGER_COLORS[LANDMARK_GROUP[i]]
+            color = colors[LANDMARK_GROUP[i]]
             radius = 6 if i in (0, 5, 9, 13, 17) else 4
             cv2.circle(image, tuple(pts_px[i]), radius, color, -1, cv2.LINE_AA)
-            cv2.circle(image, tuple(pts_px[i]), radius, (255, 255, 255), 1, cv2.LINE_AA)
+            cv2.circle(image, tuple(pts_px[i]), radius, outline, 1, cv2.LINE_AA)
 
 
 def draw_hand_label(image: np.ndarray, hand: HandDetection) -> None:
@@ -1289,6 +1563,20 @@ class HandTrackingThread(QThread):
         self._last_guidance = 0.0
         self._last_static_topk: list[tuple[str, float]] = []
         self._last_distance_warning = None
+        # Guante conectado (lo pone la ventana): aclarar y dibujar en claro la
+        # mano que deletrea. _glove_box: donde estaba esa mano y cuando.
+        self._glove_on_hand = False
+        self._glove_box: Optional[tuple[int, int, int, int]] = None
+        # Guante conectado: receptor (flechas de los sensores), señas que
+        # conoce (con los nombres de la camara) y sus respuestas recientes
+        # (hora perf_counter, top-k) para combinarlas con la camara.
+        self._glove_receiver = None
+        self._glove_vocab: set[str] = set()
+        self._glove_history: deque = deque(maxlen=64)
+        self._last_glove_status = "solo_camara"
+        self._last_glove_conflict: Optional[tuple[str, str]] = None
+        self._pending_activity_glove: Optional[list[tuple[str, float]]] = None
+        self._glove_box_t = 0.0
 
         self._latencies: deque[float] = deque(maxlen=100)
         self._frame_times: deque[float] = deque(maxlen=30)
@@ -1329,6 +1617,39 @@ class HandTrackingThread(QThread):
 
     def set_draw_connections(self, value: bool) -> None:
         self._cfg.draw_connections = value
+
+    def set_glove(self, receiver, vocab: set[str]) -> None:
+        """Guante conectado (receptor y señas que conoce) o None si no."""
+        self._glove_receiver = receiver
+        self._glove_vocab = set(vocab) if receiver is not None else set()
+        self._glove_on_hand = receiver is not None
+        if receiver is None:
+            self._glove_box = None
+            self._glove_history.clear()
+
+    def set_glove_opinion(self, topk: Optional[list[tuple[str, float]]]) -> None:
+        """Ultima respuesta del guante (la ventana la manda ~4 veces por
+        segundo); None si no reconocio nada."""
+        if topk:
+            self._glove_history.append((time.perf_counter(), list(topk)))
+
+    def _fresh_glove_opinion(self, now: float) -> Optional[list[tuple[str, float]]]:
+        if self._glove_history and now - self._glove_history[-1][0] <= GLOVE_OPINION_FRESH_S:
+            return self._glove_history[-1][1]
+        return None
+
+    def _glove_opinion_since(self, t0: float) -> Optional[list[tuple[str, float]]]:
+        """Promedio de las respuestas del guante desde t0 (toda la sena)."""
+        sums: dict[str, float] = {}
+        n = 0
+        for t, topk in self._glove_history:
+            if t >= t0:
+                n += 1
+                for label, p in topk:
+                    sums[label] = sums.get(label, 0.0) + p
+        if not n:
+            return None
+        return sorted(((l, v / n) for l, v in sums.items()), key=lambda x: -x[1])[:3]
 
     def set_draw_body(self, value: bool) -> None:
         self._cfg.draw_body = value
@@ -1493,6 +1814,10 @@ class HandTrackingThread(QThread):
 
             t0 = time.perf_counter()
 
+            if self._glove_on_hand:
+                recent = self._glove_box is not None and time.monotonic() - self._glove_box_t < GLOVE_BOX_HOLD_S
+                frame = brighten_regions(frame, [self._glove_box] if recent else [])
+
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             try:
                 mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
@@ -1503,6 +1828,10 @@ class HandTrackingThread(QThread):
                 continue
 
             detections = self._parse_results(results)
+            gloved = self._select_hand(detections) if self._glove_on_hand else None
+            if gloved is not None:
+                self._glove_box = hand_box(gloved, frame.shape[1], frame.shape[0])
+                self._glove_box_t = time.monotonic()
             if self._body_tracker is not None:
                 # Sin timestamp_ms a proposito: BodyTracker usa tiempo real
                 # (con el +1 de las manos la pose se retrasa, ver body_tracker.py).
@@ -1557,6 +1886,12 @@ class HandTrackingThread(QThread):
             hand = self._select_hand(detections)
             try:
                 topk = self._classify_static(hand)
+                if self._glove_vocab:
+                    glove = self._fresh_glove_opinion(time.perf_counter())
+                    camera_top = topk[0][0] if topk else None
+                    topk, self._last_glove_status = fuse_topk(topk, glove, self._glove_vocab)
+                    self._last_glove_conflict = (
+                        (camera_top, glove[0][0]) if self._last_glove_status == "no_coinciden" else None)
                 self._last_static_topk = topk
                 smoothed = self._smoother.push(topk)
                 self._update_release(smoothed.letter)
@@ -1717,6 +2052,8 @@ class HandTrackingThread(QThread):
             # frame activo; eso no es parte de la sena.
             duration_s = max(0.0, now - self._activity_start - PALABRAS_REST_MS_TO_END / 1000.0)
             if kind == "fin_valida":
+                self._pending_activity_glove = (
+                    self._glove_opinion_since(self._activity_start) if self._glove_vocab else None)
                 self._start_auto_classification(sequence, letters, now, duration_s)
             elif len(sequence) >= 6 and not letters:
                 self.auto_result_signal.emit({"kind": "corta", "code": "corta", "topk": [],
@@ -1742,6 +2079,7 @@ class HandTrackingThread(QThread):
                 "static_unsure": unsure if still else None,
                 "moving_letter": (not still and raised == 1 and detections.num_hands > 0
                                   and len(sign_text) == 1 and sign_text.isalpha()),
+                "glove_conflict": self._last_glove_conflict if detections.num_hands else None,
             })
 
         # 5. Texto de Estado.
@@ -1796,15 +2134,22 @@ class HandTrackingThread(QThread):
             letter_dist = self._dtw_recognizer.compute_distances(letter_query) if self._dtw_recognizer else {}
             best_letter = min(letter_dist.values(), default=float("inf"))
             best_word = float("inf")
+            hands_dist: dict[str, float] = {}
             if self._word_recognizers is not None:
                 hands_only, with_body = self._word_recognizers
-                best_word = min(hands_only.compute_distances(hands).values(), default=float("inf"))
+                hands_dist = hands_only.compute_distances(hands)
+                best_word = min(hands_dist.values(), default=float("inf"))
+            body_frac = float(np.mean(seq[:, 134] > 0)) if len(seq) else 0.0
             base = {"d_word": best_word, "d_letter": best_letter, "letters": list(letters or []),
-                    "stats": sign_stats(seq, duration_s), "duration_s": duration_s}
+                    "stats": sign_stats(seq, duration_s), "duration_s": duration_s, "body_frac": body_frac}
             if best_word < AUTO_WORD_PREFERENCE * best_letter:
-                word_dist = with_body.compute_distances(seq)
-                result = dict(base, kind="palabra", topk=distances_to_topk(word_dist, 3, WORD_TEMPERATURE),
-                              best_dist=min(word_dist.values()))
+                if body_frac >= WORD_MIN_BODY_FRACTION:
+                    word_dist = with_body.compute_distances(fill_missing_body(seq))
+                    topk, note = hola_mama_rule(distances_to_topk(word_dist, 3, WORD_TEMPERATURE), base["stats"])
+                else:
+                    word_dist = hands_dist
+                    topk, note = distances_to_topk(word_dist, 3, WORD_TEMPERATURE), "sin cuerpo: solo manos"
+                result = dict(base, kind="palabra", topk=topk, best_dist=min(word_dist.values()), note=note)
             elif letter_dist:
                 result = dict(base, kind="letra", topk=distances_to_topk(letter_dist, 3), best_dist=best_letter)
         except Exception as e:
@@ -1821,6 +2166,12 @@ class HandTrackingThread(QThread):
             self.auto_result_signal.emit({"kind": "error", "code": "error", "topk": [], "detail": "error"})
             return
         kind, topk, letters = result["kind"], result["topk"], result["letters"]
+        # Camara + guante (ver fuse_topk): la respuesta del guante durante
+        # toda la sena reordena las candidatas de la camara.
+        glove, self._pending_activity_glove = self._pending_activity_glove, None
+        camera_top = topk[0][0] if topk else None
+        topk, glove_status = fuse_topk(topk, glove, self._glove_vocab)
+        result = dict(result, topk=topk)
         label, conf = topk[0]
         too_long = result["duration_s"] >= PALABRAS_MAX_SEQUENCE_MS / 1000.0 - 0.5
         if kind == "palabra":
@@ -1830,34 +2181,70 @@ class HandTrackingThread(QThread):
             if committed and len(letters) > AUTO_MAX_RETRACTED_LETTERS:
                 committed, code = False, "deletreo_largo"
                 reason = f"se fijaron {len(letters)} letras: fue deletreo"
+            elif (committed and letters and result.get("body_frac", 1.0) < WORD_MIN_BODY_FRACTION
+                  and result["best_dist"] > WORD_NO_BODY_REPLACE_MAX):
+                # Sin la ubicacion no hay como distinguirla de la letra sostenida.
+                committed, code = False, "deletreo"
+                reason = f"sin cuerpo visible, se conserva {''.join(letters)}"
             if committed:
                 if letters:
                     self.letters_retracted_signal.emit(letters)
                 self._commit_word(label)
                 self._auto_idle_text = f"{word_display(label)} (palabra, {conf * 100:.0f}%)"
                 detail = f"palabra agregada (margen {margin * 100:.0f}pp)"
+                if result.get("note"):
+                    detail += f", {result['note']}"
                 if letters:
                     detail += f", reemplaza {''.join(letters)}"
             else:
                 self._auto_idle_text = f"¿{word_display(label)}? - no agregada"
                 detail = f"palabra no agregada: {reason}"
             label = word_display(label)
-        elif letters:
-            # Deletreo: las letras estaticas ya se escribieron; el DTW de la
-            # actividad completa no agrega una letra dinamica encima.
+        elif letters and not (
+            len(letters) <= AUTO_MAX_RETRACTED_LETTERS
+            and result["best_dist"] <= DYN_REPLACE_MAX_DISTANCE
+            and dynamic_commit_decision(topk)[0]
+        ):
+            # Las letras fijas se quedan: la letra con movimiento no se
+            # distingue de ellas sostenidas (ver DYN_REPLACE_MAX_DISTANCE).
             committed, shown, code = False, topk, "deletreo"
-            detail = f"deletreo ({''.join(letters)}): se conservan las letras"
+            detail = (f"deletreo ({''.join(letters)}): se conservan las letras "
+                      f"({label} a distancia {result['best_dist']:.2f})")
         else:
             committed, margin, rule = dynamic_commit_decision(topk)
             shown = topk
             code = "ok" if committed else "letra_dudosa"
             if committed:
+                if letters:
+                    # La letra de partida (I de la J, N de la Ñ...) la reemplaza.
+                    self.letters_retracted_signal.emit(letters)
                 self._commit_letter(label)
                 self._auto_idle_text = f"{label} ({conf * 100:.0f}%)"
                 detail = f"letra agregada (regla {rule}, margen {margin * 100:.0f}pp)"
+                if letters:
+                    detail += f", reemplaza {''.join(letters)}"
             else:
                 self._auto_idle_text = f"¿{label}? ({conf * 100:.0f}%) - no agregada"
                 detail = f"letra no agregada (margen {margin * 100:.0f}pp)"
+        # La camara no reconocio la sena (no se parece a nada) pero el guante
+        # si, y muy seguro: la camara vio algo que no sabe leer (p. ej. el
+        # guante oscuro); se escribe lo del guante.
+        if (code == "desconocida" and glove and glove[0][1] >= GLOVE_ALONE_MIN_PROB
+                and glove[0][0] in self._glove_vocab and len(letters) <= AUTO_MAX_RETRACTED_LETTERS):
+            g_label = glove[0][0]
+            if letters:
+                self.letters_retracted_signal.emit(letters)
+            if len(g_label) > 1:
+                self._commit_word(g_label)
+                kind = "palabra"
+            else:
+                self._commit_letter(g_label)
+                kind = "letra"
+            label, code, glove_status = word_display(g_label), "ok", "guante_solo"
+            shown = [(label, glove[0][1])]
+            detail = f"la cámara no la reconoció; se escribe {label} del guante ({glove[0][1] * 100:.0f}%)"
+        if glove:
+            detail += f" | guante: {glove[0][0]} {glove[0][1] * 100:.0f}% ({glove_status})"
         log.info(
             "[auto] %s: %s | distancia solo manos: palabra %.2f, letra %.2f -> %s",
             kind, "  ".join(f"{w} {c * 100:.1f}%" for w, c in shown), result["d_word"], result["d_letter"], detail,
@@ -1865,6 +2252,8 @@ class HandTrackingThread(QThread):
         self.auto_result_signal.emit({
             "kind": kind, "code": code, "label": label, "topk": shown, "detail": detail,
             "stats": result["stats"], "letters": letters, "too_long": too_long,
+            "glove_status": glove_status, "camera_top": camera_top,
+            "glove_top": glove[0][0] if glove else None,
         })
 
     def _commit_word(self, label: str) -> None:
@@ -2225,7 +2614,15 @@ class HandTrackingThread(QThread):
         if warning is not None:
             draw_warning(out, warning)
 
+        # Lectura del guante (flechas de los sensores), si esta conectado.
+        reading = None
+        if self._glove_receiver is not None and self._glove_receiver.connected():
+            reading = self._glove_receiver.latest()
+
         if detections.num_hands == 0:
+            if reading is not None:
+                # La camara no encuentra la mano: el guante se ve en el recuadro.
+                draw_glove_vectors(out, reading)
             cv2.putText(
                 out, "Sin manos detectadas", (10, 30),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 3, cv2.LINE_AA,
@@ -2236,14 +2633,25 @@ class HandTrackingThread(QThread):
             )
             return out
 
+        gloved = self._select_hand(detections) if self._glove_on_hand else None
         for hand in detections.hands:
-            if self._cfg.draw_landmarks or self._cfg.draw_connections:
+            if hand is gloved:
+                # La mano con guante siempre muestra su vector (los 21 puntos
+                # que usa la camara), aunque el dibujo este apagado en Ajustes.
+                draw_hand_landmarks(out, hand, draw_connections=True, draw_points=True, light=True)
+            elif self._cfg.draw_landmarks or self._cfg.draw_connections:
                 draw_hand_landmarks(
                     out, hand,
                     draw_connections=self._cfg.draw_connections,
                     draw_points=self._cfg.draw_landmarks,
                 )
             draw_hand_label(out, hand)
+        if gloved is not None and reading is not None:
+            h, w = out.shape[:2]
+            pts = gloved.landmarks_2d[:, :2] * np.array([w, h], dtype=np.float32)
+            draw_glove_vectors(out, reading, pts, float(np.linalg.norm(pts[9] - pts[0])))
+        elif reading is not None:
+            draw_glove_vectors(out, reading)
 
         banner = f"Manos: {detections.num_hands}"
         cv2.putText(
@@ -2466,6 +2874,16 @@ class SignLanguageApp(QMainWindow):
 
         self.speaker = Speaker()
 
+        # Guante (ESP32): independiente de la camara. El QTimer evalua la
+        # ventana de lecturas ~4 veces por segundo (el clasificador tarda
+        # menos de 1 ms, no hace falta otro hilo; la red ya va en el suyo).
+        self.glove: Optional[GloveSession] = None
+        self._glove_connected: Optional[bool] = None
+        self._camera_hand_at = 0.0
+        self._glove_timer = QTimer(self)
+        self._glove_timer.setInterval(250)
+        self._glove_timer.timeout.connect(self._glove_tick)
+
         # Recrear el HandLandmarker es caro: se espera a que el slider de
         # confianza de deteccion se detenga antes de aplicarlo.
         self._threshold_apply_timer = QTimer(self)
@@ -2501,6 +2919,8 @@ class SignLanguageApp(QMainWindow):
 
         self._build_ui()
         self._restore_window_state()
+        # El guante siempre esta activo: se conecta solo al abrir (sin boton).
+        self.start_glove(quiet=True)
         # Las plantillas se cargan en segundo plano mientras la persona se
         # acomoda, para que Iniciar no congele la ventana (en la Raspberry Pi,
         # la primera vez, varios segundos).
@@ -2536,6 +2956,7 @@ class SignLanguageApp(QMainWindow):
         action("Terminar palabra", [Qt.Key.Key_Return, Qt.Key.Key_Enter, "Ctrl+Space"], self.insert_space)
         action("Ajustes", ["Ctrl+,"], self.open_settings)
         action("Manual de señas", ["F1"], self.open_manual)
+        action("Capturar seña del guante", ["Ctrl+G"], self.glove_capture)
 
     def _build_controls(self) -> None:
         """Controles de ajustes tecnicos. Viven en la ventana de Ajustes, pero
@@ -2601,6 +3022,15 @@ class SignLanguageApp(QMainWindow):
         self.diagnostic_label.setStyleSheet("font-family: monospace; font-size: 12px;")
         self.diagnostic_label.setWordWrap(True)
         self.diagnostic_label.hide()
+
+        self.cb_glove_auto = QCheckBox("Escribir la seña del guante en cuanto se sostiene")
+        self.cb_glove_auto.setChecked(self.cfg.glove_auto)
+        self.cb_glove_auto.setToolTip(
+            "Apagado: el guante solo escribe con la captura con cuenta atrás (Ctrl+G).")
+        self.cb_glove_auto.toggled.connect(self._on_glove_auto_toggled)
+        self.glove_info_label = QLabel("")
+        self.glove_info_label.setObjectName("Muted")
+        self.glove_info_label.setWordWrap(True)
 
     @staticmethod
     def _labeled_row(text: str, widget: QWidget, value: Optional[QLabel] = None) -> QHBoxLayout:
@@ -2729,6 +3159,15 @@ class SignLanguageApp(QMainWindow):
         self._set_sign("—", COLORS["muted"], "Esperando")
         right.addWidget(sign_card)
 
+        # Lectura en vivo de los sensores del guante (solo con el guante encendido).
+        self.glove_card = Card("Sensores del guante")
+        self.glove_sensors_label = QLabel(format_reading(None))
+        self.glove_sensors_label.setStyleSheet(
+            f"font-family: monospace; font-size: 11px; color: {COLORS['muted']};")
+        self.glove_sensors_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.glove_card.body.addWidget(self.glove_sensors_label)
+        right.addWidget(self.glove_card)
+
         fb_card = Card("Retroalimentación")
         self.feedback = FeedbackPanel()
         fb_card.body.addWidget(self.feedback, stretch=1)
@@ -2743,7 +3182,9 @@ class SignLanguageApp(QMainWindow):
         self.status_hands = QLabel("✋ Manos: 0")
         self.status_fps = QLabel("FPS: —")
         self.status_latency = QLabel("Latencia: —")
-        for w in (self.status_camera, self.status_body, self.status_hands, self.status_fps, self.status_latency):
+        self.status_glove = QLabel("🧤 Guante apagado")
+        for w in (self.status_camera, self.status_body, self.status_hands, self.status_fps, self.status_latency,
+                  self.status_glove):
             bar.addPermanentWidget(w)
 
     def open_settings(self) -> None:
@@ -2762,8 +3203,10 @@ class SignLanguageApp(QMainWindow):
                 ]),
                 ("Persona", [self._labeled_row("Mano que deletrea", self.hand_combo), self.cb_speak]),
                 ("Dibujo sobre el video", [self.cb_landmarks, self.cb_connections, self.cb_body]),
+                ("Guante (ESP32)", [self.cb_glove_auto, self.glove_info_label]),
                 ("Diagnóstico", [self.cb_diagnostic, self.diagnostic_label]),
             ], self)
+        self._refresh_glove_info()
         self._settings_dialog.show()
         self._settings_dialog.raise_()
 
@@ -2882,6 +3325,7 @@ class SignLanguageApp(QMainWindow):
         self.ai_thread.set_min_confidence(self.min_confidence_slider.value() / 100.0)
         self.ai_thread.set_min_margin(self.min_margin_slider.value() / 100.0)
         self.ai_thread.set_diagnostic_mode(self.cb_diagnostic.isChecked())
+        self._sync_glove_to_thread()
 
         self.camera_thread.error_signal.connect(self._on_camera_error)
         self.camera_thread.status_signal.connect(lambda s: self.status_camera.setText(f"● {s}"))
@@ -2991,6 +3435,7 @@ class SignLanguageApp(QMainWindow):
         self.ai_thread.set_min_confidence(self.min_confidence_slider.value() / 100.0)
         self.ai_thread.set_min_margin(self.min_margin_slider.value() / 100.0)
         self.ai_thread.set_diagnostic_mode(self.cb_diagnostic.isChecked())
+        self._sync_glove_to_thread()
         self.ai_thread.start()
         self._last_heartbeat = time.time()
         self.statusBar().showMessage("IA reiniciada por inactividad", 3000)
@@ -3079,8 +3524,16 @@ class SignLanguageApp(QMainWindow):
         kind = info.get("kind", "")
         fb = feedback_for_result(info, word_profiles())
         topk = info.get("topk") or []
+        glove_status = info.get("glove_status")
+        if glove_status == "no_coinciden":
+            self.feedback.add(Feedback(
+                "warn", "La cámara y el guante no coinciden",
+                f"Cámara: {word_display(info.get('camera_top') or '?')} · Guante: "
+                f"{word_display(info.get('glove_top') or '?')}. Repite la seña."))
         if code == "ok":
-            self._set_sign(info.get("label", ""), COLORS["ok"], "Palabra" if kind == "palabra" else "Letra")
+            source = {"coinciden": " · cámara + guante", "guante_solo": " · guante"}.get(glove_status, "")
+            self._set_sign(info.get("label", ""), COLORS["ok"],
+                           ("Palabra" if kind == "palabra" else "Letra") + source)
             self.candidates.set_candidates(topk, COLORS["ok"])
             self._flash("ok")
         elif code in ("deletreo", "deletreo_largo"):
@@ -3131,7 +3584,17 @@ class SignLanguageApp(QMainWindow):
             else:
                 self._guidance_since.pop(key, None)
         held = {key: now - since for key, since in self._guidance_since.items()}
-        self.feedback.set_live(guidance_feedback(state, held))
+        conflict = state.get("glove_conflict")
+        if conflict:
+            self._guidance_since.setdefault("guante", now)
+        else:
+            self._guidance_since.pop("guante", None)
+        if conflict and now - self._guidance_since["guante"] >= 0.6:
+            self.feedback.set_live(Feedback(
+                "tip", f"¿{conflict[0]} o {conflict[1]}?",
+                f"La cámara ve {conflict[0]} y el guante siente {conflict[1]}. Ajusta la forma de la mano."))
+        else:
+            self.feedback.set_live(guidance_feedback(state, held))
         if state.get("body_tracking"):
             self.status_body.setText("Cuerpo: visible" if state.get("body_visible") else "Cuerpo: no se ve")
 
@@ -3175,6 +3638,8 @@ class SignLanguageApp(QMainWindow):
             self._set_sign("—", COLORS["muted"], "Esperando")
 
     def update_hands(self, detections: FrameDetections) -> None:
+        if detections.num_hands:
+            self._camera_hand_at = time.time()
         text = f"✋ Manos: {detections.num_hands}"
         if self.status_hands.text() != text:
             self.status_hands.setText(text)
@@ -3364,12 +3829,190 @@ class SignLanguageApp(QMainWindow):
             QMessageBox.warning(self, "Error", f"No se pudo guardar: {e}")
 
 
+    # ---- guante (ESP32) ---------------------------------------------------
+
+    def _glove_dataset_path(self) -> Path:
+        return Path(self.cfg.glove_dataset).expanduser() if self.cfg.glove_dataset else GLOVE_DEFAULT_DATASET
+
+    def start_glove(self, quiet: bool = False) -> None:
+        """Carga el dataset y empieza a escuchar a la ESP32. No depende de la
+        camara: las senas del guante se escriben en el mismo texto. quiet: al
+        abrir el programa, sin ventanas de error ni mensajes (la pantalla no
+        cambia; el estado se ve en la barra y en la caja de sensores)."""
+        if self.glove is not None:
+            return
+        path = self._glove_dataset_path()
+        try:
+            classifier = GloveClassifier.from_file(path)
+            receiver = GloveReceiver(self.cfg.glove_ip, self.cfg.glove_port)
+            receiver.start()
+        except (OSError, ValueError) as e:
+            self.status_glove.setText("🧤 Guante: sin muestras" if isinstance(e, (FileNotFoundError, ValueError))
+                                      else "🧤 Guante: error")
+            log.warning("Guante no iniciado (%s): %s", path, e)
+            if quiet:
+                return
+            QMessageBox.warning(
+                self, "Guante",
+                f"No se pudo iniciar el guante.\n\nDataset: {path}\n{e}\n\n"
+                "Graba muestras con:  python grabar_guante.py")
+            return
+        self.glove = GloveSession(receiver, classifier, auto=self.cfg.glove_auto)
+        self._glove_connected = None
+        self._glove_timer.start()
+        self.status_glove.setText("🧤 Buscando guante…")
+        self.glove_sensors_label.setText(format_reading(None))
+        log.info("Guante: %d muestras (%s), umbral %.2f, ESP32 en %s:%d",
+                 len(classifier.y), ", ".join(classifier.labels), classifier.max_distance,
+                 self.cfg.glove_ip, self.cfg.glove_port)
+        self._refresh_glove_info()
+
+    def stop_glove(self) -> None:
+        self._glove_timer.stop()
+        if self.glove is None:
+            return
+        self.glove.receiver.stop()
+        self.glove = None
+        self._glove_connected = None
+        self._sync_glove_to_thread()
+        self.status_glove.setText("🧤 Guante apagado")
+        self.glove_sensors_label.setText(format_reading(None) + "\n(guante apagado)")
+        self._refresh_glove_info()
+
+    def glove_capture(self) -> None:
+        """Ctrl+G: captura con cuenta atras (2, 1, ¡ya!, 2 s), como
+        grabar_guante.py. Sirve tambien con el modo automatico apagado."""
+        if self.glove is None:
+            self.start_glove()
+            if self.glove is None:
+                return
+        if not self.glove.receiver.connected():
+            self.feedback.add(Feedback(
+                "warn", "El guante no manda datos",
+                "Revisa que la ESP32 esté encendida y la Raspberry en la red GUANTE_LSM."))
+            return
+        self.glove.request_capture()
+
+    def _on_glove_auto_toggled(self, checked: bool) -> None:
+        self.cfg.glove_auto = checked
+        if self.glove is not None:
+            self.glove.auto = checked
+            self.glove.spotter.reset()
+
+    def _refresh_glove_info(self) -> None:
+        path = self._glove_dataset_path()
+        lines = [f"ESP32: {self.cfg.glove_ip}:{self.cfg.glove_port} · Dataset: {path}"]
+        if self.glove is not None:
+            clf = self.glove.classifier
+            counts = ", ".join(f"{word_display(l)} ({n})" for l, n in sorted(clf.counts.items()))
+            lines.append(f"Señas: {counts}. Umbral de distancia: {clf.max_distance:.2f}.")
+        lines.append("Ctrl+G: capturar una seña con cuenta atrás.")
+        self.glove_info_label.setText("\n".join(lines))
+
+    def _glove_tick(self) -> None:
+        if self.glove is None:
+            return
+        now = time.time()
+        receiver = self.glove.receiver
+        self.glove_sensors_label.setText(format_reading(receiver.latest() if receiver.connected(now) else None))
+        for ev in self.glove.tick(now):
+            if ev.kind == "estado":
+                connected = ev.data["connected"]
+                self.status_glove.setText(
+                    f"🧤 Guante: {ev.data['hz']:.0f} lecturas/s" if connected else "🧤 Guante sin datos")
+                if connected != self._glove_connected:
+                    # Solo la barra de estado y la caja de sensores cambian:
+                    # conectar el guante no mueve nada mas en la pantalla.
+                    log.info("Guante %s", "conectado" if connected else "sin datos")
+                    self._glove_connected = connected
+                    self._sync_glove_to_thread()
+            elif ev.kind == "cuenta":
+                self._set_sign(str(ev.data["n"]), COLORS["info"], "Guante · prepara la seña")
+                self._result_hold_until = now + 1.5
+            elif ev.kind == "capturando":
+                self._set_sign("…", COLORS["accent"], "Guante · sostén la seña")
+                self._result_hold_until = now + 2.5
+            elif ev.kind == "vivo":
+                # A la camara: se combina con lo que ella ve (fuse_topk).
+                res = ev.data["result"]
+                if self.ai_thread is not None:
+                    self.ai_thread.set_glove_opinion(
+                        [(self._glove_camera_label(l), p) for l, p in res.topk] if res.accepted else None)
+            elif ev.kind == "resultado":
+                if not ev.data.get("manual") and self._camera_sees_hand(now):
+                    continue     # la camara ve la mano: la respuesta sale de los dos juntos
+                self._on_glove_result(ev.data)
+
+    def _camera_sees_hand(self, now: float) -> bool:
+        if self.ai_thread is None:
+            return False
+        return (now - self._camera_hand_at < GLOVE_CAMERA_HAND_S
+                or self._phase in ("seña", "clasificando"))
+
+    def _glove_text(self, label: str) -> str:
+        """Etiqueta del guante como la escribe la camara: MAMA -> MAMÁ,
+        POR_FAVOR -> POR FAVOR."""
+        for word in word_profiles():
+            if plain_label(word) == plain_label(label):
+                return word_display(word)
+        return word_display(label)
+
+    def _glove_camera_label(self, label: str) -> str:
+        """Etiqueta del guante con el nombre que usa la camara (MAMA -> MAMÁ)."""
+        for word in word_profiles():
+            if plain_label(word) == plain_label(label):
+                return word
+        return label
+
+    def _sync_glove_to_thread(self) -> None:
+        """Le pasa al hilo de la camara el guante conectado (para dibujar sus
+        sensores y combinar respuestas) o nada si no hay guante."""
+        if self.ai_thread is None:
+            return
+        if self.glove is not None and self._glove_connected:
+            vocab = {self._glove_camera_label(l) for l in self.glove.classifier.labels}
+            self.ai_thread.set_glove(self.glove.receiver, vocab)
+        else:
+            self.ai_thread.set_glove(None, set())
+
+    def _on_glove_result(self, data: dict) -> None:
+        result = data["result"]
+        label = data["commit"]
+        topk = [(self._glove_text(l), p) for l, p in result.topk]
+        if label:
+            text = self._glove_text(label)
+            self._set_sign(text, COLORS["ok"], "Guante · " + ("Palabra" if len(text) > 1 else "Letra"))
+            self.candidates.set_candidates(topk, COLORS["ok"])
+            self._commit_glove_label(text)
+            if data.get("manual"):
+                self.feedback.add(Feedback(
+                    "ok", f"Guante: {text}", f"{topk[0][1] * 100:.0f}% · distancia {result.distance:.2f}"))
+        else:
+            self._set_sign(f"¿{topk[0][0]}?" if topk else "?", COLORS["warn"], "Guante · repite la seña")
+            self.candidates.set_candidates(topk, COLORS["warn"])
+            self.feedback.add(Feedback("warn", "El guante no reconoció la seña", result.reason.capitalize() + "."))
+        self._result_hold_until = time.time() + 2.5
+
+    def _commit_glove_label(self, text: str) -> None:
+        """Letra: se agrega a la palabra en curso. Palabra (HOLA, POR FAVOR):
+        se escribe y se cierra, como las palabras de la camara."""
+        self._flush_held()
+        if len(text) > 1:
+            if self.current_word and not self.current_word.endswith(" "):
+                self.current_word += " "
+            self.current_word += text
+            self.on_space_committed()
+        else:
+            self.current_word += text
+            self._render_sentence()
+
     def closeEvent(self, event) -> None:
         log.info("Cerrando aplicación")
         self._save_window_state()
         if self.config_path is not None:
             self.cfg.save(self.config_path)
         self.stop_system()
+        self.stop_glove()
         # Un hilo que no termino a tiempo tiene que acabar antes de que el
         # proceso salga, o Qt aborta al destruirlo.
         for thread in list(self._retiring_threads):
@@ -3387,6 +4030,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--config", type=Path, help="Archivo de configuración JSON")
     p.add_argument("--threshold", type=float, help="Confianza mínima de detección (0-1)")
     p.add_argument("--max-hands", type=int, help="Número máximo de manos a detectar")
+    p.add_argument("--glove-ip", help=f"IP de la ESP32 del guante (por defecto {GLOVE_IP}; 127.0.0.1 con simular_guante.py)")
+    p.add_argument("--glove-dataset", help="Archivo .jsonl de muestras del guante (grabar_guante.py)")
     p.add_argument("-v", "--verbose", action="store_true", help="Logs detallados")
     return p.parse_args()
 
@@ -3408,6 +4053,10 @@ def main() -> int:
         cfg.set_validated("min_detection_confidence", args.threshold)
     if args.max_hands is not None:
         cfg.set_validated("max_num_hands", args.max_hands)
+    if args.glove_ip is not None:
+        cfg.set_validated("glove_ip", args.glove_ip)
+    if args.glove_dataset is not None:
+        cfg.set_validated("glove_dataset", args.glove_dataset)
 
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
