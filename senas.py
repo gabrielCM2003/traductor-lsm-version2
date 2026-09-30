@@ -13,7 +13,6 @@ import statistics
 import subprocess
 import sys
 import threading
-import unicodedata
 import time
 import urllib.request
 import urllib.error
@@ -32,9 +31,13 @@ from PyQt6.QtCore import (
 from PyQt6.QtGui import QImage, QPixmap, QAction, QKeySequence
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QPushButton, QMessageBox, QSlider, QFrame, QComboBox,
-    QFileDialog, QPlainTextEdit, QStatusBar, QToolBar, QSizePolicy,
-    QCheckBox,
+    QLabel, QPushButton, QMessageBox, QSlider, QComboBox,
+    QFileDialog, QStatusBar, QSizePolicy, QCheckBox,
+)
+
+from interfaz_lsm import (
+    COLORS, PHASE_STYLE, STYLESHEET, Card, CandidateBars, FeedbackPanel, GuideDialog, Pill,
+    SettingsDialog, big_button, feedback_for_result, guidance_feedback, how_to_sign, sentence_html,
 )
 
 try:
@@ -55,7 +58,8 @@ try:
         PALABRAS_MAX_SEQUENCE_MS, PALABRAS_MIN_SEQUENCE_MS, PALABRAS_REST_MS_TO_END,
     )
     from dtw_recognizer import (
-        DEFAULT_WORDS_DIR, WORD_BODY_WEIGHT, DTWRecognizer, distances_to_topk, mirror_and_swap_hands,
+        DEFAULT_WORDS_DIR, WORD_BODY_WEIGHT, WORD_TEMPERATURE, DTWRecognizer, distances_to_topk,
+        mirror_and_swap_hands,
     )
 except ImportError as e:
     # Alfabeto dinamico (J,K,Ñ,Q,X,Z): opcional. Si falta fastdtw/scipy o los
@@ -67,7 +71,7 @@ except ImportError as e:
     distances_to_topk = None
     DYN_STANDALONE_MIN_SEQUENCE_MS = 170
     PALABRAS_REST_MS_TO_END, PALABRAS_MIN_SEQUENCE_MS, PALABRAS_MAX_SEQUENCE_MS = 400, 300, 8000
-    DEFAULT_WORDS_DIR, WORD_BODY_WEIGHT = None, 4.0
+    DEFAULT_WORDS_DIR, WORD_BODY_WEIGHT, WORD_TEMPERATURE = None, 4.0, 0.5
     logging.getLogger("sign_translator").warning(
         "Alfabeto dinamico no disponible (%s). Instala fastdtw/scipy para habilitarlo.", e
     )
@@ -205,22 +209,28 @@ def _get_dtw_recognizer() -> Optional["DTWRecognizer"]:
 # dedo medio) por segundo, para que no dependa de la distancia a la camara.
 AUTO_STATIC_MAX_SPEED = 1.5
 AUTO_SPEED_WINDOW = 6
-# Palabra si d_palabra < AUTO_WORD_PREFERENCE * d_letra (solo manos). Medido
-# con todas las plantillas, cada una contra las demas: con 1.0, 56/59 palabras
-# y 689/689 letras quedan en su categoria; con 1.2, 58/59 y 687/689. Al pasar
-# videos por la app, un HOLA quedo en 1.44 contra 1.43 y se tomaba como letra.
-AUTO_WORD_PREFERENCE = 1.2
+# Palabra si d_palabra < AUTO_WORD_PREFERENCE * d_letra (solo manos). Con
+# personas que no estan en las plantillas (cada persona de los videos contra
+# las otras dos), la distancia a las palabras crece: con 1.2, 55/59 palabras
+# quedaban en su categoria; con 1.4, 58/59. Las letras (cada plantilla contra
+# las demas): 687/689 con 1.2, ~680/689 con 1.4. Se prefiere 1.4 porque las
+# palabras fallaban justo con gente nueva.
+AUTO_WORD_PREFERENCE = 1.4
 # Letras estaticas que una palabra puede reemplazar (ver arriba). Medido
 # pasando los videos por la app: HOLA fijaba una "R" en la pausa de la frente.
 AUTO_MAX_RETRACTED_LETTERS = 2
 
-# Palabras (DTW con cuerpo, peso WORD_BODY_WEIGHT). Deja-uno-fuera con las 59
-# muestras de video: las 58 bien reconocidas tuvieron margen >= 0.33 sobre la
-# 2.a palabra y la unica mal reconocida 0.24.
-WORD_MIN_MARGIN = 0.30
+# Palabras (DTW con cuerpo, peso WORD_BODY_WEIGHT; confianza con
+# WORD_TEMPERATURE). Medido reconociendo a cada persona de los videos solo con
+# las plantillas de las otras dos: 56/59 bien. Con margen >= 0.15 se escriben
+# 54 de esas 56 y no se agrega ningun error (los 3 errores, AYUDA<->GRACIAS,
+# tienen margen alto y ningun umbral los separa). La regla anterior (margen
+# 0.30 sin calibrar y distancia <= 10) solo escribia 49: era el "titubeo".
+WORD_MIN_MARGIN = 0.15
 # Por encima de esta distancia DTW el movimiento no se parece a ninguna
-# palabra (la mayor de una muestra bien reconocida fue 9.4).
-WORD_MAX_DISTANCE = 10.0
+# palabra. Con personas nuevas la mayor distancia de una palabra bien
+# reconocida fue 11.1 (con las mismas personas, 9.4).
+WORD_MAX_DISTANCE = 16.0
 
 _word_recognizers: Optional[tuple["DTWRecognizer", "DTWRecognizer"]] = None
 _word_recognizers_load_attempted = False
@@ -244,6 +254,76 @@ def _get_word_recognizers() -> Optional[tuple["DTWRecognizer", "DTWRecognizer"]]
             except Exception:
                 logging.getLogger("sign_translator").exception("Error cargando las plantillas de palabras")
     return _word_recognizers
+
+
+@dataclass
+class SignStats:
+    """Donde y como se hizo una sena con movimiento, en anchos de hombro (ver
+    body_location_features): muneca respecto al centro de los hombros (dy > 0
+    es hacia abajo), distancia de la punta del indice a la boca, fraccion de
+    frames con dos manos y duracion. La interfaz compara esto con el perfil de
+    cada palabra para decir que corregir (interfaz_lsm.compare_to)."""
+    wrist_dx: float = 0.0
+    wrist_dy: float = 0.0
+    tip_mouth: float = 9.0
+    two_hands: float = 0.0
+    duration_s: float = 0.0
+    has_body: bool = False
+
+
+def sign_stats(sequence: np.ndarray, duration_s: float) -> SignStats:
+    """SignStats de una secuencia cruda (T, 126 + 9). La mano que se mide es
+    la que aparece en mas frames con cuerpo visible."""
+    seq = np.asarray(sequence, dtype=np.float64)
+    hands, body = seq[:, :126], seq[:, 126:135]
+    left = np.abs(hands[:, :63]).sum(axis=1) > 0
+    right = np.abs(hands[:, 63:126]).sum(axis=1) > 0
+    two = float(np.mean(left & right)) if len(seq) else 0.0
+    with_body = body[:, 8] > 0
+    use_left = (left & with_body).sum() >= (right & with_body).sum()
+    mask, off = ((left & with_body), 0) if use_left else ((right & with_body), 4)
+    if not mask.any():
+        return SignStats(two_hands=two, duration_s=duration_s)
+    wrist = body[mask, off:off + 2]
+    tip = body[mask, off + 2:off + 4]
+    return SignStats(
+        wrist_dx=float(np.median(wrist[:, 0])),
+        wrist_dy=float(np.median(wrist[:, 1])),
+        tip_mouth=float(np.median(np.linalg.norm(tip, axis=1))),
+        two_hands=two,
+        duration_s=duration_s,
+        has_body=True,
+    )
+
+
+_word_profiles: Optional[dict[str, SignStats]] = None
+
+
+def word_profiles() -> dict[str, SignStats]:
+    """{PALABRA como se muestra: perfil mediano de sus plantillas}. Las
+    plantillas vienen de videos a ~30 fps (duracion = frames / 30)."""
+    global _word_profiles
+    if _word_profiles is None:
+        _word_profiles = {}
+        recognizers = _get_word_recognizers()
+        if recognizers is not None:
+            with_body = recognizers[1]
+            for label, templates in with_body._templates.items():
+                per = []
+                for tmpl in templates:
+                    raw = np.array(tmpl, dtype=np.float64)
+                    raw[:, 126:] /= WORD_BODY_WEIGHT     # las plantillas guardan el cuerpo ya ponderado
+                    per.append(sign_stats(raw, len(raw) / 30.0))
+                with_b = [s for s in per if s.has_body] or per
+                _word_profiles[word_display(label)] = SignStats(
+                    wrist_dx=float(np.median([s.wrist_dx for s in with_b])),
+                    wrist_dy=float(np.median([s.wrist_dy for s in with_b])),
+                    tip_mouth=float(np.median([s.tip_mouth for s in with_b])),
+                    two_hands=float(np.median([s.two_hands for s in per])),
+                    duration_s=float(np.median([s.duration_s for s in per])),
+                    has_body=any(s.has_body for s in per),
+                )
+    return _word_profiles
 
 
 def word_display(label: str) -> str:
@@ -1008,6 +1088,8 @@ class HandTrackingThread(QThread):
     space_committed_signal = pyqtSignal()
     auto_result_signal = pyqtSignal(object)           # modo automatico: {"topk", "detail"}
     letters_retracted_signal = pyqtSignal(object)     # letras (list[str]) que una palabra reemplaza
+    phase_signal = pyqtSignal(str)                    # "reposo" | "seña" | "clasificando"
+    guidance_signal = pyqtSignal(object)              # estado para consejos en vivo (~4 por segundo)
     metrics_signal = pyqtSignal(object)
     error_signal = pyqtSignal(str)
     model_loaded_signal = pyqtSignal()
@@ -1109,6 +1191,11 @@ class HandTrackingThread(QThread):
         self._auto_classify_start = 0.0
         self._auto_idle_text = "Esperando mano"
         self._wrist_track: deque[tuple[float, float, float, float]] = deque(maxlen=AUTO_SPEED_WINDOW)
+        self._activity_start = 0.0
+        self._phase = ""
+        self._last_guidance = 0.0
+        self._last_static_topk: list[tuple[str, float]] = []
+        self._last_distance_warning = None
 
         self._latencies: deque[float] = deque(maxlen=100)
         self._frame_times: deque[float] = deque(maxlen=30)
@@ -1377,6 +1464,7 @@ class HandTrackingThread(QThread):
             hand = self._select_hand(detections)
             try:
                 topk = self._classify_static(hand)
+                self._last_static_topk = topk
                 smoothed = self._smoother.push(topk)
                 self._update_release(smoothed.letter)
 
@@ -1526,22 +1614,58 @@ class HandTrackingThread(QThread):
         event = self._activity_segmenter.push(active, vector, now)
         if event is not None and event[0] == "inicio":
             self._activity_letters = []
+            self._activity_start = now
         if committed:
             self._activity_letters.append(self._last_committed_label)
         if event is not None and event[0] != "inicio":
             kind, sequence = event
             letters, self._activity_letters = self._activity_letters, []
+            # El segmentador corta PALABRAS_REST_MS_TO_END despues del ultimo
+            # frame activo; eso no es parte de la sena.
+            duration_s = max(0.0, now - self._activity_start - PALABRAS_REST_MS_TO_END / 1000.0)
             if kind == "fin_valida":
-                self._start_auto_classification(sequence, letters, now)
+                self._start_auto_classification(sequence, letters, now, duration_s)
+            elif len(sequence) >= 6 and not letters:
+                self.auto_result_signal.emit({"kind": "corta", "code": "corta", "topk": [],
+                                              "detail": "seña muy corta"})
 
-        # 4. Texto de Estado.
+        # 4. Fase y consejos para la interfaz.
+        if self._auto_classifying:
+            self._set_phase("clasificando")
+        else:
+            self._set_phase("seña" if self._activity_segmenter.state == "grabando" else "reposo")
+        if now - self._last_guidance >= 0.25:
+            self._last_guidance = now
+            unsure = None
+            if sign_text.startswith("?") and len(self._last_static_topk) >= 2:
+                unsure = self._last_static_topk[:2]
+            self.guidance_signal.emit({
+                "hands": detections.num_hands,
+                "raised": raised,
+                "body_tracking": self._body_tracker is not None,
+                "body_visible": rest_line_y(detections.body, frame_w, frame_h) is not None,
+                "too_close": self._last_distance_warning is not None,
+                "two_raised_still": raised >= 2 and still,
+                "static_unsure": unsure if still else None,
+                "moving_letter": (not still and raised == 1 and detections.num_hands > 0
+                                  and len(sign_text) == 1 and sign_text.isalpha()),
+            })
+
+        # 5. Texto de Estado.
         if self._auto_classifying:
             return (f"Clasificando... ({now - self._auto_classify_start:.0f}s)", 0.0)
         if detections.num_hands > 0 and sign_text != "—":
             return (sign_text, sign_conf)
         return (self._auto_idle_text, 0.0)
 
-    def _start_auto_classification(self, sequence: list[np.ndarray], letters: list[str], now: float) -> None:
+    def _set_phase(self, phase: str) -> None:
+        if phase != self._phase:
+            self._phase = phase
+            self.phase_signal.emit(phase)
+
+    def _start_auto_classification(
+        self, sequence: list[np.ndarray], letters: list[str], now: float, duration_s: float = 0.0
+    ) -> None:
         if self._auto_classifying:
             # Igual que el modo dinamico: no se encolan dos clasificaciones.
             log.warning("[auto] seña descartada: la clasificacion anterior aun no termina (%d frames)", len(sequence))
@@ -1551,16 +1675,18 @@ class HandTrackingThread(QThread):
             return
         self._auto_classifying = True
         self._auto_classify_start = now
-        threading.Thread(target=self._classify_auto_sequence, args=(sequence, letters), daemon=True).start()
+        threading.Thread(
+            target=self._classify_auto_sequence, args=(sequence, letters, duration_s), daemon=True
+        ).start()
 
-    def _classify_auto_sequence(self, sequence: list[np.ndarray], letters: Optional[list[str]] = None) -> None:
+    def _classify_auto_sequence(
+        self, sequence: list[np.ndarray], letters: Optional[list[str]] = None, duration_s: float = 0.0
+    ) -> None:
         """En un hilo aparte (como _classify_dynamic_sequence): decide si la
-        actividad fue una letra dinamica o una palabra y deja en la cola
-        (categoria, top-3, distancia del top-1, mejor distancia de palabra y
-        de letra comparando solo manos, letras estaticas de la actividad), o
-        None si fallo."""
-        letters = list(letters or [])
-        result: Optional[tuple] = None
+        actividad fue una letra dinamica o una palabra y deja en la cola un
+        dict (kind, topk, best_dist, d_word, d_letter, letters, stats,
+        duration_s), o None si fallo."""
+        result: Optional[dict] = None
         try:
             seq = np.asarray(sequence, dtype=np.float64)
             if self._cfg.dominant_hand == "Left":
@@ -1574,28 +1700,36 @@ class HandTrackingThread(QThread):
             if self._word_recognizers is not None:
                 hands_only, with_body = self._word_recognizers
                 best_word = min(hands_only.compute_distances(hands).values(), default=float("inf"))
+            base = {"d_word": best_word, "d_letter": best_letter, "letters": list(letters or []),
+                    "stats": sign_stats(seq, duration_s), "duration_s": duration_s}
             if best_word < AUTO_WORD_PREFERENCE * best_letter:
                 word_dist = with_body.compute_distances(seq)
-                result = ("palabra", distances_to_topk(word_dist, 3), min(word_dist.values()),
-                          best_word, best_letter, letters)
+                result = dict(base, kind="palabra", topk=distances_to_topk(word_dist, 3, WORD_TEMPERATURE),
+                              best_dist=min(word_dist.values()))
             elif letter_dist:
-                result = ("letra", distances_to_topk(letter_dist, 3), best_letter, best_word, best_letter,
-                          letters)
+                result = dict(base, kind="letra", topk=distances_to_topk(letter_dist, 3), best_dist=best_letter)
         except Exception as e:
             log.exception("Error en la clasificacion automatica: %s", e)
         self._auto_result_queue.put(result)
 
-    def _apply_auto_result(self, result: Optional[tuple]) -> None:
+    def _apply_auto_result(self, result: Optional[dict]) -> None:
+        """Escribe (o no) la letra o palabra de una actividad y avisa a la
+        interfaz con auto_result_signal: {kind, code, label, topk, detail,
+        stats, letters, too_long}. code: "ok", "ambigua", "desconocida",
+        "deletreo_largo", "deletreo", "letra_dudosa" o "error"."""
         if result is None:
             self._auto_idle_text = "Error al clasificar la seña (ver consola)"
+            self.auto_result_signal.emit({"kind": "error", "code": "error", "topk": [], "detail": "error"})
             return
-        kind, topk, best_dist, best_word, best_letter, letters = result
+        kind, topk, letters = result["kind"], result["topk"], result["letters"]
         label, conf = topk[0]
+        too_long = result["duration_s"] >= PALABRAS_MAX_SEQUENCE_MS / 1000.0 - 0.5
         if kind == "palabra":
-            committed, margin, reason = word_commit_decision(topk, best_dist)
+            committed, margin, reason = word_commit_decision(topk, result["best_dist"])
+            code = "ok" if committed else ("desconocida" if result["best_dist"] > WORD_MAX_DISTANCE else "ambigua")
             shown = [(word_display(w), c) for w, c in topk]
             if committed and len(letters) > AUTO_MAX_RETRACTED_LETTERS:
-                committed = False
+                committed, code = False, "deletreo_largo"
                 reason = f"se fijaron {len(letters)} letras: fue deletreo"
             if committed:
                 if letters:
@@ -1608,14 +1742,16 @@ class HandTrackingThread(QThread):
             else:
                 self._auto_idle_text = f"¿{word_display(label)}? - no agregada"
                 detail = f"palabra no agregada: {reason}"
+            label = word_display(label)
         elif letters:
             # Deletreo: las letras estaticas ya se escribieron; el DTW de la
             # actividad completa no agrega una letra dinamica encima.
-            committed, shown = False, topk
+            committed, shown, code = False, topk, "deletreo"
             detail = f"deletreo ({''.join(letters)}): se conservan las letras"
         else:
             committed, margin, rule = dynamic_commit_decision(topk)
             shown = topk
+            code = "ok" if committed else "letra_dudosa"
             if committed:
                 self._commit_letter(label)
                 self._auto_idle_text = f"{label} ({conf * 100:.0f}%)"
@@ -1625,9 +1761,12 @@ class HandTrackingThread(QThread):
                 detail = f"letra no agregada (margen {margin * 100:.0f}pp)"
         log.info(
             "[auto] %s: %s | distancia solo manos: palabra %.2f, letra %.2f -> %s",
-            kind, "  ".join(f"{w} {c * 100:.1f}%" for w, c in shown), best_word, best_letter, detail,
+            kind, "  ".join(f"{w} {c * 100:.1f}%" for w, c in shown), result["d_word"], result["d_letter"], detail,
         )
-        self.auto_result_signal.emit({"topk": shown, "detail": detail})
+        self.auto_result_signal.emit({
+            "kind": kind, "code": code, "label": label, "topk": shown, "detail": detail,
+            "stats": result["stats"], "letters": letters, "too_long": too_long,
+        })
 
     def _commit_word(self, label: str) -> None:
         """Escribe la palabra y la cierra, como si se hubieran bajado las
@@ -1981,6 +2120,7 @@ class HandTrackingThread(QThread):
         warning = self._distance_warning.update(
             detections.hands, out.shape[1], out.shape[0], time.monotonic(),
         )
+        self._last_distance_warning = warning
         if warning is not None:
             draw_warning(out, warning)
 
@@ -2232,8 +2372,29 @@ class SignLanguageApp(QMainWindow):
         self._threshold_apply_timer.setInterval(400)
         self._threshold_apply_timer.timeout.connect(self._apply_threshold)
 
-        self.setWindowTitle(f"Traductor LSM v{APP_VERSION}")
-        self.setMinimumSize(QSize(1100, 720))
+        # Estado de la interfaz: fase de la sena, letras pendientes (de la
+        # sena en curso, que una palabra todavia puede reemplazar), hasta
+        # cuando se muestra el ultimo resultado y desde cuando se cumple cada
+        # condicion de los consejos en vivo.
+        self._phase = "detenido"
+        self._pending = 0
+        # Primera letra fija de la sena en curso, retenida (no escrita): en
+        # la pausa de una palabra (HOLA en la frente) el clasificador estatico
+        # alcanza a fijar una letra; si se escribiera de inmediato, se veria
+        # aparecer y borrarse cuando llega la palabra. Se escribe al terminar
+        # la sena o en cuanto llega una segunda letra (_spelling: es deletreo).
+        self._held: list[str] = []
+        self._spelling = False
+        self._result_hold_until = 0.0
+        self._guidance_since: dict[str, float] = {}
+        self._flash_timer = QTimer(self)
+        self._flash_timer.setSingleShot(True)
+        self._flash_timer.timeout.connect(lambda: self._apply_phase_style(self._phase))
+        self._settings_dialog: Optional[SettingsDialog] = None
+
+        self.setWindowTitle("Traductor LSM")
+        self.setMinimumSize(QSize(1180, 760))
+        self.setStyleSheet(STYLESHEET)
 
         self._build_ui()
         self._restore_window_state()
@@ -2241,332 +2402,284 @@ class SignLanguageApp(QMainWindow):
     # ---- UI ---------------------------------------------------------------
 
     def _build_ui(self) -> None:
-        self._build_toolbar()
+        self._build_actions()
+        self._build_controls()
         self._build_central_widget()
         self._build_status_bar()
+        self._render_sentence()
+        self._apply_phase_style("detenido")
 
-    def _build_toolbar(self) -> None:
-        toolbar = QToolBar("Principal")
-        toolbar.setObjectName("MainToolBar")  
-        toolbar.setMovable(False)
-        self.addToolBar(toolbar)
+    def _build_actions(self) -> None:
+        """Atajos de teclado (sin barra de herramientas: los botones estan en
+        la ventana)."""
+        def action(text: str, keys: list, slot) -> QAction:
+            act = QAction(text, self)
+            act.setShortcuts([QKeySequence(k) for k in keys])
+            act.triggered.connect(slot)
+            self.addAction(act)
+            return act
 
-        self.action_start = QAction("▶ Iniciar", self)
-        self.action_start.setShortcut(QKeySequence("Ctrl+R"))
-        self.action_start.triggered.connect(self.start_system)
-        toolbar.addAction(self.action_start)
-
-        self.action_stop = QAction("■ Detener", self)
-        self.action_stop.setShortcut(QKeySequence("Ctrl+T"))
-        self.action_stop.triggered.connect(self.stop_system)
+        self.action_start = action("Iniciar", ["Ctrl+R"], self.start_system)
+        self.action_stop = action("Detener", ["Ctrl+T"], self.stop_system)
         self.action_stop.setEnabled(False)
-        toolbar.addAction(self.action_stop)
+        action("Captura", ["Ctrl+S"], self.save_screenshot)
+        action("Borrar letra", [Qt.Key.Key_Backspace], self.delete_last_letter)
+        action("Borrar palabra", ["Ctrl+Backspace"], self.clear_current_word)
+        action("Terminar palabra", [Qt.Key.Key_Return, Qt.Key.Key_Enter, "Ctrl+Space"], self.insert_space)
+        action("Ajustes", ["Ctrl+,"], self.open_settings)
+        action("Guía", ["F1"], self.open_guide)
 
-        toolbar.addSeparator()
+    def _build_controls(self) -> None:
+        """Controles de ajustes tecnicos. Viven en la ventana de Ajustes, pero
+        se crean aqui porque start_system y el watchdog leen sus valores."""
+        def slider(lo: int, hi: int, value: int, slot, tip: str) -> QSlider:
+            s = QSlider(Qt.Orientation.Horizontal)
+            s.setRange(lo, hi)
+            s.setValue(value)
+            s.setToolTip(tip)
+            s.valueChanged.connect(slot)
+            return s
 
-
-        action_screenshot = QAction("📷 Captura", self)
-        action_screenshot.setShortcut(QKeySequence("Ctrl+S"))
-        action_screenshot.triggered.connect(self.save_screenshot)
-        toolbar.addAction(action_screenshot)
-
-        action_export = QAction("💾 Exportar historial", self)
-        action_export.triggered.connect(self.export_history)
-        toolbar.addAction(action_export)
-
-        toolbar.addSeparator()
-
-        action_backspace = QAction("⌫ Borrar letra", self)
-        action_backspace.setShortcut(QKeySequence(Qt.Key.Key_Backspace))
-        action_backspace.triggered.connect(self.delete_last_letter)
-        toolbar.addAction(action_backspace)
-
-        action_clear = QAction("✕ Borrar palabra", self)
-        action_clear.setShortcut(QKeySequence("Ctrl+Backspace"))
-        action_clear.triggered.connect(self.clear_current_word)
-        toolbar.addAction(action_clear)
-
-        action_space = QAction("␣ Espacio (Enter)", self)
-        action_space.setShortcuts([
-            QKeySequence(Qt.Key.Key_Return),
-            QKeySequence(Qt.Key.Key_Enter),
-            QKeySequence("Ctrl+Space"),
-        ])
-        action_space.triggered.connect(self.insert_space)
-        toolbar.addAction(action_space)
-
-    def _build_central_widget(self) -> None:
-        central = QWidget()
-        self.setCentralWidget(central)
-        main = QHBoxLayout(central)
-
-        # Panel video.
-        video_box = QVBoxLayout()
-        self.image_label = QLabel("Pulsa Iniciar (Ctrl+R) para comenzar")
-        self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.image_label.setStyleSheet(
-            "background-color: #1a1a1a; color: #888; font-size: 14px; border-radius: 8px;"
-        )
-        self.image_label.setMinimumSize(640, 480)
-        self.image_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        video_box.addWidget(self.image_label, stretch=1)
-
-        word_frame = QFrame()
-        word_frame.setFrameShape(QFrame.Shape.StyledPanel)
-        word_layout = QVBoxLayout(word_frame)
-        word_title = QLabel("PALABRA EN CONSTRUCCIÓN")
-        word_title.setStyleSheet("font-size: 11px; color: #777; font-weight: bold;")
-        self.word_label = QLabel("")
-        self.word_label.setStyleSheet(
-            "font-size: 36px; font-weight: bold; color: #1a5490; "
-            "letter-spacing: 4px; padding: 8px;"
-        )
-        self.word_label.setMinimumHeight(60)
-        word_layout.addWidget(word_title)
-        word_layout.addWidget(self.word_label)
-        video_box.addWidget(word_frame)
-
-        # Panel lateral.
-        side = QVBoxLayout()
-
-        title = QLabel("ESTADO")
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        title.setStyleSheet("font-weight: bold; font-size: 14px; color: #555;")
-        side.addWidget(title)
-
-        self.sign_label = QLabel("—")
-        self.sign_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.sign_label.setStyleSheet(
-            "font-size: 32px; color: #2E86C1; font-weight: bold;"
-            "border: 2px solid #d0d0d0; border-radius: 12px; padding: 18px;"
-        )
-        self.sign_label.setMinimumHeight(100)
-        side.addWidget(self.sign_label)
-
-        self.classifier_info_label = QLabel(self._classifier_status_text())
-        self.classifier_info_label.setWordWrap(True)
-        self.classifier_info_label.setStyleSheet("color: #777; font-size: 11px; font-style: italic;")
-        self.classifier_info_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        side.addWidget(self.classifier_info_label)
-
-        side.addSpacing(8)
-        clf_title = QLabel("AJUSTES DE RECONOCIMIENTO")
-        clf_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        clf_title.setStyleSheet("font-weight: bold; font-size: 12px; color: #555;")
-        side.addWidget(clf_title)
-
-        stab_row = QHBoxLayout()
-        stab_label = QLabel("Estabilidad:")
-        stab_label.setToolTip(
+        self.stable_frames_slider = slider(
+            3, 25, self.cfg.stable_frames_to_commit, self._on_stable_frames_changed,
             "Cuántos frames seguidos debe mantenerse una letra para fijarla.\n"
-            "Bajo = más rápido, más errores. Alto = más lento, más seguro."
-        )
-        stab_row.addWidget(stab_label)
-        self.stable_frames_slider = QSlider(Qt.Orientation.Horizontal)
-        self.stable_frames_slider.setRange(3, 25)
-        self.stable_frames_slider.setValue(self.cfg.stable_frames_to_commit)
-        self.stable_frames_slider.valueChanged.connect(self._on_stable_frames_changed)
+            "Bajo = más rápido, más errores. Alto = más lento, más seguro.")
         self.stable_frames_value_label = QLabel(str(self.cfg.stable_frames_to_commit))
-        self.stable_frames_value_label.setMinimumWidth(28)
-        stab_row.addWidget(self.stable_frames_slider, stretch=1)
-        stab_row.addWidget(self.stable_frames_value_label)
-        side.addLayout(stab_row)
-
-        conf_row = QHBoxLayout()
-        conf_label = QLabel("Conf. mín:")
-        conf_label.setToolTip(
-            "Qué tan seguro debe estar el modelo para que la letra cuente.\n"
-            "Alto = solo letras muy claras. Bajo = acepta predicciones inseguras."
-        )
-        conf_row.addWidget(conf_label)
-        self.min_confidence_slider = QSlider(Qt.Orientation.Horizontal)
-        self.min_confidence_slider.setRange(30, 90)
-        self.min_confidence_slider.setValue(round(self.cfg.min_letter_confidence * 100))
-        self.min_confidence_slider.valueChanged.connect(self._on_min_confidence_changed)
+        self.min_confidence_slider = slider(
+            30, 90, round(self.cfg.min_letter_confidence * 100), self._on_min_confidence_changed,
+            "Qué tan seguro debe estar el modelo para que una letra fija cuente.")
         self.min_confidence_value_label = QLabel(f"{self.cfg.min_letter_confidence:.2f}")
-        self.min_confidence_value_label.setMinimumWidth(40)
-        conf_row.addWidget(self.min_confidence_slider, stretch=1)
-        conf_row.addWidget(self.min_confidence_value_label)
-        side.addLayout(conf_row)
-
-        margin_row = QHBoxLayout()
-        margin_label = QLabel("Margen:")
-        margin_label.setToolTip(
-            "Diferencia mínima entre la 1ª y 2ª letra más probables.\n"
-            "Alto = bloquea cuando el modelo duda (M vs N, V vs W).\n"
-            "Bajo = acepta predicciones aunque sean parejas."
-        )
-        margin_row.addWidget(margin_label)
-        self.min_margin_slider = QSlider(Qt.Orientation.Horizontal)
-        self.min_margin_slider.setRange(0, 50)
-        self.min_margin_slider.setValue(round(self.cfg.min_letter_margin * 100))
-        self.min_margin_slider.valueChanged.connect(self._on_min_margin_changed)
+        self.min_margin_slider = slider(
+            0, 50, round(self.cfg.min_letter_margin * 100), self._on_min_margin_changed,
+            "Diferencia mínima entre la 1.ª y la 2.ª letra más probables.")
         self.min_margin_value_label = QLabel(f"{self.cfg.min_letter_margin:.2f}")
-        self.min_margin_value_label.setMinimumWidth(40)
-        margin_row.addWidget(self.min_margin_slider, stretch=1)
-        margin_row.addWidget(self.min_margin_value_label)
-        side.addLayout(margin_row)
-
-        # Toggle: modo diagnóstico
-        self.cb_diagnostic = QCheckBox("Modo diagnóstico (mostrar top-3)")
-        self.cb_diagnostic.setToolTip(
-            "Muestra las 3 letras más probables en cada frame.\n"
-            "Útil para entender por qué una letra falla."
-        )
-        self.cb_diagnostic.toggled.connect(self._on_diagnostic_toggled)
-        side.addWidget(self.cb_diagnostic)
-
-        self.diagnostic_label = QLabel("")
-        self.diagnostic_label.setStyleSheet(
-            "font-family: monospace; font-size: 11px; color: #888;"
-            "background: #f5f5f5; border-radius: 4px; padding: 6px;"
-        )
-        self.diagnostic_label.setMinimumHeight(48)
-        self.diagnostic_label.setWordWrap(True)
-        self.diagnostic_label.hide()
-        side.addWidget(self.diagnostic_label)
-
-        side.addSpacing(8)
-
-        cam_row = QHBoxLayout()
-        cam_row.addWidget(QLabel("Cámara:"))
-        self.camera_combo = QComboBox()
-        self.camera_combo.addItem(f"#{self.cfg.camera_index}", self.cfg.camera_index)
-        self.refresh_cameras_btn = QPushButton("↻")
-        self.refresh_cameras_btn.setFixedWidth(32)
-        self.refresh_cameras_btn.setToolTip("Buscar cámaras conectadas")
-        self.refresh_cameras_btn.clicked.connect(self._refresh_cameras)
-        cam_row.addWidget(self.camera_combo, stretch=1)
-        cam_row.addWidget(self.refresh_cameras_btn)
-        side.addLayout(cam_row)
-
-        thr_row = QHBoxLayout()
-        thr_row.addWidget(QLabel("Confianza:"))
-        self.threshold_slider = QSlider(Qt.Orientation.Horizontal)
-        self.threshold_slider.setRange(10, 95)
-        self.threshold_slider.setValue(int(self.cfg.min_detection_confidence * 100))
-        self.threshold_slider.setToolTip("Confianza mínima para detectar una mano")
-        self.threshold_slider.valueChanged.connect(self._on_threshold_changed)
+        self.threshold_slider = slider(
+            10, 95, int(self.cfg.min_detection_confidence * 100), self._on_threshold_changed,
+            "Confianza mínima para detectar una mano.")
         self.threshold_value_label = QLabel(f"{int(self.cfg.min_detection_confidence * 100)}%")
-        self.threshold_value_label.setMinimumWidth(40)
-        thr_row.addWidget(self.threshold_slider, stretch=1)
-        thr_row.addWidget(self.threshold_value_label)
-        side.addLayout(thr_row)
 
-        self.cb_landmarks = QCheckBox("Dibujar puntos (círculos)")
-        self.cb_landmarks.setChecked(self.cfg.draw_landmarks)
-        self.cb_landmarks.toggled.connect(self._on_draw_landmarks)
-        side.addWidget(self.cb_landmarks)
-
-        self.cb_connections = QCheckBox("Dibujar conexiones (estructura)")
-        self.cb_connections.setChecked(self.cfg.draw_connections)
-        self.cb_connections.toggled.connect(self._on_draw_connections)
-        side.addWidget(self.cb_connections)
-
-        self.cb_body = QCheckBox("Dibujar esqueleto del cuerpo")
-        self.cb_body.setChecked(self.cfg.draw_body)
-        self.cb_body.setEnabled(self.cfg.body_tracking)
-        self.cb_body.setToolTip(
-            "Hombros, brazos y cara (MediaPipe Pose). En magenta, los puntos de\n"
-            "referencia para ubicar las manos: centro de hombros y de la boca.\n"
-            "Desactivado si body_tracking es false en la configuracion."
-        )
-        self.cb_body.toggled.connect(self._on_draw_body)
-        side.addWidget(self.cb_body)
-
-        hand_row = QHBoxLayout()
-        hand_row.addWidget(QLabel("Mano que deletrea:"))
         self.hand_combo = QComboBox()
         self.hand_combo.addItem("Derecha", "Right")
         self.hand_combo.addItem("Izquierda", "Left")
         self.hand_combo.setCurrentIndex(self.hand_combo.findData(self.cfg.dominant_hand))
         self.hand_combo.setToolTip(
-            "Con las dos manos en cuadro, el alfabeto estático usa esta.\n"
-            "Con la izquierda, la seña se refleja para compararla con el\n"
-            "modelo y las plantillas, que son de la mano derecha."
-        )
+            "Con la izquierda, las señas se reflejan para compararlas con\n"
+            "el modelo y las plantillas, que son de la mano derecha.")
         self.hand_combo.currentIndexChanged.connect(self._on_dominant_hand_changed)
-        hand_row.addWidget(self.hand_combo, stretch=1)
-        side.addLayout(hand_row)
 
-        self.cb_speak = QCheckBox("Leer palabras en voz alta")
+        self.cb_speak = QCheckBox("Leer cada palabra en voz alta al terminarla")
         if self.speaker.available:
             self.cb_speak.setChecked(self.cfg.speak_words)
-            self.cb_speak.setToolTip("Lee cada palabra al terminarla (espacio o Enter).")
         else:
             self.cb_speak.setEnabled(False)
-            self.cb_speak.setToolTip(
-                "No se encontró un motor de voz.\n"
-                "Linux / Raspberry Pi: sudo apt install espeak-ng"
-            )
+            self.cb_speak.setToolTip("No se encontró un motor de voz.\n"
+                                     "Linux / Raspberry Pi: sudo apt install espeak-ng")
         self.cb_speak.toggled.connect(self._on_speak_toggled)
-        side.addWidget(self.cb_speak)
 
-        side.addSpacing(8)
+        self.cb_landmarks = QCheckBox("Puntos de las manos")
+        self.cb_landmarks.setChecked(self.cfg.draw_landmarks)
+        self.cb_landmarks.toggled.connect(self._on_draw_landmarks)
+        self.cb_connections = QCheckBox("Conexiones de las manos")
+        self.cb_connections.setChecked(self.cfg.draw_connections)
+        self.cb_connections.toggled.connect(self._on_draw_connections)
+        self.cb_body = QCheckBox("Esqueleto del cuerpo y línea de reposo")
+        self.cb_body.setChecked(self.cfg.draw_body)
+        self.cb_body.setEnabled(self.cfg.body_tracking)
+        self.cb_body.toggled.connect(self._on_draw_body)
 
-        side.addWidget(QLabel("HISTORIAL"))
-        self.history_view = QPlainTextEdit()
-        self.history_view.setReadOnly(True)
-        self.history_view.setMaximumHeight(150)
-        self.history_view.setStyleSheet("font-family: monospace; font-size: 12px;")
-        side.addWidget(self.history_view)
+        self.cb_diagnostic = QCheckBox("Mostrar las 3 letras más probables en cada frame")
+        self.cb_diagnostic.toggled.connect(self._on_diagnostic_toggled)
+        self.diagnostic_label = QLabel("")
+        self.diagnostic_label.setStyleSheet("font-family: monospace; font-size: 12px;")
+        self.diagnostic_label.setWordWrap(True)
+        self.diagnostic_label.hide()
 
-        side.addStretch()
+    @staticmethod
+    def _labeled_row(text: str, widget: QWidget, value: Optional[QLabel] = None) -> QHBoxLayout:
+        row = QHBoxLayout()
+        label = QLabel(text)
+        label.setMinimumWidth(150)
+        row.addWidget(label)
+        row.addWidget(widget, stretch=1)
+        if value is not None:
+            value.setMinimumWidth(44)
+            row.addWidget(value)
+        return row
 
-        main.addLayout(video_box, stretch=7)
-        main.addLayout(side, stretch=3)
+    def _build_central_widget(self) -> None:
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(18, 14, 18, 10)
+        root.setSpacing(14)
+
+        # Encabezado: titulo, camara, guia, ajustes e iniciar/detener.
+        header = QHBoxLayout()
+        titles = QVBoxLayout()
+        title = QLabel("Traductor LSM")
+        title.setObjectName("AppTitle")
+        subtitle = QLabel("Lengua de Señas Mexicana a texto y voz")
+        subtitle.setObjectName("AppSubtitle")
+        titles.addWidget(title)
+        titles.addWidget(subtitle)
+        header.addLayout(titles)
+        header.addStretch()
+        self.camera_combo = QComboBox()
+        self.camera_combo.addItem(f"Cámara #{self.cfg.camera_index}", self.cfg.camera_index)
+        self.camera_combo.setMinimumWidth(130)
+        self.refresh_cameras_btn = QPushButton("↻")
+        self.refresh_cameras_btn.setToolTip("Buscar cámaras conectadas")
+        self.refresh_cameras_btn.clicked.connect(self._refresh_cameras)
+        guide_btn = QPushButton("❔ Guía")
+        guide_btn.setToolTip("Cómo hacer las señas (F1)")
+        guide_btn.clicked.connect(self.open_guide)
+        settings_btn = QPushButton("⚙ Ajustes")
+        settings_btn.setToolTip("Ajustes de cámara, reconocimiento y voz (Ctrl+,)")
+        settings_btn.clicked.connect(self.open_settings)
+        self.start_button = QPushButton("▶  Iniciar")
+        self.start_button.setObjectName("Primary")
+        self.start_button.setMinimumWidth(130)
+        self.start_button.setToolTip("Iniciar o detener la cámara (Ctrl+R / Ctrl+T)")
+        self.start_button.clicked.connect(self._toggle_system)
+        for w in (self.camera_combo, self.refresh_cameras_btn, guide_btn, settings_btn, self.start_button):
+            w.setCursor(Qt.CursorShape.PointingHandCursor)
+            header.addWidget(w)
+        root.addLayout(header)
+
+        body = QHBoxLayout()
+        body.setSpacing(14)
+        root.addLayout(body, stretch=1)
+
+        # Columna izquierda: video y texto traducido.
+        left = QVBoxLayout()
+        left.setSpacing(14)
+        video_card = Card()
+        self.image_label = QLabel("Presiona  ▶ Iniciar  para encender la cámara")
+        self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.image_label.setMinimumSize(640, 420)
+        self.image_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        video_card.body.addWidget(self.image_label, stretch=1)
+        video_footer = QHBoxLayout()
+        self.phase_pill = Pill()
+        video_footer.addWidget(self.phase_pill)
+        self.hint_label = QLabel("Sube la mano sobre la línea punteada para empezar una seña.")
+        self.hint_label.setObjectName("Muted")
+        video_footer.addWidget(self.hint_label, stretch=1)
+        video_card.body.addLayout(video_footer)
+        left.addWidget(video_card, stretch=1)
+
+        text_card = Card("Texto traducido")
+        self.sentence_label = QLabel()
+        self.sentence_label.setWordWrap(True)
+        self.sentence_label.setTextFormat(Qt.TextFormat.RichText)
+        self.sentence_label.setMinimumHeight(70)
+        self.sentence_label.setStyleSheet("font-size: 30px; font-weight: 600; letter-spacing: 1px;")
+        text_card.body.addWidget(self.sentence_label)
+        buttons = QHBoxLayout()
+        for text, tip, slot in (
+            ("⌫  Borrar letra", "Borra la última letra (Retroceso)", self.delete_last_letter),
+            ("✕  Borrar palabra", "Borra la palabra en curso (Ctrl+Retroceso)", self.clear_current_word),
+            ("␣  Terminar palabra", "Cierra la palabra en curso (Enter)", self.insert_space),
+            ("🔊  Leer", "Lee en voz alta la última palabra", self.speak_last),
+            ("💾  Guardar texto", "Guarda todo el texto en un archivo", self.export_history),
+            ("🗑  Limpiar", "Borra todo el texto", self.clear_all),
+        ):
+            b = big_button(text, tip)
+            b.clicked.connect(slot)
+            buttons.addWidget(b)
+        text_card.body.addLayout(buttons)
+        left.addWidget(text_card)
+        body.addLayout(left, stretch=62)
+
+        # Columna derecha: sena actual y retroalimentacion.
+        right = QVBoxLayout()
+        right.setSpacing(14)
+        sign_card = Card("Seña")
+        self.sign_label = QLabel("—")
+        self.sign_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.sign_label.setMinimumHeight(110)
+        self.sign_kind_label = QLabel("Esperando")
+        self.sign_kind_label.setObjectName("Muted")
+        self.sign_kind_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        sign_card.body.addWidget(self.sign_label)
+        sign_card.body.addWidget(self.sign_kind_label)
+        self.candidates = CandidateBars()
+        sign_card.body.addWidget(self.candidates)
+        self._set_sign("—", COLORS["muted"], "Esperando")
+        right.addWidget(sign_card)
+
+        fb_card = Card("Retroalimentación")
+        self.feedback = FeedbackPanel()
+        fb_card.body.addWidget(self.feedback, stretch=1)
+        right.addWidget(fb_card, stretch=1)
+        body.addLayout(right, stretch=38)
 
     def _build_status_bar(self) -> None:
         bar = QStatusBar()
         self.setStatusBar(bar)
-
-        self.status_engine = QLabel("⚙ MediaPipe Hands")
-        self.status_camera = QLabel("● Cámara: detenida")
+        self.status_camera = QLabel("● Cámara detenida")
+        self.status_body = QLabel("Cuerpo: —")
         self.status_hands = QLabel("✋ Manos: 0")
         self.status_fps = QLabel("FPS: —")
         self.status_latency = QLabel("Latencia: —")
+        for w in (self.status_camera, self.status_body, self.status_hands, self.status_fps, self.status_latency):
+            bar.addPermanentWidget(w)
 
-        bar.addPermanentWidget(self.status_engine)
-        bar.addPermanentWidget(self._sep())
-        bar.addPermanentWidget(self.status_camera)
-        bar.addPermanentWidget(self._sep())
-        bar.addPermanentWidget(self.status_hands)
-        bar.addPermanentWidget(self._sep())
-        bar.addPermanentWidget(self.status_fps)
-        bar.addPermanentWidget(self._sep())
-        bar.addPermanentWidget(self.status_latency)
+    def open_settings(self) -> None:
+        if self._settings_dialog is None:
+            cam_row = QHBoxLayout()
+            cam_row.addWidget(QLabel("La cámara se elige arriba, junto a Iniciar."))
+            self._settings_dialog = SettingsDialog([
+                ("Letras fijas (A-Y)", [
+                    self._labeled_row("Estabilidad (frames)", self.stable_frames_slider, self.stable_frames_value_label),
+                    self._labeled_row("Confianza mínima", self.min_confidence_slider, self.min_confidence_value_label),
+                    self._labeled_row("Margen mínimo", self.min_margin_slider, self.min_margin_value_label),
+                ]),
+                ("Cámara y detección", [
+                    cam_row,
+                    self._labeled_row("Detección de manos", self.threshold_slider, self.threshold_value_label),
+                ]),
+                ("Persona", [self._labeled_row("Mano que deletrea", self.hand_combo), self.cb_speak]),
+                ("Dibujo sobre el video", [self.cb_landmarks, self.cb_connections, self.cb_body]),
+                ("Diagnóstico", [self.cb_diagnostic, self.diagnostic_label]),
+            ], self)
+        self._settings_dialog.show()
+        self._settings_dialog.raise_()
 
-    @staticmethod
-    def _sep() -> QFrame:
-        s = QFrame()
-        s.setFrameShape(QFrame.Shape.VLine)
-        s.setFrameShadow(QFrame.Shadow.Sunken)
-        return s
+    def open_guide(self) -> None:
+        profiles = word_profiles()
+        lines = [how_to_sign(label, prof) for label, prof in sorted(profiles.items())]
+        GuideDialog(lines, self).exec()
 
-    def _classifier_status_text(self) -> str:
-        """Ayuda del modo automatico: que se puede signar y como, segun los
-        modelos y plantillas que haya en la carpeta del programa."""
-        from sign_classifier import MODEL_FILENAME, LABELS_FILENAME
-        models_dir = Path(__file__).resolve().parent
-        lines = ["Modo AUTOMÁTICO: letras y palabras, sin cambiar de modo."]
-        if (models_dir / MODEL_FILENAME).exists() and (models_dir / LABELS_FILENAME).exists():
-            lines.append("• Letras A-Y: mantén la mano quieta un momento.")
-        else:
-            lines.append(f"• Sin modelo estático: coloca {MODEL_FILENAME} y {LABELS_FILENAME} en {models_dir}.")
-        if AutoSegmenter is not None and (models_dir / "datos_dinamicas").is_dir():
-            lines.append("• J K Ñ Q X Z: sube la mano, haz la letra y bájala.")
-        words = []
-        if DEFAULT_WORDS_DIR is not None and DEFAULT_WORDS_DIR.is_dir():
-            words = sorted(
-                word_display(unicodedata.normalize("NFC", d.name))
-                for d in DEFAULT_WORDS_DIR.iterdir() if d.is_dir()
-            )
-        if words:
-            lines.append(f"• Palabras ({', '.join(words)}): sube las manos, haz la seña y bájalas.")
-        else:
-            lines.append("• Sin palabras: corre extraer_palabras_videos.py para crearlas.")
-        lines.append("• Baja las manos un momento para cerrar la palabra.")
-        return "\n".join(lines)
+    # ---- estado visual ----------------------------------------------------
+
+    def _set_sign(self, text: str, color: str, kind: str) -> None:
+        size = 64 if len(text) <= 2 else (40 if len(text) <= 9 else 30)
+        self.sign_label.setText(text)
+        self.sign_label.setStyleSheet(f"font-size: {size}px; font-weight: 800; color: {color};")
+        self.sign_kind_label.setText(kind)
+
+    def _apply_phase_style(self, phase: str) -> None:
+        text, color = PHASE_STYLE.get(phase, PHASE_STYLE["reposo"])
+        # En reposo el marco queda discreto, pero la etiqueta se tiene que leer.
+        self.phase_pill.set(text, COLORS["muted"] if phase in ("reposo", "detenido") else color)
+        self.image_label.setStyleSheet(
+            f"background: #0b1220; color: {COLORS['muted']}; font-size: 16px;"
+            f"border: 3px solid {color}; border-radius: 12px;"
+        )
+
+    def _flash(self, phase: str, ms: int = 1400) -> None:
+        """Marco verde (reconocida) o ambar (repetir) por un momento."""
+        text, color = PHASE_STYLE[phase]
+        self.phase_pill.set(text, color)
+        self.image_label.setStyleSheet(
+            f"background: #0b1220; color: {COLORS['muted']}; font-size: 16px;"
+            f"border: 3px solid {color}; border-radius: 12px;"
+        )
+        self._flash_timer.start(ms)
+
+    def _render_sentence(self) -> None:
+        self.sentence_label.setText(sentence_html(self.history, self.current_word, self._pending))
 
     def _restore_window_state(self) -> None:
         geom = self.settings.value("window/geometry")
@@ -2591,6 +2704,8 @@ class SignLanguageApp(QMainWindow):
         self.ai_thread.space_committed_signal.connect(self.on_space_committed)
         self.ai_thread.auto_result_signal.connect(self._on_auto_result)
         self.ai_thread.letters_retracted_signal.connect(self.on_letters_retracted)
+        self.ai_thread.phase_signal.connect(self._on_phase)
+        self.ai_thread.guidance_signal.connect(self._on_guidance)
         self.ai_thread.metrics_signal.connect(self.update_metrics)
         self.ai_thread.error_signal.connect(self._on_ai_error)
         self.ai_thread.model_loaded_signal.connect(self._on_model_loaded)
@@ -2604,6 +2719,11 @@ class SignLanguageApp(QMainWindow):
 
         self.action_start.setEnabled(False)
         self.status_camera.setText("● Conectando...")
+        self.start_button.setText("■  Detener")
+        self.start_button.setObjectName("Danger")
+        self.start_button.setStyleSheet("")    # que tome el estilo de #Danger
+        self.image_label.setText("Encendiendo la cámara…")
+        self._on_phase("reposo")
 
         self.camera_thread = CameraThread(self.frame_queue, self.cfg.camera_index)
         self.ai_thread = HandTrackingThread(self.frame_queue, self.cfg)
@@ -2645,6 +2765,8 @@ class SignLanguageApp(QMainWindow):
                 thread.letter_committed_signal, thread.space_committed_signal,
                 thread.metrics_signal, thread.error_signal,
                 thread.model_loaded_signal, thread.heartbeat_signal,
+                thread.auto_result_signal, thread.letters_retracted_signal,
+                thread.phase_signal, thread.guidance_signal,
             ):
                 try:
                     signal.disconnect()
@@ -2681,16 +2803,33 @@ class SignLanguageApp(QMainWindow):
             except queue.Empty:
                 break
 
-        self.image_label.setText("Cámara detenida")
         self.image_label.setPixmap(QPixmap())
-        self.sign_label.setText("—")
-        self.status_camera.setText("● Cámara: detenida")
+        self.image_label.setText("Cámara detenida. Presiona  ▶ Iniciar  para continuar")
+        self._set_sign("—", COLORS["muted"], "Esperando")
+        self.candidates.set_candidates([])
+        self.feedback.set_live(None)
+        self._guidance_since.clear()
+        self._pending = 0
+        self._render_sentence()
+        self._flash_timer.stop()
+        self._on_phase("detenido")
+        self.status_camera.setText("● Cámara detenida")
+        self.status_body.setText("Cuerpo: —")
         self.status_hands.setText("✋ Manos: 0")
         self.status_fps.setText("FPS: —")
         self.status_latency.setText("Latencia: —")
 
         self.action_start.setEnabled(True)
         self.action_stop.setEnabled(False)
+        self.start_button.setText("▶  Iniciar")
+        self.start_button.setObjectName("Primary")
+        self.start_button.setStyleSheet("")
+
+    def _toggle_system(self) -> None:
+        if self.camera_thread is None and self.ai_thread is None:
+            self.start_system()
+        else:
+            self.stop_system()
 
     def _restart_ai_thread(self) -> None:
         log.warning("Watchdog: reiniciando hilo de IA")
@@ -2783,15 +2922,68 @@ class SignLanguageApp(QMainWindow):
         self.diagnostic_label.setText("\n".join(lines))
 
     def _on_auto_result(self, info: dict) -> None:
-        """Top-3 de cada letra dinamica o palabra del modo automatico y si se
-        agrego o por que no. Se muestra siempre, no solo con el diagnostico."""
-        lines = []
-        for i, (label, conf) in enumerate(info["topk"][:3]):
-            bar_len = int(conf * 20)
-            lines.append(f"{i + 1}. {label}  {'█' * bar_len}{'░' * (20 - bar_len)} {conf * 100:5.1f}%")
-        lines.append(f"→ {info['detail']}")
-        self.diagnostic_label.show()
-        self.diagnostic_label.setText("\n".join(lines))
+        """Resultado de una sena con movimiento: la tarjeta de la sena, el
+        top-3, el marco del video y el mensaje de retroalimentacion con lo
+        que hay que corregir (interfaz_lsm.feedback_for_result)."""
+        code = info.get("code", "")
+        kind = info.get("kind", "")
+        fb = feedback_for_result(info, word_profiles())
+        topk = info.get("topk") or []
+        if code == "ok":
+            self._set_sign(info.get("label", ""), COLORS["ok"], "Palabra" if kind == "palabra" else "Letra")
+            self.candidates.set_candidates(topk, COLORS["ok"])
+            self._flash("ok")
+        elif code in ("deletreo", "deletreo_largo"):
+            return
+        else:
+            shown = f"¿{topk[0][0]}?" if topk else "?"
+            self._set_sign(shown, COLORS["warn"], "Repite la seña")
+            self.candidates.set_candidates(topk, COLORS["warn"])
+            self._flash("repetir", 2200)
+        self._result_hold_until = time.time() + 2.5
+        if fb is not None:
+            self.feedback.add(fb)
+
+    def _on_phase(self, phase: str) -> None:
+        self._phase = phase
+        if phase in ("reposo", "detenido"):
+            # La sena termino y ya se resolvio: la letra retenida se escribe
+            # (si una palabra la reemplazo, ya se quito) y las demas dejan de
+            # estar pendientes.
+            self._flush_held()
+            self._spelling = False
+            if self._pending:
+                self._pending = 0
+                self._render_sentence()
+        if not self._flash_timer.isActive():
+            self._apply_phase_style(phase)
+        hints = {
+            "detenido": "Presiona Iniciar para encender la cámara.",
+            "reposo": "Sube la mano sobre la línea punteada para empezar una seña.",
+            "seña": "Haz la seña completa y baja las manos al terminar.",
+            "clasificando": "Reconociendo la seña…",
+        }
+        self.hint_label.setText(hints.get(phase, ""))
+
+    def _on_guidance(self, state: dict) -> None:
+        """Estado del frame (~4 por segundo): barra de estado y consejo en
+        vivo, que solo aparece si la condicion dura un rato."""
+        now = time.time()
+        conditions = {
+            "sin_cuerpo": state.get("hands", 0) > 0 and state.get("body_tracking") and not state.get("body_visible"),
+            "dos_manos": bool(state.get("two_raised_still")),
+            "duda": bool(state.get("static_unsure")),
+            "moviendo": bool(state.get("moving_letter")),
+        }
+        for key, active in conditions.items():
+            if active:
+                self._guidance_since.setdefault(key, now)
+            else:
+                self._guidance_since.pop(key, None)
+        held = {key: now - since for key, since in self._guidance_since.items()}
+        self.feedback.set_live(guidance_feedback(state, held))
+        if state.get("body_tracking"):
+            self.status_body.setText("Cuerpo: visible" if state.get("body_visible") else "Cuerpo: no se ve")
 
     def _on_model_loaded(self) -> None:
         self.statusBar().showMessage("MediaPipe Hands listo", 3000)
@@ -2814,7 +3006,23 @@ class SignLanguageApp(QMainWindow):
             self._restart_ai_thread()
 
     def update_sign(self, text: str, conf: float) -> None:
-        self.sign_label.setText(text)
+        """Texto de Estado del hilo en cada frame. En la tarjeta solo se
+        muestra la letra fija que se esta formando (la fase y los resultados
+        de las senas con movimiento llegan por sus propias senales)."""
+        letter = text[1:] if text.startswith("?") else text
+        is_letter = len(letter) == 1 and letter.isalpha()
+        if time.time() < self._result_hold_until and not (is_letter and self._phase == "seña"):
+            return
+        if is_letter and not text.startswith("?"):
+            self._set_sign(letter, COLORS["text"], f"Letra · {conf * 100:.0f}% · mantén la mano quieta")
+        elif is_letter:
+            self._set_sign(letter, COLORS["muted"], "¿Letra? Ajusta la forma de la mano")
+        elif self._phase == "seña":
+            self._set_sign("…", COLORS["accent"], "Haciendo seña")
+        elif self._phase == "clasificando":
+            self._set_sign("…", COLORS["info"], "Reconociendo")
+        elif time.time() >= self._result_hold_until:
+            self._set_sign("—", COLORS["muted"], "Esperando")
 
     def update_hands(self, detections: FrameDetections) -> None:
         self.status_hands.setText(f"✋ Manos: {detections.num_hands}")
@@ -2839,39 +3047,71 @@ class SignLanguageApp(QMainWindow):
 
 
     def on_letter_committed(self, letter: str) -> None:
+        in_sign = len(letter) == 1 and self._phase in ("seña", "clasificando")
+        if in_sign and not self._spelling and not self._held:
+            self._held.append(letter)
+            self._set_sign(letter, COLORS["accent"], "Letra · se escribe al bajar la mano")
+            self._result_hold_until = time.time() + 1.0
+            return
+        if in_sign and self._held:
+            self._spelling = True    # segunda letra en la misma sena: es deletreo
+            self._flush_held(pending=True)
         if len(letter) > 1 and self.current_word and not self.current_word.endswith(" "):
             self.current_word += " "
         self.current_word += letter
-        self.word_label.setText(self.current_word)
+        if in_sign:
+            self._pending += 1       # una palabra de esta misma sena todavia puede reemplazarla
+            self._set_sign(letter, COLORS["ok"], "Letra agregada")
+            self._result_hold_until = time.time() + 1.0
+        self._render_sentence()
+
+    def _flush_held(self, pending: bool = False) -> None:
+        if not self._held:
+            return
+        self.current_word += "".join(self._held)
+        if pending:
+            self._pending += len(self._held)
+        self._held.clear()
+        self._render_sentence()
 
     def on_letters_retracted(self, letters: list) -> None:
         """Borra del final de la palabra en curso las letras estaticas que
         una palabra completa reemplaza (modo automatico). Si ya no estan al
         final (Enter o Retroceso de por medio), no se toca nada."""
+        if self._held and list(letters) == self._held:
+            self._held.clear()       # nunca se escribio: basta con olvidarla
+            return
         tail = "".join(letters)
         current = self.current_word.rstrip(" ")
         if tail and current.endswith(tail):
             self.current_word = current[: -len(tail)].rstrip(" ")
-            self.word_label.setText(self.current_word)
+            self._pending = max(0, self._pending - len(tail))
+            self._render_sentence()
 
     def on_space_committed(self) -> None:
+        self._flush_held()
         if not self.current_word.strip():
             return
         word = self.current_word.strip()
         self.history.append(word)
-        self.history_view.appendPlainText(word)
         self.current_word = ""
-        self.word_label.setText("")
+        self._pending = 0
+        self._render_sentence()
         if self.ai_thread is not None:
             self.ai_thread.reset_word_state()
         if self.cfg.speak_words:
             self.speaker.say(word.lower())
 
     def delete_last_letter(self) -> None:
+        if self._held:
+            self._held.pop()
+            self._set_sign("—", COLORS["muted"], "Letra borrada")
+            return
         if not self.current_word:
             return
         self.current_word = self.current_word[:-1].rstrip(" ")
-        self.word_label.setText(self.current_word)
+        self._pending = min(self._pending, len(self.current_word))
+        self._render_sentence()
         # Tras corregir, la letra se puede volver a signar de inmediato, y si
         # a la palabra le quedan letras el espacio automatico la sigue cerrando.
         if self.ai_thread is not None:
@@ -2879,9 +3119,25 @@ class SignLanguageApp(QMainWindow):
 
     def clear_current_word(self) -> None:
         self.current_word = ""
-        self.word_label.setText("")
+        self._held.clear()
+        self._pending = 0
+        self._render_sentence()
         if self.ai_thread is not None:
             self.ai_thread.reset_word_state()
+
+    def clear_all(self) -> None:
+        self.history.clear()
+        self.clear_current_word()
+        self.feedback.clear()
+
+    def speak_last(self) -> None:
+        text = self.current_word.strip() or (self.history[-1] if self.history else "")
+        if not text:
+            return
+        if not self.speaker.available:
+            QMessageBox.information(self, "Sin voz", "No se encontró un motor de voz en este equipo.")
+            return
+        self.speaker.say(text.lower())
 
     def insert_space(self) -> None:
         self.on_space_committed()

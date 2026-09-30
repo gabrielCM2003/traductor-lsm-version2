@@ -50,6 +50,15 @@ N_BODY_FEATURES = 9
 # 93.2% con peso 1, 96.6% con 2 y 98.3% con 4.
 DEFAULT_WORDS_DIR = Path(__file__).resolve().parent / "datos_palabras_dinamicas"
 WORD_BODY_WEIGHT = 4.0
+# Temperatura del softmax de las palabras (distances_to_topk), ajustada para
+# que la confianza sea una probabilidad calibrada: minimiza la log-verosimilitud
+# negativa de la palabra correcta reconociendo a cada persona de los videos
+# SOLO con las plantillas de las otras dos (3 personas). Optimo 0.50 (NLL
+# 0.27, contra 0.36 con 1.0). Con 1.0 la confianza quedaba por debajo del
+# acierto real y muchas palabras correctas se tomaban como dudosas; con 0.5,
+# de las que salen con 80% o mas se acierta mas del 92%. Las letras
+# dinamicas siguen con 1.0 (sus reglas se calibraron con esa escala).
+WORD_TEMPERATURE = 0.5
 
 
 # =========================================================================== #

@@ -19,7 +19,8 @@ El repositorio incluye también la documentación del **guante instrumentado** d
 
 | Archivo | Qué es |
 |---|---|
-| `senas.py` | Aplicación (PyQt6): cámara, MediaPipe, clasificación estática y dinámica, interfaz y voz |
+| `senas.py` | Aplicación (PyQt6): cámara, MediaPipe, modo automático (letras estáticas, dinámicas y palabras), ventana y voz |
+| `interfaz_lsm.py` | Tema visual, componentes de la ventana y textos de retroalimentación (qué corregir de cada seña) |
 | `sign_classifier.py` | Clasificador ONNX del alfabeto estático, suavizado de predicciones y confirmación de letras y espacios |
 | `dtw_recognizer.py` | Reconocedor DTW del alfabeto dinámico (J, K, Ñ, Q, X, Z) y de las palabras (con la ubicación respecto al cuerpo) |
 | `extraer_palabras_videos.py` | Saca las plantillas JSON de palabras de una carpeta de videos (una subcarpeta por palabra). Corre en la computadora o en Google Colab |
@@ -34,7 +35,7 @@ El repositorio incluye también la documentación del **guante instrumentado** d
 | `datos_palabras_dinamicas/` | Plantillas de palabras (una subcarpeta por palabra), sacadas de videos con `extraer_palabras_videos.py` o grabadas con el segmentador. Van aparte de las letras porque el DTW toma cada subcarpeta como una clase |
 | `lsm_alphabet.onnx`, `lsm_alphabet.onnx.data` | Modelo entrenado del alfabeto estático (red pequeña, 63 entradas: 21 puntos × 3) |
 | `lsm_labels.json` | Etiquetas del modelo estático y tipo de normalización |
-| `tests/` | Pruebas unitarias: configuración, alfabeto estático, modo automático y DTW con cuerpo |
+| `tests/` | Pruebas unitarias: configuración, alfabeto estático, modo automático, DTW con cuerpo, retroalimentación y ventana |
 | `probar_modo_dinamico_senas.py` | Pruebas de regresión del alfabeto dinámico integrado en `senas.py` |
 | `requirements.txt` | Dependencias de Python |
 | `Guante_LSM_Indivisa_Ingenium_2026.pdf` | Guía técnica del guante v2: enlace inalámbrico ESP-NOW, batería LiPo y estación Raspberry Pi |
@@ -86,11 +87,19 @@ Si la mano se acerca demasiado a la cámara, el video muestra un aviso: MediaPip
 
 La línea punteada del video es la **línea de reposo** (a la altura del ombligo). Una seña empieza cuando una mano sube por encima de ella y termina cuando las manos bajan (o salen de cuadro).
 
-- **Letras estáticas (A-Y):** se fijan cuando la mano está quieta un momento, sola y arriba de la línea. Una mano en movimiento no escribe letras.
+- **Letras estáticas (A-Y):** se fijan cuando la mano está quieta un momento, sola y arriba de la línea. Una mano en movimiento no escribe letras. La primera letra de cada seña se muestra en la tarjeta **Seña** y se escribe al bajar la mano (o en cuanto llega la segunda letra, si estás deletreando): así, la pausa de una palabra (HOLA en la frente) no deja una letra suelta que luego se borra.
 - **Letras con movimiento (J, K, Ñ, Q, X, Z):** sube la mano, haz la letra y bájala.
-- **Palabras (HOLA, GRACIAS, POR FAVOR, AYUDA, MAMÁ):** sube las manos, haz la seña y bájalas. La palabra se escribe completa y se cierra sola. Si en una pausa de la palabra (por ejemplo, HOLA en la frente) alcanzó a escribirse alguna letra suelta, la palabra la reemplaza.
+- **Palabras (HOLA, GRACIAS, POR FAVOR, AYUDA, MAMÁ):** sube las manos, haz la seña y bájalas. La palabra se escribe completa y se cierra sola. La confianza está calibrada con personas que no aparecen en las plantillas (temperatura 0.5), y basta un margen de 0.15 sobre la segunda palabra para escribirla.
 - Al bajar las manos, la seña completa se compara con las letras dinámicas y con las palabras. Si en ella se fijaron 3 letras estáticas o más, fue deletreo y se respeta.
-- El panel lateral muestra el top-3 de cada seña con movimiento y si se agregó o por qué no.
+- La tarjeta **Seña** muestra el top-3 de cada seña con movimiento, y **Retroalimentación** dice si salió bien y, si no, qué corregir.
+
+### La interfaz
+
+- **Encabezado:** cámara, ❔ Guía (F1, cómo se hace cada seña), ⚙ Ajustes (Ctrl+,: umbrales, mano que deletrea, voz, dibujo y diagnóstico) y ▶ Iniciar / ■ Detener.
+- **Video:** el marco cambia de color según lo que pasa: gris en reposo, azul mientras haces la seña, morado mientras la reconoce, verde si la reconoció y ámbar si hay que repetirla.
+- **Seña:** la letra que se está formando o la última letra o palabra reconocida, con sus 3 candidatas.
+- **Texto traducido:** las palabras terminadas en gris, la palabra en curso en blanco y, subrayadas en azul, las letras que la seña en curso todavía puede cambiar. Botones para borrar, terminar la palabra, leer en voz alta, guardar y limpiar.
+- **Retroalimentación:** consejos en vivo ("No veo tus hombros", "¿B o P? Ajusta la forma de los dedos", "Para deletrear usa una sola mano", "Mano muy cerca de la cámara") y el resultado de cada seña con movimiento. Si una palabra no sale, compara cómo la hiciste con cómo se hace según sus plantillas: por ejemplo, "¿HOLA o MAMÁ? Tu mano quedó frente al pecho; HOLA se hace a la altura de la cabeza", "AYUDA se hace con las dos manos" o "La hiciste muy rápido".
 
 ### Crear las plantillas de palabras desde videos
 
@@ -127,6 +136,8 @@ En modo palabras, la seña termina al bajar las manos por debajo de la línea de
 | Atajo (en macOS, Cmd en lugar de Ctrl) | Acción |
 |---|---|
 | Ctrl+R / Ctrl+T | Iniciar / detener |
+| F1 | Guía rápida |
+| Ctrl+, | Ajustes |
 | Retroceso | Borrar la última letra |
 | Ctrl+Retroceso | Borrar la palabra |
 | Enter o Ctrl+Espacio | Terminar la palabra (espacio) |
@@ -134,7 +145,7 @@ En modo palabras, la seña termina al bajar las manos por debajo de la línea de
 
 Para repetir una letra (LL, RR, EE), relaja la mano un instante (o bájala) y vuelve a hacerla.
 
-En el panel lateral, **Mano que deletrea** elige qué mano se clasifica cuando hay dos en cuadro. Con la izquierda, la seña se refleja para compararla con el modelo y las plantillas, que son de la mano derecha. **Leer palabras en voz alta** lee cada palabra al terminarla. Los valores de los sliders y estas opciones se guardan en la configuración.
+En **Ajustes**, **Mano que deletrea** elige qué mano se clasifica cuando hay dos en cuadro. Con la izquierda, la seña se refleja para compararla con el modelo y las plantillas, que son de la mano derecha. **Leer palabras en voz alta** lee cada palabra al terminarla. Los valores de los sliders y estas opciones se guardan en la configuración.
 
 ## Pruebas
 
@@ -148,7 +159,7 @@ python probar_modo_dinamico_senas.py          # reglas del alfabeto dinámico (r
 Ver `ESTADO_PROYECTO_COMPLETO.md` para el detalle completo (qué está probado con varias personas, qué sigue siendo prototipo, métricas reales medidas, y riesgos prácticos para la demo). En resumen:
 
 - Alfabeto estático (21 letras) y alfabeto dinámico completo (J, K, Ñ, Q, X, Z) funcionales, probados con varias personas.
-- **Palabras completas:** 59 plantillas de 5 palabras, sacadas de videos de varias personas del equipo. Cada plantilla contra las demás: 58/59 reconocidas. Pero son pocas personas y una sola cámara: falta probar con gente que no aparezca en los videos. El modelo `lsm_words.onnx` sigue siendo de prueba y el modo automático no lo usa.
+- **Palabras completas:** 59 plantillas de 5 palabras, sacadas de videos de 3 personas del equipo. Reconociendo a cada persona solo con las plantillas de las otras dos (como un usuario nuevo): 56/59 bien, y se escriben 54 de esas 56 sin agregar errores; los 3 errores son AYUDA↔GRACIAS. Falta probar con más personas y cámaras. El modelo `lsm_words.onnx` sigue siendo de prueba y el modo automático no lo usa.
 - El adaptador de datos del guante (sensores de flexión) todavía no tiene código: el protocolo de datos de mecatrónica sigue sin definirse.
 - La precisión del alfabeto estático todavía no está medida con personas que no participaron en el entrenamiento original.
 - El guante está documentado, pero su firmware y el lector del guante en la aplicación aún no están escritos: según las reglas del concurso, la programación del dispositivo se hace durante el evento.

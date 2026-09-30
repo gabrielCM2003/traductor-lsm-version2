@@ -113,6 +113,12 @@ def hand(x: float, y: float, handedness: str = "Left"):
                                landmarks_3d=np.zeros((21, 3), dtype=np.float32))
 
 
+def result(kind, topk, best=2.0, letters=(), d_word=1.0, d_letter=5.0, duration=1.5):
+    """Resultado de _classify_auto_sequence armado a mano."""
+    return {"kind": kind, "topk": list(topk), "best_dist": best, "d_word": d_word, "d_letter": d_letter,
+            "letters": list(letters), "stats": senas.SignStats(duration_s=duration), "duration_s": duration}
+
+
 class FakeClock:
     def __init__(self):
         self.t = 100.0
@@ -142,7 +148,9 @@ class TestModoAutomatico(unittest.TestCase):
         self.patch = mock.patch.object(senas.time, "perf_counter", self.clock)
         self.patch.start()
         self.dispatched: list[tuple] = []
-        self.thread._classify_auto_sequence = lambda seq, letters: self.dispatched.append((seq, letters))
+        self.thread._classify_auto_sequence = lambda seq, letters, duration=0.0: self.dispatched.append((seq, letters))
+        self.results: list[dict] = []
+        self.thread.auto_result_signal.connect(lambda info: self.results.append(info))
         self.retracted: list[list] = []
         self.thread.letters_retracted_signal.connect(lambda letters: self.retracted.append(letters))
 
@@ -172,14 +180,14 @@ class TestModoAutomatico(unittest.TestCase):
 
     def test_deletreo_no_agrega_letra_dinamica(self):
         self.thread._auto_classifying = True
-        self.thread._auto_result_queue.put(("letra", [("J", 0.9), ("X", 0.05), ("Z", 0.05)], 1.0, 4.0, 1.0, ["A"]))
+        self.thread._auto_result_queue.put(result("letra", [("J", 0.9), ("X", 0.05), ("Z", 0.05)], letters=["A"]))
         self.frame([], False)
         self.assertEqual(self.committed, [])
 
     def test_palabra_reemplaza_la_letra_de_su_pausa(self):
         self.thread._auto_classifying = True
         self.thread._auto_result_queue.put(
-            ("palabra", [("HOLA", 0.9), ("MAMÁ", 0.06), ("AYUDA", 0.04)], 2.0, 1.0, 5.0, ["R"]))
+            result("palabra", [("HOLA", 0.9), ("MAMÁ", 0.06), ("AYUDA", 0.04)], letters=["R"]))
         self.frame([], False)
         app.processEvents()
         self.assertEqual(self.retracted, [["R"]])
@@ -188,7 +196,7 @@ class TestModoAutomatico(unittest.TestCase):
     def test_deletreo_largo_no_se_reemplaza(self):
         self.thread._auto_classifying = True
         self.thread._auto_result_queue.put(
-            ("palabra", [("HOLA", 0.9), ("MAMÁ", 0.06), ("AYUDA", 0.04)], 2.0, 1.0, 5.0, ["A", "N", "A"]))
+            result("palabra", [("HOLA", 0.9), ("MAMÁ", 0.06), ("AYUDA", 0.04)], letters=["A", "N", "A"]))
         text, _ = self.frame([], False)
         app.processEvents()
         self.assertEqual(self.retracted, [])
@@ -213,7 +221,7 @@ class TestModoAutomatico(unittest.TestCase):
         self.thread.space_committed_signal.connect(lambda: spaces.append(1))
         self.thread._auto_classifying = True
         self.thread._auto_result_queue.put(
-            ("palabra", [("POR_FAVOR", 0.9), ("HOLA", 0.06), ("MAMÁ", 0.04)], 2.0, 1.0, 5.0, []))
+            result("palabra", [("POR_FAVOR", 0.9), ("HOLA", 0.06), ("MAMÁ", 0.04)]))
         text, _ = self.frame([], False)
         app.processEvents()
         self.assertEqual(self.committed, ["POR FAVOR"])
@@ -223,14 +231,38 @@ class TestModoAutomatico(unittest.TestCase):
     def test_palabra_dudosa_no_se_escribe(self):
         self.thread._auto_classifying = True
         self.thread._auto_result_queue.put(
-            ("palabra", [("HOLA", 0.5), ("MAMÁ", 0.4), ("AYUDA", 0.1)], 2.0, 1.0, 5.0, []))
+            result("palabra", [("HOLA", 0.5), ("MAMÁ", 0.45), ("AYUDA", 0.05)]))
         text, _ = self.frame([], False)
+        app.processEvents()
         self.assertEqual(self.committed, [])
         self.assertIn("no agregada", text)
+        self.assertEqual(self.results[-1]["code"], "ambigua")
+
+    def test_palabra_lejana_es_desconocida(self):
+        self.thread._auto_classifying = True
+        self.thread._auto_result_queue.put(
+            result("palabra", [("HOLA", 0.9), ("MAMÁ", 0.05), ("AYUDA", 0.05)], best=senas.WORD_MAX_DISTANCE + 5))
+        self.frame([], False)
+        app.processEvents()
+        self.assertEqual(self.results[-1]["code"], "desconocida")
+
+    def test_fases(self):
+        phases = []
+        self.thread.phase_signal.connect(phases.append)
+        for i in range(20):
+            self.frame([hand(0.2 + 0.015 * i, 0.4)], True)
+        self.rest()
+        app.processEvents()
+        self.assertEqual(phases, ["seña", "clasificando"])
+        # al llegar el resultado vuelve a reposo
+        self.thread._auto_result_queue.put(result("letra", [("J", 0.8), ("X", 0.1), ("Z", 0.1)], best=1.0))
+        self.frame([], False)
+        app.processEvents()
+        self.assertEqual(phases[-1], "reposo")
 
     def test_letra_dinamica_usa_las_reglas_del_modo_dinamico(self):
         self.thread._auto_classifying = True
-        self.thread._auto_result_queue.put(("letra", [("J", 0.8), ("X", 0.1), ("Z", 0.1)], 1.0, 4.0, 1.0, []))
+        self.thread._auto_result_queue.put(result("letra", [("J", 0.8), ("X", 0.1), ("Z", 0.1)], best=1.0))
         self.frame([], False)
         self.assertEqual(self.committed, ["J"])
 

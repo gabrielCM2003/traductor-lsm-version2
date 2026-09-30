@@ -382,7 +382,11 @@ def main() -> int:
                             query = [np.concatenate([c.hands_vec, c.body_vec]) for c in sequence]
                         else:
                             query = [c.hands_vec for c in sequence]
-                        topk = recognizer.predict_topk(query, k=args.k)
+                        if palabras:
+                            from dtw_recognizer import WORD_TEMPERATURE
+                            topk = recognizer.predict_topk(query, k=args.k, temperature=WORD_TEMPERATURE)
+                        else:
+                            topk = recognizer.predict_topk(query, k=args.k)
                     except Exception as e:
                         status = "Error al clasificar"
                         print(f"  ERROR al clasificar: {e}")
