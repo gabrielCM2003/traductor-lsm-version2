@@ -15,6 +15,11 @@ muestra fantasma de ~12-14 frames antes de la real. Con inicio/fin explicitos
 ese problema desaparece: la duracion de la grabacion la decide el usuario, no
 un temporizador.
 
+Al elegir la letra se pide una confirmacion grande antes de empezar a grabar
+("Vas a grabar: <LETRA> - ¿correcto?"): ENTER confirma, cualquier otra cosa
+vuelve a pedir la letra. Evita quedarse grabando en la letra equivocada sin
+darse cuenta (ver confirm_letter()).
+
 Al terminar una grabacion se pide confirmacion en la propia ventana (no hace
 falta volver a la terminal): 's' = guardar, 'd' = descartar. Si la seña dura
 menos de MIN_FRAMES_OK frames se avisa "demasiado corta" y se descarta por
@@ -54,7 +59,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import cv2
 import numpy as np
@@ -253,6 +258,26 @@ def save_raw_npz(path: Path, raw_frames: list[RawFrameSample], fps_medido: float
 # sin camara ni teclado, para poder probarlas con datos sinteticos)
 # =========================================================================== #
 
+def confirm_letter(word: str, read_line: Callable[[str], str] = input) -> bool:
+    """Confirmacion grande antes de empezar a grabar `word`: evita que una
+    letra mal escrita/mal seleccionada se quede grabando sin que nadie se
+    de cuenta (ya paso: varias muestras destinadas a J/Q/Z terminaron
+    grabadas en K por error).
+
+    ENTER (linea vacia) confirma. Cualquier otra cosa escrita antes de
+    ENTER se interpreta como "no, vuelve a pedir la letra" - no hace falta
+    que sea una tecla en particular.
+
+    `read_line` es inyectable (por defecto `input`) para poder probar esta
+    funcion con entrada simulada, sin teclado real ni camara."""
+    print("\n" + "=" * 60)
+    print(f"  VAS A GRABAR: '{word}'")
+    print("  ¿Correcto? ENTER = confirmar   |   cualquier tecla + ENTER = volver a escribir")
+    print("=" * 60)
+    respuesta = read_line("> ")
+    return respuesta == ""
+
+
 def should_discard_by_default(n_frames: int) -> bool:
     """True si, sin intervencion del usuario, esta grabacion se descartaria
     por ser demasiado corta (por debajo de MIN_FRAMES_OK). La confirmacion
@@ -343,6 +368,9 @@ def main() -> int:
                 print("  (etiqueta vacia, se ignora)")
                 continue
             word = candidate.upper()
+            if not confirm_letter(word):
+                print("  (cancelado, vuelve a escribir la letra)")
+                continue
             print(f"Grabando '{word}'.")
 
             word_dir = OUTPUT_ROOT / word

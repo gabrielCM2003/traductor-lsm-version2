@@ -1,0 +1,9 @@
+{
+  "labels": [
+    "BUENOS_DIAS",
+    "GRACIAS",
+    "HOLA"
+  ],
+  "n_features": 126,
+  "normalization": "wrist_centered_middle_scaled"
+}
