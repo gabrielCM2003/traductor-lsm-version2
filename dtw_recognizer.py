@@ -16,8 +16,10 @@ Mantiene la consistencia de interfaz pública con el resto del proyecto:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import os
 import unicodedata
 from pathlib import Path
 from typing import Any, List, Optional, Tuple, Union
@@ -70,7 +72,10 @@ if HAVE_NUMBA:
     # sin soltar el candado de Python, ese hilo lo acaparaba igual durante los
     # varios segundos que tarda en maquinas lentas (y el watchdog reiniciaba
     # el hilo de deteccion a medio reconocimiento).
-    @njit(fastmath=True, nogil=True)
+    # cache=True: el codigo compilado se guarda en __pycache__. En la
+    # Raspberry Pi compilar tarda varios segundos, y sin esto se repetia en
+    # cada arranque de la app.
+    @njit(fastmath=True, nogil=True, cache=True)
     def _dtw_dp_numba(cost_matrix: np.ndarray) -> float:
         """Cálculo DTW y longitud de path con Numba a nivel de C."""
         n, m = cost_matrix.shape
@@ -223,6 +228,7 @@ class DTWRecognizer:
         resample_len: Optional[int] = None,
         hand_agnostic: bool = False,
         body_weight: Optional[float] = None,
+        template_step: int = 1,
     ):
         """Inicializa el reconocedor y carga en memoria todas las plantillas disponibles.
 
@@ -244,6 +250,12 @@ class DTWRecognizer:
                          palabras, que se distinguen por DONDE se hacen. Las
                          consultas traen entonces 126 + 9 columnas y las
                          plantillas sin "body_frames" se saltan.
+            template_step: se toma 1 de cada `template_step` frames de cada
+                           plantilla. Con 2, las plantillas grabadas a 30 fps
+                           quedan a ~15 fps: el DTW tarda ~1/4 (es n x m) y la
+                           consulta se puede tomar tambien a ~15 fps (lo que
+                           procesa una Raspberry Pi). El llamador submuestrea
+                           la consulta; ver senas._classify_auto_sequence.
         """
         self.data_dir = Path(data_dir) if data_dir else DEFAULT_DATA_DIR
         self.labels_path = Path(labels_path) if labels_path else DEFAULT_LABELS_FILE
@@ -251,6 +263,7 @@ class DTWRecognizer:
         self.hand_agnostic = hand_agnostic
         self.body_weight = body_weight
         self.n_features = N_FEATURES + (N_BODY_FEATURES if body_weight is not None else 0)
+        self.template_step = max(1, int(template_step))
 
         # Diccionario con estructura: { 'palabra': [array(T1, 126), array(T2, 126), ...] }
         self._templates: dict[str, list[np.ndarray]] = {}
@@ -273,6 +286,7 @@ class DTWRecognizer:
         resample_len: Optional[int] = None,
         hand_agnostic: bool = False,
         body_weight: Optional[float] = None,
+        template_step: int = 1,
     ) -> Optional["DTWRecognizer"]:
         """Intenta instanciar DTWRecognizer de manera segura.
         
@@ -285,6 +299,7 @@ class DTWRecognizer:
                 resample_len=resample_len,
                 hand_agnostic=hand_agnostic,
                 body_weight=body_weight,
+                template_step=template_step,
             )
             if not recognizer.labels:
                 log.warning("DTWRecognizer no disponible: no se encontraron plantillas.")
@@ -303,67 +318,13 @@ class DTWRecognizer:
             self._labels = []
             return
 
-        for word_dir in sorted(self.data_dir.iterdir()):
-            if not word_dir.is_dir():
-                continue
-
-            # macOS puede entregar el nombre de la carpeta "Ñ" descompuesto
-            # (N + tilde combinable): sin normalizar, esa etiqueta no era
-            # igual a la "Ñ" de senas.py (DYN_NORMAL_LETTERS) y se ordenaba
-            # distinto que en Windows.
-            word = unicodedata.normalize("NFC", word_dir.name)
-            samples: list[np.ndarray] = []
-
-            # 1. Buscar archivos JSON (formato estándar de recolector_dinamico.py)
-            for json_file in sorted(word_dir.glob("*.json")):
-                try:
-                    content = json.loads(json_file.read_text(encoding="utf-8"))
-                    frames = content.get("frames", content.get("sequence", content))
-                    arr = np.array(frames, dtype=np.float64)
-                    if arr.ndim == 2 and arr.shape[1] == N_FEATURES and self.body_weight is not None:
-                        body = np.array(content.get("body_frames", []), dtype=np.float64)
-                        if body.shape != (len(arr), N_BODY_FEATURES):
-                            log.warning(
-                                "Archivo %s sin body_frames validos (%s): se salta",
-                                json_file.name, body.shape,
-                            )
-                            continue
-                        arr = np.hstack([arr, body])
-                    if arr.ndim == 2 and arr.shape[1] == self.n_features and len(arr) > 0:
-                        samples.append(self._prepare(arr))
-                    else:
-                        log.warning(
-                            "Archivo %s con dimensiones no válidas: %s",
-                            json_file.name,
-                            arr.shape,
-                        )
-                except Exception as e:
-                    log.warning("Error al leer %s: %s", json_file, e)
-
-            # 2. Buscar archivos NPY si los hubiera
-            for npy_file in sorted(word_dir.glob("*.npy")):
-                try:
-                    arr = np.load(str(npy_file)).astype(np.float64)
-                    if arr.ndim == 2 and arr.shape[1] == self.n_features and len(arr) > 0:
-                        samples.append(self._prepare(arr))
-                except Exception as e:
-                    log.warning("Error al leer %s: %s", npy_file, e)
-
-            # 3. Buscar archivos CSV si los hubiera
-            for csv_file in sorted(word_dir.glob("*.csv")):
-                try:
-                    arr = np.loadtxt(str(csv_file), delimiter=",").astype(np.float64)
-                    if arr.ndim == 2 and arr.shape[1] == self.n_features and len(arr) > 0:
-                        samples.append(self._prepare(arr))
-                except Exception as e:
-                    log.warning("Error al leer %s: %s", csv_file, e)
-
-            if samples:
-                # extend y no =: en Linux una carpeta "Ñ" compuesta y otra
-                # descompuesta son dos carpetas distintas con la misma
-                # etiqueta, y la segunda borraba las plantillas de la primera.
-                self._templates.setdefault(word, []).extend(samples)
-                log.debug("Cargadas %d plantillas para '%s'", len(samples), word)
+        for word, raw in self._read_raw_templates():
+            if self.template_step > 1:
+                raw = raw[:: self.template_step]
+            # extend y no =: en Linux una carpeta "Ñ" compuesta y otra
+            # descompuesta son dos carpetas distintas con la misma
+            # etiqueta, y la segunda borraba las plantillas de la primera.
+            self._templates.setdefault(word, []).append(self._prepare(raw))
 
         self._labels = sorted(list(self._templates.keys()))
         log.info(
@@ -372,6 +333,119 @@ class DTWRecognizer:
             sum(len(v) for v in self._templates.values()),
             HAVE_NUMBA,
         )
+
+    # ---- lectura de plantillas, con cache --------------------------------
+
+    def _template_files(self) -> list[Path]:
+        return sorted(
+            f for d in self.data_dir.iterdir() if d.is_dir()
+            for f in d.iterdir() if f.suffix in (".json", ".npy", ".csv")
+        )
+
+    def _cache_path(self) -> Path:
+        return self.data_dir / f".cache_plantillas_{self.n_features}.npz"
+
+    def _fingerprint(self, files: list[Path]) -> str:
+        """Cambia si se agrega, borra o modifica cualquier plantilla."""
+        h = hashlib.sha1()
+        for f in files:
+            st = f.stat()
+            h.update(f"{f.relative_to(self.data_dir).as_posix()}|{st.st_size}|{st.st_mtime_ns}\n".encode("utf-8"))
+        return h.hexdigest()
+
+    def _read_raw_templates(self) -> list[tuple[str, np.ndarray]]:
+        """[(etiqueta, secuencia cruda (T, n_features))] de todas las
+        plantillas. Leer cientos de JSON tarda ~1 s en una laptop y varios en
+        la Raspberry Pi; por eso el resultado se guarda en un .npz dentro de
+        data_dir y se reutiliza mientras ninguna plantilla cambie."""
+        files = self._template_files()
+        fingerprint = self._fingerprint(files)
+        cache = self._cache_path()
+        if cache.exists():
+            try:
+                with np.load(cache, allow_pickle=False) as npz:
+                    if str(npz["fingerprint"]) == fingerprint:
+                        labels, lengths, data = npz["labels"], npz["lengths"], npz["data"]
+                        out, start = [], 0
+                        for label, n in zip(labels, lengths):
+                            out.append((str(label), data[start:start + n].astype(np.float64)))
+                            start += int(n)
+                        return out
+            except Exception as e:
+                log.warning("Cache de plantillas ilegible (%s): se vuelven a leer los archivos", e)
+
+        out = []
+        for word_dir in sorted(d for d in self.data_dir.iterdir() if d.is_dir()):
+            # macOS puede entregar el nombre de la carpeta "Ñ" descompuesto
+            # (N + tilde combinable): sin normalizar, esa etiqueta no era
+            # igual a la "Ñ" de senas.py (DYN_NORMAL_LETTERS) y se ordenaba
+            # distinto que en Windows.
+            word = unicodedata.normalize("NFC", word_dir.name)
+            for raw in self._read_dir(word_dir):
+                out.append((word, raw))
+
+        if out:
+            try:
+                tmp = cache.with_name(cache.name + ".tmp.npz")
+                np.savez(
+                    tmp,
+                    fingerprint=np.array(fingerprint),
+                    labels=np.array([w for w, _ in out]),
+                    lengths=np.array([len(a) for _, a in out], dtype=np.int32),
+                    data=np.concatenate([a for _, a in out]).astype(np.float32),
+                )
+                os.replace(tmp, cache)
+            except Exception as e:     # carpeta de solo lectura, disco lleno...
+                log.info("No se pudo guardar el cache de plantillas: %s", e)
+        return out
+
+    def _read_dir(self, word_dir: Path) -> list[np.ndarray]:
+        samples: list[np.ndarray] = []
+
+        # 1. Buscar archivos JSON (formato estándar de recolector_dinamico.py)
+        for json_file in sorted(word_dir.glob("*.json")):
+            try:
+                content = json.loads(json_file.read_text(encoding="utf-8"))
+                frames = content.get("frames", content.get("sequence", content))
+                arr = np.array(frames, dtype=np.float64)
+                if arr.ndim == 2 and arr.shape[1] == N_FEATURES and self.body_weight is not None:
+                    body = np.array(content.get("body_frames", []), dtype=np.float64)
+                    if body.shape != (len(arr), N_BODY_FEATURES):
+                        log.warning(
+                            "Archivo %s sin body_frames validos (%s): se salta",
+                            json_file.name, body.shape,
+                        )
+                        continue
+                    arr = np.hstack([arr, body])
+                if arr.ndim == 2 and arr.shape[1] == self.n_features and len(arr) > 0:
+                    samples.append(arr)
+                else:
+                    log.warning(
+                        "Archivo %s con dimensiones no válidas: %s",
+                        json_file.name,
+                        arr.shape,
+                    )
+            except Exception as e:
+                log.warning("Error al leer %s: %s", json_file, e)
+
+        # 2. Buscar archivos NPY si los hubiera
+        for npy_file in sorted(word_dir.glob("*.npy")):
+            try:
+                arr = np.load(str(npy_file)).astype(np.float64)
+                if arr.ndim == 2 and arr.shape[1] == self.n_features and len(arr) > 0:
+                    samples.append(arr)
+            except Exception as e:
+                log.warning("Error al leer %s: %s", npy_file, e)
+
+        # 3. Buscar archivos CSV si los hubiera
+        for csv_file in sorted(word_dir.glob("*.csv")):
+            try:
+                arr = np.loadtxt(str(csv_file), delimiter=",").astype(np.float64)
+                if arr.ndim == 2 and arr.shape[1] == self.n_features and len(arr) > 0:
+                    samples.append(arr)
+            except Exception as e:
+                log.warning("Error al leer %s: %s", csv_file, e)
+        return samples
 
     @property
     def labels(self) -> list[str]:

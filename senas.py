@@ -160,18 +160,40 @@ DYN_NQ_PAIR_MIN_MARGIN = 0.22
 # cargarlo desde disco cada vez. Se cachea una sola vez por proceso.
 _dtw_recognizer_singleton: Optional["DTWRecognizer"] = None
 _dtw_recognizer_load_attempted = False
+# La ventana precarga los reconocedores en un hilo al abrir (preload_models),
+# para que Iniciar no congele la ventana; este candado evita cargarlos dos veces.
+_models_lock = threading.RLock()
+
+# Plantillas de letras dinamicas a ~15 fps (1 de cada 2 frames de las de 30
+# fps): el DTW contra las 689 plantillas bajo de 94 a 27 ms en la laptop.
+# Medido con 150 plantillas, cada una contra las demas: letra correcta 146 ->
+# 145, bien escritas 142 -> 140, mal escritas 1 -> 1. La consulta se toma a
+# la misma frecuencia (LETTER_DTW_FPS), que es mas o menos lo que procesa una
+# Raspberry Pi. Las palabras se quedan a 30 fps: su DTW ya es barato (12 ms)
+# y a 15 fps bajaban de 56/59 a 54/59 con personas nuevas.
+LETTER_TEMPLATE_STEP = 2
+TEMPLATE_FPS = 30.0
+LETTER_DTW_FPS = TEMPLATE_FPS / LETTER_TEMPLATE_STEP
 
 
 def _get_dtw_recognizer() -> Optional["DTWRecognizer"]:
     global _dtw_recognizer_singleton, _dtw_recognizer_load_attempted
-    if not _dtw_recognizer_load_attempted:
-        _dtw_recognizer_load_attempted = True
-        if DTWRecognizer is not None:
-            try:
-                _dtw_recognizer_singleton = DTWRecognizer.try_load()
-            except Exception:
-                logging.getLogger("sign_translator").exception("Error cargando DTWRecognizer")
+    with _models_lock:
+        if not _dtw_recognizer_load_attempted:
+            _dtw_recognizer_load_attempted = True
+            if DTWRecognizer is not None:
+                try:
+                    _dtw_recognizer_singleton = DTWRecognizer.try_load(template_step=LETTER_TEMPLATE_STEP)
+                except Exception:
+                    logging.getLogger("sign_translator").exception("Error cargando DTWRecognizer")
     return _dtw_recognizer_singleton
+
+
+def preload_models() -> None:
+    """Carga las plantillas (letras y palabras) y los perfiles de palabras.
+    La ventana lo llama en un hilo al abrir."""
+    _get_dtw_recognizer()
+    word_profiles()
 
 
 # --------------------------------------------------------------------------- #
@@ -241,18 +263,19 @@ def _get_word_recognizers() -> Optional[tuple["DTWRecognizer", "DTWRecognizer"]]
     o None si no hay. El de solo manos sirve para comparar contra las letras
     en la misma escala; el de cuerpo, para decidir cual palabra."""
     global _word_recognizers, _word_recognizers_load_attempted
-    if not _word_recognizers_load_attempted:
-        _word_recognizers_load_attempted = True
-        if DTWRecognizer is not None and DEFAULT_WORDS_DIR is not None and DEFAULT_WORDS_DIR.is_dir():
-            try:
-                hands_only = DTWRecognizer(data_dir=DEFAULT_WORDS_DIR, auto_save_labels=False)
-                with_body = DTWRecognizer(
-                    data_dir=DEFAULT_WORDS_DIR, auto_save_labels=False, body_weight=WORD_BODY_WEIGHT
-                )
-                if with_body.labels:
-                    _word_recognizers = (hands_only, with_body)
-            except Exception:
-                logging.getLogger("sign_translator").exception("Error cargando las plantillas de palabras")
+    with _models_lock:
+        if not _word_recognizers_load_attempted:
+            _word_recognizers_load_attempted = True
+            if DTWRecognizer is not None and DEFAULT_WORDS_DIR is not None and DEFAULT_WORDS_DIR.is_dir():
+                try:
+                    hands_only = DTWRecognizer(data_dir=DEFAULT_WORDS_DIR, auto_save_labels=False)
+                    with_body = DTWRecognizer(
+                        data_dir=DEFAULT_WORDS_DIR, auto_save_labels=False, body_weight=WORD_BODY_WEIGHT
+                    )
+                    if with_body.labels:
+                        _word_recognizers = (hands_only, with_body)
+                except Exception:
+                    logging.getLogger("sign_translator").exception("Error cargando las plantillas de palabras")
     return _word_recognizers
 
 
@@ -302,6 +325,11 @@ _word_profiles: Optional[dict[str, SignStats]] = None
 def word_profiles() -> dict[str, SignStats]:
     """{PALABRA como se muestra: perfil mediano de sus plantillas}. Las
     plantillas vienen de videos a ~30 fps (duracion = frames / 30)."""
+    with _models_lock:
+        return _compute_word_profiles()
+
+
+def _compute_word_profiles() -> dict[str, SignStats]:
     global _word_profiles
     if _word_profiles is None:
         _word_profiles = {}
@@ -344,6 +372,15 @@ def word_commit_decision(topk: list[tuple[str, float]], best_distance: float) ->
     return True, margin, ""
 
 
+def _is_raspberry_pi() -> bool:
+    try:
+        return "raspberry pi" in Path("/proc/device-tree/model").read_text(errors="ignore").lower()
+    except OSError:
+        return False
+
+
+IS_RASPBERRY_PI = _is_raspberry_pi()
+
 APP_NAME = "SignTranslator"
 APP_ORG = "OpenLSM"
 APP_VERSION = "4.0-lsm-automatico"
@@ -382,9 +419,14 @@ DEFAULT_CONFIG = {
     # tiempo de CPU y solo se usa el alfabeto.
     "body_tracking": True,
     "draw_body": True,
-    # "full" (mas estable) o "lite" (mas rapido, para la Raspberry Pi si hace
-    # falta). Ver DEFAULT_POSE_MODEL en body_tracker.py.
-    "pose_model": DEFAULT_POSE_MODEL,
+    # "full" (mas estable) o "lite" (mas rapido). En la Raspberry Pi va
+    # "lite" por defecto. Ver DEFAULT_POSE_MODEL en body_tracker.py.
+    "pose_model": "lite" if IS_RASPBERRY_PI else DEFAULT_POSE_MODEL,
+    # La pose corre en su propio hilo, en paralelo a las manos, y cada frame
+    # usa el ultimo cuerpo disponible (a lo mas un frame atras; hombros y
+    # boca casi no se mueven en ese tiempo). Medido en la laptop: manos +
+    # pose en serie 16.4 ms por frame, en paralelo ~8 ms (lo de las manos).
+    "pose_async": True,
 }
 
 # Rangos validos al cargar config.json / CLI. Los que tienen slider usan su
@@ -449,6 +491,7 @@ class AppConfig:
     body_tracking: bool = DEFAULT_CONFIG["body_tracking"]
     draw_body: bool = DEFAULT_CONFIG["draw_body"]
     pose_model: str = DEFAULT_CONFIG["pose_model"]
+    pose_async: bool = DEFAULT_CONFIG["pose_async"]
 
     @classmethod
     def load(cls, json_path: Optional[Path] = None) -> "AppConfig":
@@ -1078,6 +1121,53 @@ class InferenceMetrics:
     last_inference_ts: float = field(default_factory=time.time)
 
 
+class AsyncBodyTracker:
+    """BodyTracker en su propio hilo. detect() le deja el frame y devuelve
+    sin esperar el ultimo cuerpo que ya termino (de uno o dos frames atras),
+    asi la pose corre en paralelo a las manos en otro nucleo: MediaPipe
+    suelta el GIL mientras infiere. Medido en la laptop: manos + pose en serie
+    16.4 ms por frame; con la pose aparte, lo de las manos (~8 ms). BodyTracker
+    sigue usando su reloj real (ver su docstring)."""
+
+    def __init__(self, tracker: BodyTracker):
+        self._tracker = tracker
+        self._cond = threading.Condition()
+        self._pending = None
+        self._latest: Optional[BodyDetection] = None
+        self._stopped = False
+        self._thread = threading.Thread(target=self._run, name="pose", daemon=True)
+        self._thread.start()
+
+    def detect(self, mp_image) -> Optional[BodyDetection]:
+        with self._cond:
+            self._pending = mp_image      # si habia uno sin procesar, se reemplaza
+            self._cond.notify()
+            return self._latest
+
+    def _run(self) -> None:
+        while True:
+            with self._cond:
+                while self._pending is None and not self._stopped:
+                    self._cond.wait()
+                if self._stopped:
+                    return
+                image, self._pending = self._pending, None
+            try:
+                body = self._tracker.detect(image)
+            except Exception:
+                log.exception("MediaPipe Pose falló")
+                body = None
+            with self._cond:
+                self._latest = body
+
+    def close(self) -> None:
+        with self._cond:
+            self._stopped = True
+            self._cond.notify()
+        self._thread.join(timeout=2.0)
+        self._tracker.close()
+
+
 class HandTrackingThread(QThread):
     
     change_pixmap_signal = pyqtSignal(np.ndarray)
@@ -1694,7 +1784,13 @@ class HandTrackingThread(QThread):
                 # tambien refleja el bloque de cuerpo.
                 seq = mirror_and_swap_hands(seq)
             hands = seq[:, :126]
-            letter_dist = self._dtw_recognizer.compute_distances(hands) if self._dtw_recognizer else {}
+            # Letras: consulta a ~LETTER_DTW_FPS, como sus plantillas. En una
+            # laptop a 30 fps se toma 1 de cada 2 frames; en la Pi, que
+            # procesa ~15 fps, la secuencia completa.
+            fps = len(hands) / duration_s if duration_s > 0.2 else TEMPLATE_FPS
+            letter_step = max(1, int(round(fps / LETTER_DTW_FPS)))
+            letter_query = hands[::letter_step] if len(hands) >= 2 * letter_step else hands
+            letter_dist = self._dtw_recognizer.compute_distances(letter_query) if self._dtw_recognizer else {}
             best_letter = min(letter_dist.values(), default=float("inf"))
             best_word = float("inf")
             if self._word_recognizers is not None:
@@ -2050,8 +2146,10 @@ class HandTrackingThread(QThread):
             # siguen funcionando igual, solo sin esqueleto.
             if self._cfg.body_tracking:
                 try:
-                    self._body_tracker = BodyTracker(self._cfg.pose_model, models_dir)
-                    log.info("MediaPipe Pose Landmarker (%s) listo.", self._cfg.pose_model)
+                    tracker = BodyTracker(self._cfg.pose_model, models_dir)
+                    self._body_tracker = AsyncBodyTracker(tracker) if self._cfg.pose_async else tracker
+                    log.info("MediaPipe Pose Landmarker (%s%s) listo.", self._cfg.pose_model,
+                             ", en paralelo" if self._cfg.pose_async else "")
                 except Exception:
                     log.exception("No se pudo iniciar MediaPipe Pose; se sigue sin esqueleto del cuerpo")
                     self._body_tracker = None
@@ -2398,6 +2496,10 @@ class SignLanguageApp(QMainWindow):
 
         self._build_ui()
         self._restore_window_state()
+        # Las plantillas se cargan en segundo plano mientras la persona se
+        # acomoda, para que Iniciar no congele la ventana (en la Raspberry Pi,
+        # la primera vez, varios segundos).
+        threading.Thread(target=preload_models, name="precarga", daemon=True).start()
 
     # ---- UI ---------------------------------------------------------------
 
@@ -2654,6 +2756,11 @@ class SignLanguageApp(QMainWindow):
     # ---- estado visual ----------------------------------------------------
 
     def _set_sign(self, text: str, color: str, kind: str) -> None:
+        # Se llama en cada frame: setStyleSheet obliga a Qt a recalcular el
+        # estilo, asi que solo se toca si algo cambio.
+        if (text, color, kind) == getattr(self, "_sign_state", None):
+            return
+        self._sign_state = (text, color, kind)
         size = 64 if len(text) <= 2 else (40 if len(text) <= 9 else 30)
         self.sign_label.setText(text)
         self.sign_label.setStyleSheet(f"font-size: {size}px; font-weight: 800; color: {color};")
@@ -3025,7 +3132,9 @@ class SignLanguageApp(QMainWindow):
             self._set_sign("—", COLORS["muted"], "Esperando")
 
     def update_hands(self, detections: FrameDetections) -> None:
-        self.status_hands.setText(f"✋ Manos: {detections.num_hands}")
+        text = f"✋ Manos: {detections.num_hands}"
+        if self.status_hands.text() != text:
+            self.status_hands.setText(text)
 
     def update_metrics(self, m: InferenceMetrics) -> None:
         self.status_fps.setText(f"FPS: {m.fps:.1f}")
@@ -3035,15 +3144,19 @@ class SignLanguageApp(QMainWindow):
         if cv_img is None or cv_img.size == 0:
             return
         self._last_annotated_frame = cv_img
-        rgb = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
-        h, w, ch = rgb.shape
-        qt_img = QImage(rgb.data, w, h, ch * w, QImage.Format.Format_RGB888).copy()
-        scaled = qt_img.scaled(
-            self.image_label.width(), self.image_label.height(),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        self.image_label.setPixmap(QPixmap.fromImage(scaled))
+        # Escalado con OpenCV (vectorizado, rapido en ARM) y QImage en BGR
+        # directo: sin la conversion a RGB ni el escalado suave de Qt, que en
+        # la Raspberry Pi se comian tiempo del hilo de la ventana en cada frame.
+        h, w = cv_img.shape[:2]
+        box_w = max(1, self.image_label.width() - 8)
+        box_h = max(1, self.image_label.height() - 8)
+        scale = min(box_w / w, box_h / h)
+        if abs(scale - 1.0) > 0.01:
+            cv_img = cv2.resize(cv_img, (max(1, int(w * scale)), max(1, int(h * scale))),
+                                interpolation=cv2.INTER_LINEAR)
+        img = np.ascontiguousarray(cv_img)
+        qt_img = QImage(img.data, img.shape[1], img.shape[0], img.strides[0], QImage.Format.Format_BGR888)
+        self.image_label.setPixmap(QPixmap.fromImage(qt_img))
 
 
     def on_letter_committed(self, letter: str) -> None:

@@ -101,6 +101,21 @@ La línea punteada del video es la **línea de reposo** (a la altura del ombligo
 - **Texto traducido:** las palabras terminadas en gris, la palabra en curso en blanco y, subrayadas en azul, las letras que la seña en curso todavía puede cambiar. Botones para borrar, terminar la palabra, leer en voz alta, guardar y limpiar.
 - **Retroalimentación:** consejos en vivo ("No veo tus hombros", "¿B o P? Ajusta la forma de los dedos", "Para deletrear usa una sola mano", "Mano muy cerca de la cámara") y el resultado de cada seña con movimiento. Si una palabra no sale, compara cómo la hiciste con cómo se hace según sus plantillas: por ejemplo, "¿HOLA o MAMÁ? Tu mano quedó frente al pecho; HOLA se hace a la altura de la cabeza", "AYUDA se hace con las dos manos" o "La hiciste muy rápido".
 
+### Rendimiento (Raspberry Pi 5)
+
+Medido en la laptop de desarrollo; en la Pi 5 todo es unas 3-5 veces más lento, en la misma proporción.
+
+| Qué | Antes | Ahora |
+|---|---|---|
+| Proceso por cuadro (manos + cuerpo) | 16.4 ms, uno tras otro | ~8 ms: la pose corre en su propio hilo, en paralelo (`"pose_async": true`) |
+| Modelo de pose en la Raspberry Pi | full | lite (se detecta la Pi sola) |
+| Reconocer una seña con movimiento | 90 ms | 30 ms: las plantillas de letras se comparan a ~15 cuadros por segundo |
+| Cargar las plantillas al abrir | 1.75 s | 0.06 s: se guardan en un caché (`.cache_plantillas_*.npz`, se regenera si cambian) y se cargan en segundo plano al abrir la ventana |
+| Compilar el DTW (Numba) | en cada arranque | solo la primera vez (`cache=True`) |
+| Dibujar el video en la ventana | conversión a RGB + escalado suave de Qt | escalado con OpenCV y la imagen en BGR directo |
+
+Pasando los 15 videos de prueba por la app como cámara, con pose lite, a 30 y a 15 cuadros por segundo, las 15 palabras salen bien en ambos casos. El único costo medido: de 90 letras dinámicas de prueba se escriben 82 en vez de 84 (si se quiere la precisión completa, `LETTER_TEMPLATE_STEP = 1` en `senas.py`).
+
 ### Crear las plantillas de palabras desde videos
 
 Pon los videos en una carpeta con una subcarpeta por palabra (el nombre de la subcarpeta es la palabra; `PORFAVOR` se guarda como `POR_FAVOR` y se muestra como "POR FAVOR"):
