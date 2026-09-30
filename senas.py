@@ -7,7 +7,10 @@ import logging
 import os
 import platform
 import queue
+import re
+import shutil
 import statistics
+import subprocess
 import sys
 import threading
 import time
@@ -28,9 +31,13 @@ from PyQt6.QtCore import (
 from PyQt6.QtGui import QImage, QPixmap, QAction, QKeySequence
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QPushButton, QMessageBox, QSlider, QFrame, QComboBox,
-    QFileDialog, QPlainTextEdit, QStatusBar, QToolBar, QSizePolicy,
-    QCheckBox,
+    QLabel, QPushButton, QMessageBox, QSlider, QComboBox,
+    QFileDialog, QStatusBar, QSizePolicy, QCheckBox,
+)
+
+from interfaz_lsm import (
+    COLORS, PHASE_STYLE, STYLESHEET, Card, CandidateBars, FeedbackPanel, GuideDialog, Pill,
+    SettingsDialog, big_button, feedback_for_result, guidance_feedback, how_to_sign, sentence_html,
 )
 
 try:
@@ -40,34 +47,33 @@ except ImportError:
     raise
 
 from sign_classifier import SignClassifier, PredictionSmoother, normalize_keypoints, hand_to_feature_vector
+from body_tracker import (
+    BodyDetection, BodyTracker, DEFAULT_POSE_MODEL, POSE_MODELS, body_location_features,
+    draw_body_skeleton, draw_rest_line, hands_in_signing_space, rest_line_y,
+)
 
 try:
-    from segmentador_automatico import AutoSegmenter, MIN_SEQUENCE_MS as DYN_STANDALONE_MIN_SEQUENCE_MS
-    from dtw_recognizer import DTWRecognizer
+    from segmentador_automatico import (
+        AutoSegmenter, MIN_SEQUENCE_MS as DYN_STANDALONE_MIN_SEQUENCE_MS,
+        PALABRAS_MAX_SEQUENCE_MS, PALABRAS_MIN_SEQUENCE_MS, PALABRAS_REST_MS_TO_END,
+    )
+    from dtw_recognizer import (
+        DEFAULT_WORDS_DIR, WORD_BODY_WEIGHT, WORD_TEMPERATURE, DTWRecognizer, distances_to_topk,
+        mirror_and_swap_hands,
+    )
 except ImportError as e:
     # Alfabeto dinamico (J,K,Ñ,Q,X,Z): opcional. Si falta fastdtw/scipy o los
     # archivos aun no existen, el alfabeto estatico sigue funcionando igual
     # que antes; el modo dinamico simplemente queda deshabilitado.
     AutoSegmenter = None
     DTWRecognizer = None
+    mirror_and_swap_hands = None
+    distances_to_topk = None
     DYN_STANDALONE_MIN_SEQUENCE_MS = 170
+    PALABRAS_REST_MS_TO_END, PALABRAS_MIN_SEQUENCE_MS, PALABRAS_MAX_SEQUENCE_MS = 400, 300, 8000
+    DEFAULT_WORDS_DIR, WORD_BODY_WEIGHT, WORD_TEMPERATURE = None, 4.0, 0.5
     logging.getLogger("sign_translator").warning(
         "Alfabeto dinamico no disponible (%s). Instala fastdtw/scipy para habilitarlo.", e
-    )
-
-try:
-    from body_tracker import BodyTracker, draw_body_skeleton, body_location_features
-except ImportError as e:
-    # Esqueleto de pose: puramente visual/diagnostico (checkbox "Dibujar
-    # esqueleto (Pose)"), ver body_tracker.py. NO alimenta al clasificador ni
-    # al segmentador de ninguna forma - si falta este modulo o su modelo, el
-    # alfabeto estatico y dinamico siguen funcionando exactamente igual, el
-    # checkbox simplemente no hace nada.
-    BodyTracker = None
-    draw_body_skeleton = None
-    body_location_features = None
-    logging.getLogger("sign_translator").warning(
-        "Esqueleto de pose no disponible (%s). body_tracker.py es opcional.", e
     )
 
 # --------------------------------------------------------------------------- #
@@ -154,23 +160,230 @@ DYN_NQ_PAIR_MIN_MARGIN = 0.22
 # cargarlo desde disco cada vez. Se cachea una sola vez por proceso.
 _dtw_recognizer_singleton: Optional["DTWRecognizer"] = None
 _dtw_recognizer_load_attempted = False
+# La ventana precarga los reconocedores en un hilo al abrir (preload_models),
+# para que Iniciar no congele la ventana; este candado evita cargarlos dos veces.
+_models_lock = threading.RLock()
+
+# Plantillas de letras dinamicas a ~15 fps (1 de cada 2 frames de las de 30
+# fps): el DTW contra las 689 plantillas bajo de 94 a 27 ms en la laptop.
+# Medido con 150 plantillas, cada una contra las demas: letra correcta 146 ->
+# 145, bien escritas 142 -> 140, mal escritas 1 -> 1. La consulta se toma a
+# la misma frecuencia (LETTER_DTW_FPS), que es mas o menos lo que procesa una
+# Raspberry Pi. Las palabras se quedan a 30 fps: su DTW ya es barato (12 ms)
+# y a 15 fps bajaban de 56/59 a 54/59 con personas nuevas.
+LETTER_TEMPLATE_STEP = 2
+TEMPLATE_FPS = 30.0
+LETTER_DTW_FPS = TEMPLATE_FPS / LETTER_TEMPLATE_STEP
 
 
 def _get_dtw_recognizer() -> Optional["DTWRecognizer"]:
     global _dtw_recognizer_singleton, _dtw_recognizer_load_attempted
-    if not _dtw_recognizer_load_attempted:
-        _dtw_recognizer_load_attempted = True
-        if DTWRecognizer is not None:
-            try:
-                _dtw_recognizer_singleton = DTWRecognizer.try_load()
-            except Exception:
-                logging.getLogger("sign_translator").exception("Error cargando DTWRecognizer")
+    with _models_lock:
+        if not _dtw_recognizer_load_attempted:
+            _dtw_recognizer_load_attempted = True
+            if DTWRecognizer is not None:
+                try:
+                    _dtw_recognizer_singleton = DTWRecognizer.try_load(template_step=LETTER_TEMPLATE_STEP)
+                except Exception:
+                    logging.getLogger("sign_translator").exception("Error cargando DTWRecognizer")
     return _dtw_recognizer_singleton
 
 
+def preload_models() -> None:
+    """Carga las plantillas (letras y palabras) y los perfiles de palabras.
+    La ventana lo llama en un hilo al abrir."""
+    _get_dtw_recognizer()
+    word_profiles()
+
+
+# --------------------------------------------------------------------------- #
+# Modo automatico: letras estaticas, letras dinamicas y palabras completas a
+# la vez, sin botones para cambiar de modo (es el modo de la ventana).
+#
+# Una ACTIVIDAD dura desde que una mano sube sobre la linea de reposo (pose,
+# ver body_tracker.rest_line_y) hasta que baja; sin hombros en cuadro, desde
+# que aparece la mano hasta que sale. Es el mismo corte que
+# segmentador_automatico.py --modo palabras (constantes PALABRAS_*).
+#   - Letras estaticas: el clasificador de siempre corre en cada frame, pero
+#     solo fija la letra si la mano esta QUIETA (AUTO_STATIC_MAX_SPEED), arriba
+#     de la linea de reposo y es la UNICA mano arriba (el alfabeto es de una
+#     mano; POR FAVOR y AYUDA son de dos).
+#   - Al bajar las manos, la actividad completa se compara con DTW contra las
+#     letras dinamicas (datos_dinamicas/) y las palabras
+#     (datos_palabras_dinamicas/).
+#     La categoria se decide comparando SOLO las manos (el mismo vector de
+#     126 en las dos): es palabra si su plantilla mas cercana esta a menos de
+#     AUTO_WORD_PREFERENCE veces la distancia de la letra mas cercana.
+#   - Letra: solo si en la actividad no se fijo ninguna letra estatica (si
+#     se fijo, fue deletreo); se aplica dynamic_commit_decision. Las letras
+#     con movimiento (J, K, Ñ, Q, X, Z) se hacen solas: subir la mano, hacer
+#     la letra y bajarla.
+#   - Palabra: el DTW con la ubicacion respecto al cuerpo decide cual y
+#     word_commit_decision si se escribe. Muchas palabras tienen una pausa con
+#     la mano quieta (HOLA en la frente, medio segundo) en la que el
+#     clasificador estatico alcanza a fijar una letra: si en la actividad se
+#     fijaron a lo mas AUTO_MAX_RETRACTED_LETTERS, se borran y se escribe la
+#     palabra. Con mas letras fue deletreo y se respeta.
+# --------------------------------------------------------------------------- #
+
+# Mano quieta para fijar una letra estatica: velocidad media de la muneca en
+# los ultimos AUTO_SPEED_WINDOW frames, en tamanos de mano (muneca -> base del
+# dedo medio) por segundo, para que no dependa de la distancia a la camara.
+AUTO_STATIC_MAX_SPEED = 1.5
+AUTO_SPEED_WINDOW = 6
+# Palabra si d_palabra < AUTO_WORD_PREFERENCE * d_letra (solo manos). Con
+# personas que no estan en las plantillas (cada persona de los videos contra
+# las otras dos), la distancia a las palabras crece: con 1.2, 55/59 palabras
+# quedaban en su categoria; con 1.4, 58/59. Las letras (cada plantilla contra
+# las demas): 687/689 con 1.2, ~680/689 con 1.4. Se prefiere 1.4 porque las
+# palabras fallaban justo con gente nueva.
+AUTO_WORD_PREFERENCE = 1.4
+# Letras estaticas que una palabra puede reemplazar (ver arriba). Medido
+# pasando los videos por la app: HOLA fijaba una "R" en la pausa de la frente.
+AUTO_MAX_RETRACTED_LETTERS = 2
+
+# Palabras (DTW con cuerpo, peso WORD_BODY_WEIGHT; confianza con
+# WORD_TEMPERATURE). Medido reconociendo a cada persona de los videos solo con
+# las plantillas de las otras dos: 56/59 bien. Con margen >= 0.15 se escriben
+# 54 de esas 56 y no se agrega ningun error (los 3 errores, AYUDA<->GRACIAS,
+# tienen margen alto y ningun umbral los separa). La regla anterior (margen
+# 0.30 sin calibrar y distancia <= 10) solo escribia 49: era el "titubeo".
+WORD_MIN_MARGIN = 0.15
+# Por encima de esta distancia DTW el movimiento no se parece a ninguna
+# palabra. Con personas nuevas la mayor distancia de una palabra bien
+# reconocida fue 11.1 (con las mismas personas, 9.4).
+WORD_MAX_DISTANCE = 16.0
+
+_word_recognizers: Optional[tuple["DTWRecognizer", "DTWRecognizer"]] = None
+_word_recognizers_load_attempted = False
+
+
+def _get_word_recognizers() -> Optional[tuple["DTWRecognizer", "DTWRecognizer"]]:
+    """(solo manos, manos + cuerpo) sobre las mismas plantillas de palabras,
+    o None si no hay. El de solo manos sirve para comparar contra las letras
+    en la misma escala; el de cuerpo, para decidir cual palabra."""
+    global _word_recognizers, _word_recognizers_load_attempted
+    with _models_lock:
+        if not _word_recognizers_load_attempted:
+            _word_recognizers_load_attempted = True
+            if DTWRecognizer is not None and DEFAULT_WORDS_DIR is not None and DEFAULT_WORDS_DIR.is_dir():
+                try:
+                    hands_only = DTWRecognizer(data_dir=DEFAULT_WORDS_DIR, auto_save_labels=False)
+                    with_body = DTWRecognizer(
+                        data_dir=DEFAULT_WORDS_DIR, auto_save_labels=False, body_weight=WORD_BODY_WEIGHT
+                    )
+                    if with_body.labels:
+                        _word_recognizers = (hands_only, with_body)
+                except Exception:
+                    logging.getLogger("sign_translator").exception("Error cargando las plantillas de palabras")
+    return _word_recognizers
+
+
+@dataclass
+class SignStats:
+    """Donde y como se hizo una sena con movimiento, en anchos de hombro (ver
+    body_location_features): muneca respecto al centro de los hombros (dy > 0
+    es hacia abajo), distancia de la punta del indice a la boca, fraccion de
+    frames con dos manos y duracion. La interfaz compara esto con el perfil de
+    cada palabra para decir que corregir (interfaz_lsm.compare_to)."""
+    wrist_dx: float = 0.0
+    wrist_dy: float = 0.0
+    tip_mouth: float = 9.0
+    two_hands: float = 0.0
+    duration_s: float = 0.0
+    has_body: bool = False
+
+
+def sign_stats(sequence: np.ndarray, duration_s: float) -> SignStats:
+    """SignStats de una secuencia cruda (T, 126 + 9). La mano que se mide es
+    la que aparece en mas frames con cuerpo visible."""
+    seq = np.asarray(sequence, dtype=np.float64)
+    hands, body = seq[:, :126], seq[:, 126:135]
+    left = np.abs(hands[:, :63]).sum(axis=1) > 0
+    right = np.abs(hands[:, 63:126]).sum(axis=1) > 0
+    two = float(np.mean(left & right)) if len(seq) else 0.0
+    with_body = body[:, 8] > 0
+    use_left = (left & with_body).sum() >= (right & with_body).sum()
+    mask, off = ((left & with_body), 0) if use_left else ((right & with_body), 4)
+    if not mask.any():
+        return SignStats(two_hands=two, duration_s=duration_s)
+    wrist = body[mask, off:off + 2]
+    tip = body[mask, off + 2:off + 4]
+    return SignStats(
+        wrist_dx=float(np.median(wrist[:, 0])),
+        wrist_dy=float(np.median(wrist[:, 1])),
+        tip_mouth=float(np.median(np.linalg.norm(tip, axis=1))),
+        two_hands=two,
+        duration_s=duration_s,
+        has_body=True,
+    )
+
+
+_word_profiles: Optional[dict[str, SignStats]] = None
+
+
+def word_profiles() -> dict[str, SignStats]:
+    """{PALABRA como se muestra: perfil mediano de sus plantillas}. Las
+    plantillas vienen de videos a ~30 fps (duracion = frames / 30)."""
+    with _models_lock:
+        return _compute_word_profiles()
+
+
+def _compute_word_profiles() -> dict[str, SignStats]:
+    global _word_profiles
+    if _word_profiles is None:
+        _word_profiles = {}
+        recognizers = _get_word_recognizers()
+        if recognizers is not None:
+            with_body = recognizers[1]
+            for label, templates in with_body._templates.items():
+                per = []
+                for tmpl in templates:
+                    raw = np.array(tmpl, dtype=np.float64)
+                    raw[:, 126:] /= WORD_BODY_WEIGHT     # las plantillas guardan el cuerpo ya ponderado
+                    per.append(sign_stats(raw, len(raw) / 30.0))
+                with_b = [s for s in per if s.has_body] or per
+                _word_profiles[word_display(label)] = SignStats(
+                    wrist_dx=float(np.median([s.wrist_dx for s in with_b])),
+                    wrist_dy=float(np.median([s.wrist_dy for s in with_b])),
+                    tip_mouth=float(np.median([s.tip_mouth for s in with_b])),
+                    two_hands=float(np.median([s.two_hands for s in per])),
+                    duration_s=float(np.median([s.duration_s for s in per])),
+                    has_body=any(s.has_body for s in per),
+                )
+    return _word_profiles
+
+
+def word_display(label: str) -> str:
+    """Etiqueta de carpeta -> texto: POR_FAVOR -> POR FAVOR."""
+    return label.replace("_", " ")
+
+
+def word_commit_decision(topk: list[tuple[str, float]], best_distance: float) -> tuple[bool, float, str]:
+    """Si se escribe la palabra top-1 del DTW con cuerpo. Devuelve
+    (se_escribe, margen sobre la 2.a, motivo si no se escribe)."""
+    if not topk:
+        return False, 0.0, "sin candidatos"
+    margin = topk[0][1] - topk[1][1] if len(topk) > 1 else topk[0][1]
+    if best_distance > WORD_MAX_DISTANCE:
+        return False, margin, f"no se parece a ninguna palabra (distancia {best_distance:.1f})"
+    if margin < WORD_MIN_MARGIN:
+        return False, margin, f"margen {margin * 100:.0f}pp < {WORD_MIN_MARGIN * 100:.0f}pp"
+    return True, margin, ""
+
+
+def _is_raspberry_pi() -> bool:
+    try:
+        return "raspberry pi" in Path("/proc/device-tree/model").read_text(errors="ignore").lower()
+    except OSError:
+        return False
+
+
+IS_RASPBERRY_PI = _is_raspberry_pi()
+
 APP_NAME = "SignTranslator"
 APP_ORG = "OpenLSM"
-APP_VERSION = "3.3-lsm-alfabeto-dinamico"
+APP_VERSION = "4.0-lsm-automatico"
 
 HAND_MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
@@ -183,19 +396,68 @@ DEFAULT_CONFIG = {
     "max_num_hands": 2,
     "min_detection_confidence": 0.5,
     "min_tracking_confidence": 0.5,
-    "model_complexity": 1,                 
     "smoothing_window": 7,
     "stable_frames_to_commit": 12,
     "no_hand_frames_for_space": 25,
-    "keypoint_buffer_size": 30,           
+    # Alfabeto estatico: frames con otra letra (o sin mano) para poder volver
+    # a confirmar la misma letra (LL, RR, EE): "relajar la mano un instante".
+    "repeat_release_frames": 8,
+    # Sliders de confianza minima y margen del alfabeto estatico (se guardan).
+    "min_letter_confidence": 0.55,
+    "min_letter_margin": 0.15,
+    # Mano que deletrea, la de la PERSONA: "Right" | "Left" (ver
+    # MEDIAPIPE_LABEL_OF_HAND para como se traduce a la etiqueta de MediaPipe).
+    "dominant_hand": "Right",
+    "speak_words": False,
+    "keypoint_buffer_size": 30,
     "queue_maxsize": 1,
     "watchdog_timeout_s": 5.0,
     "draw_landmarks": True,
     "draw_connections": True,
-    # Puramente visual/diagnostico (ver body_tracker.py). Default False: es
-    # opcional, no debe costarle CPU/descarga de modelo a quien no lo activa.
-    "draw_body_skeleton": False,
+    # Esqueleto del cuerpo (MediaPipe Pose, ver body_tracker.py). En False no
+    # se carga el modelo de pose: util si en la Raspberry Pi hace falta el
+    # tiempo de CPU y solo se usa el alfabeto.
+    "body_tracking": True,
+    "draw_body": True,
+    # "full" (mas estable) o "lite" (mas rapido). En la Raspberry Pi va
+    # "lite" por defecto. Ver DEFAULT_POSE_MODEL en body_tracker.py.
+    "pose_model": "lite" if IS_RASPBERRY_PI else DEFAULT_POSE_MODEL,
+    # La pose corre en su propio hilo, en paralelo a las manos, y cada frame
+    # usa el ultimo cuerpo disponible (a lo mas un frame atras; hombros y
+    # boca casi no se mueven en ese tiempo). Medido en la laptop: manos +
+    # pose en serie 16.4 ms por frame, en paralelo ~8 ms (lo de las manos).
+    "pose_async": True,
 }
+
+# Rangos validos al cargar config.json / CLI. Los que tienen slider usan su
+# mismo rango. queue_maxsize >= 1: con 0 la cola seria infinita.
+CONFIG_RANGES: dict[str, tuple[float, float]] = {
+    "camera_index": (0, 63),
+    "max_num_hands": (1, 4),
+    "min_detection_confidence": (0.10, 0.95),
+    "min_tracking_confidence": (0.0, 1.0),
+    "smoothing_window": (5, 30),
+    "stable_frames_to_commit": (3, 25),
+    "no_hand_frames_for_space": (5, 300),
+    "repeat_release_frames": (2, 60),
+    "min_letter_confidence": (0.30, 0.90),
+    "min_letter_margin": (0.0, 0.50),
+    "keypoint_buffer_size": (5, 300),
+    "queue_maxsize": (1, 10),
+    "watchdog_timeout_s": (2.0, 60.0),
+}
+CONFIG_CHOICES: dict[str, tuple[str, ...]] = {
+    "dominant_hand": ("Right", "Left"),
+    "pose_model": POSE_MODELS,
+}
+
+# Etiqueta que MediaPipe le pone a cada mano de la persona en ESTE programa
+# (frame volteado en espejo antes de detectar): la contraria. Medido: 585 de
+# las 586 plantillas de datos_dinamicas/ (CICESE + grabaciones del equipo,
+# personas que deletrean con la derecha) tienen la mano en el slot "Left", y
+# draw_hand_label ya muestra "Derecha" para "Left". No confiar en la
+# documentacion de MediaPipe, que dice lo contrario para imagenes en espejo.
+MEDIAPIPE_LABEL_OF_HAND = {"Right": "Left", "Left": "Right"}
 
 
 logging.basicConfig(
@@ -213,30 +475,93 @@ class AppConfig:
     max_num_hands: int = DEFAULT_CONFIG["max_num_hands"]
     min_detection_confidence: float = DEFAULT_CONFIG["min_detection_confidence"]
     min_tracking_confidence: float = DEFAULT_CONFIG["min_tracking_confidence"]
-    model_complexity: int = DEFAULT_CONFIG["model_complexity"]
     smoothing_window: int = DEFAULT_CONFIG["smoothing_window"]
     stable_frames_to_commit: int = DEFAULT_CONFIG["stable_frames_to_commit"]
     no_hand_frames_for_space: int = DEFAULT_CONFIG["no_hand_frames_for_space"]
+    repeat_release_frames: int = DEFAULT_CONFIG["repeat_release_frames"]
+    min_letter_confidence: float = DEFAULT_CONFIG["min_letter_confidence"]
+    min_letter_margin: float = DEFAULT_CONFIG["min_letter_margin"]
+    dominant_hand: str = DEFAULT_CONFIG["dominant_hand"]
+    speak_words: bool = DEFAULT_CONFIG["speak_words"]
     keypoint_buffer_size: int = DEFAULT_CONFIG["keypoint_buffer_size"]
     queue_maxsize: int = DEFAULT_CONFIG["queue_maxsize"]
     watchdog_timeout_s: float = DEFAULT_CONFIG["watchdog_timeout_s"]
     draw_landmarks: bool = DEFAULT_CONFIG["draw_landmarks"]
     draw_connections: bool = DEFAULT_CONFIG["draw_connections"]
-    draw_body_skeleton: bool = DEFAULT_CONFIG["draw_body_skeleton"]
+    body_tracking: bool = DEFAULT_CONFIG["body_tracking"]
+    draw_body: bool = DEFAULT_CONFIG["draw_body"]
+    pose_model: str = DEFAULT_CONFIG["pose_model"]
+    pose_async: bool = DEFAULT_CONFIG["pose_async"]
 
     @classmethod
     def load(cls, json_path: Optional[Path] = None) -> "AppConfig":
         cfg = cls()
-        if json_path and json_path.exists():
-            try:
-                data = json.loads(json_path.read_text(encoding="utf-8"))
-                for k, v in data.items():
-                    if hasattr(cfg, k):
-                        setattr(cfg, k, v)
-                log.info("Configuración cargada desde %s", json_path)
-            except (json.JSONDecodeError, OSError) as e:
-                log.warning("No se pudo leer %s: %s. Usando defaults.", json_path, e)
+        if not (json_path and json_path.exists()):
+            return cfg
+        try:
+            data = json.loads(json_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
+            log.warning("No se pudo leer %s: %s. Usando defaults.", json_path, e)
+            return cfg
+        # Antes se hacia setattr de lo que viniera: un config.json que no
+        # fuera un objeto tronaba al arrancar, y un valor de otro tipo o fuera
+        # de rango (ej. "camera_index": "0", "max_num_hands": 0) fallaba
+        # despues, lejos de aqui.
+        if not isinstance(data, dict):
+            log.warning("%s no contiene un objeto JSON. Usando defaults.", json_path)
+            return cfg
+        for k, v in data.items():
+            if k in DEFAULT_CONFIG:
+                cfg.set_validated(k, v)
+            else:
+                log.debug("Config: clave desconocida ignorada: %s", k)
+        log.info("Configuración cargada desde %s", json_path)
         return cfg
+
+    def set_validated(self, name: str, value) -> bool:
+        """Asigna `value` si tiene el tipo correcto; lo recorta a su rango.
+
+        Un valor invalido se ignora (con aviso) y se conserva el actual.
+        """
+        default = DEFAULT_CONFIG[name]
+        # bool va primero: en Python bool es subclase de int.
+        if isinstance(default, bool):
+            ok = isinstance(value, bool)
+        elif isinstance(default, int):
+            if isinstance(value, float) and value.is_integer():
+                value = int(value)
+            ok = isinstance(value, int) and not isinstance(value, bool)
+        elif isinstance(default, float):
+            ok = isinstance(value, (int, float)) and not isinstance(value, bool)
+            if ok:
+                value = float(value)
+        else:
+            ok = isinstance(value, str)
+            if ok and name in CONFIG_CHOICES:
+                match = [c for c in CONFIG_CHOICES[name] if c.lower() == value.strip().lower()]
+                ok = bool(match)
+                if ok:
+                    value = match[0]
+
+        if not ok:
+            log.warning(
+                "Config: valor inválido para %s: %r (se mantiene %r)",
+                name, value, getattr(self, name),
+            )
+            return False
+
+        if name in CONFIG_RANGES:
+            lo, hi = CONFIG_RANGES[name]
+            clamped = type(default)(min(max(value, lo), hi))
+            if clamped != value:
+                log.warning(
+                    "Config: %s=%r fuera de rango [%s, %s]; se usa %r",
+                    name, value, lo, hi, clamped,
+                )
+            value = clamped
+
+        setattr(self, name, value)
+        return True
 
     def save(self, json_path: Path) -> None:
         try:
@@ -438,6 +763,7 @@ class HandDetection:
 @dataclass
 class FrameDetections:
     hands: list[HandDetection] = field(default_factory=list)
+    body: Optional[BodyDetection] = None    # None si body_tracking esta apagado o no hay nadie en cuadro
     timestamp: float = field(default_factory=time.time)
 
     @property
@@ -520,8 +846,51 @@ def draw_hand_label(image: np.ndarray, hand: HandDetection) -> None:
     )
 
 
+# Cerca de la camara, MediaPipe SIGUE la mano mientras no la pierda (medido:
+# la siguio aun llenando toda la imagen), pero si la pierde ya no la puede
+# volver a DETECTAR: el detector inicial no encuentra manos que ocupen ~80% o
+# mas de la imagen (medido, deteccion desde cero: 70% 5/5, 80% 2/5, 90% 0/5).
+# Basta un movimiento rapido o la camara desenfocada de cerca para perderla, y
+# en el modo dinamico eso corta la sena a la mitad. Se avisa desde antes.
+HAND_TOO_CLOSE_FRAC = 0.6
+# Si la mano desaparece poco despues de haber estado muy cerca, se avisa que
+# se perdio por eso (no se sabe donde quedo, asi que el aviso caduca).
+HAND_LOST_WARNING_S = 3.0
+
+
+def hand_size_fraction(hand: HandDetection, frame_w: int, frame_h: int) -> float:
+    """Lado mayor del recuadro de la mano entre el lado mayor de la imagen
+    (el detector de MediaPipe trabaja sobre la imagen hecha cuadrada)."""
+    pts = hand.landmarks_2d[:, :2] * np.array([frame_w, frame_h], dtype=np.float32)
+    return float(np.ptp(pts, axis=0).max()) / max(frame_w, frame_h)
+
+
+class HandDistanceWarning:
+    """Decide que aviso mostrar, frame a frame: mano demasiado cerca, o mano
+    perdida justo despues de haber estado demasiado cerca."""
+
+    def __init__(self) -> None:
+        self._last_close = float("-inf")
+
+    def update(self, hands, frame_w: int, frame_h: int, now: float) -> Optional[str]:
+        hands = list(hands)
+        if any(hand_size_fraction(h, frame_w, frame_h) >= HAND_TOO_CLOSE_FRAC for h in hands):
+            self._last_close = now
+            return "Mano muy cerca de la camara: alejala un poco"
+        if not hands and now - self._last_close < HAND_LOST_WARNING_S:
+            return "Se perdio la mano por estar muy cerca: alejala"
+        return None
+
+
+def draw_warning(image: np.ndarray, text: str) -> None:
+    """Aviso en naranja en la parte de abajo del video."""
+    y = image.shape[0] - 15
+    cv2.putText(image, text, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 0), 4, cv2.LINE_AA)
+    cv2.putText(image, text, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 165, 255), 2, cv2.LINE_AA)
+
+
 # =========================================================================== #
-# Hilo 1: cámara con reconexión 
+# Hilo 1: cámara con reconexión
 # =========================================================================== #
 
 class CameraThread(QThread):
@@ -628,9 +997,11 @@ class CameraThread(QThread):
                 cap.release()
             log.info("Hilo de cámara terminado")
 
-    def stop(self) -> None:
+    def stop(self, timeout_ms: int = 2000) -> bool:
+        """Pide terminar y espera. False si sigue corriendo (p. ej. una camara
+        trabada en cap.read()): ver SignLanguageApp._retire_thread."""
         self._run_flag = False
-        self.wait(2000)
+        return self.wait(timeout_ms)
 
 
 # =========================================================================== #
@@ -750,6 +1121,53 @@ class InferenceMetrics:
     last_inference_ts: float = field(default_factory=time.time)
 
 
+class AsyncBodyTracker:
+    """BodyTracker en su propio hilo. detect() le deja el frame y devuelve
+    sin esperar el ultimo cuerpo que ya termino (de uno o dos frames atras),
+    asi la pose corre en paralelo a las manos en otro nucleo: MediaPipe
+    suelta el GIL mientras infiere. Medido en la laptop: manos + pose en serie
+    16.4 ms por frame; con la pose aparte, lo de las manos (~8 ms). BodyTracker
+    sigue usando su reloj real (ver su docstring)."""
+
+    def __init__(self, tracker: BodyTracker):
+        self._tracker = tracker
+        self._cond = threading.Condition()
+        self._pending = None
+        self._latest: Optional[BodyDetection] = None
+        self._stopped = False
+        self._thread = threading.Thread(target=self._run, name="pose", daemon=True)
+        self._thread.start()
+
+    def detect(self, mp_image) -> Optional[BodyDetection]:
+        with self._cond:
+            self._pending = mp_image      # si habia uno sin procesar, se reemplaza
+            self._cond.notify()
+            return self._latest
+
+    def _run(self) -> None:
+        while True:
+            with self._cond:
+                while self._pending is None and not self._stopped:
+                    self._cond.wait()
+                if self._stopped:
+                    return
+                image, self._pending = self._pending, None
+            try:
+                body = self._tracker.detect(image)
+            except Exception:
+                log.exception("MediaPipe Pose falló")
+                body = None
+            with self._cond:
+                self._latest = body
+
+    def close(self) -> None:
+        with self._cond:
+            self._stopped = True
+            self._cond.notify()
+        self._thread.join(timeout=2.0)
+        self._tracker.close()
+
+
 class HandTrackingThread(QThread):
     
     change_pixmap_signal = pyqtSignal(np.ndarray)
@@ -758,6 +1176,10 @@ class HandTrackingThread(QThread):
     sign_diagnostic_signal = pyqtSignal(object)       
     letter_committed_signal = pyqtSignal(str)
     space_committed_signal = pyqtSignal()
+    auto_result_signal = pyqtSignal(object)           # modo automatico: {"topk", "detail"}
+    letters_retracted_signal = pyqtSignal(object)     # letras (list[str]) que una palabra reemplaza
+    phase_signal = pyqtSignal(str)                    # "reposo" | "seña" | "clasificando"
+    guidance_signal = pyqtSignal(object)              # estado para consejos en vivo (~4 por segundo)
     metrics_signal = pyqtSignal(object)
     error_signal = pyqtSignal(str)
     model_loaded_signal = pyqtSignal()
@@ -769,12 +1191,11 @@ class HandTrackingThread(QThread):
         self._cfg = config
         self._run_flag = True
         self._hands_solution = None
-
-        # Esqueleto de pose: puramente visual/diagnostico, ver body_tracker.py
-        # y _get_body_tracker(). No participa en self._classifier ni en
-        # self._auto_segmenter/self._dtw_recognizer de ninguna forma.
-        self._body_tracker: Optional["BodyTracker"] = None
-        self._body_tracker_failed: bool = False
+        # La GUI lo pide al mover el slider de deteccion; lo atiende run() en
+        # este mismo hilo (el HandLandmarker no se debe tocar desde otro).
+        self._reinit_hands_requested = False
+        self._body_tracker: Optional[BodyTracker] = None
+        self._distance_warning = HandDistanceWarning()
 
         self._keypoint_buffer: deque[np.ndarray] = deque(
             maxlen=config.keypoint_buffer_size
@@ -782,14 +1203,21 @@ class HandTrackingThread(QThread):
 
         self._frames_without_hand = 0
         self._space_already_committed = False
+        # Ultima letra confirmada: no se vuelve a confirmar hasta que la sena
+        # se interrumpe repeat_release_frames frames (_release_frames).
         self._last_committed_label: Optional[str] = None
+        self._release_frames = 0
+        # Si la palabra en curso tiene letras (para el espacio automatico).
+        # Antes se usaba _last_committed_label para esto, y por eso liberar la
+        # letra para repetirla (LL, RR) hubiera impedido cerrar la palabra.
+        self._word_has_letters = False
 
         self._classifier: Optional[SignClassifier] = SignClassifier.try_load()
         self._per_letter_confidence: dict[str, float] = {}
         self._smoother = PredictionSmoother(
             window_size=max(5, config.smoothing_window),
-            min_confidence=0.55,
-            min_margin=0.15,
+            min_confidence=config.min_letter_confidence,
+            min_margin=config.min_letter_margin,
             per_letter_confidence=self._per_letter_confidence,
         )
         self._diagnostic_mode: bool = False
@@ -837,6 +1265,28 @@ class HandTrackingThread(QThread):
         # cuando no hay una secuencia en curso.
         self._dynamic_sequence_hand_identity: Optional[set[str]] = None
 
+        # Modo automatico (ver AUTO_* al inicio del archivo): el que usa la
+        # ventana. Tiene su propio corte de actividades y su propia cola, y
+        # no toca el estado del modo dinamico de solo letras (set_dynamic_mode),
+        # que se conserva para probar_modo_dinamico_senas.py.
+        self._word_recognizers = _get_word_recognizers()
+        self._activity_segmenter: Optional["AutoSegmenter"] = self._new_activity_segmenter()
+        self._auto_mode: bool = self._activity_segmenter is not None and (
+            self._dtw_recognizer is not None or self._word_recognizers is not None
+        )
+        # Letras estaticas fijadas en la actividad en curso (ver AUTO_MAX_RETRACTED_LETTERS).
+        self._activity_letters: list[str] = []
+        self._auto_result_queue: "queue.Queue[Optional[tuple]]" = queue.Queue()
+        self._auto_classifying = False
+        self._auto_classify_start = 0.0
+        self._auto_idle_text = "Esperando mano"
+        self._wrist_track: deque[tuple[float, float, float, float]] = deque(maxlen=AUTO_SPEED_WINDOW)
+        self._activity_start = 0.0
+        self._phase = ""
+        self._last_guidance = 0.0
+        self._last_static_topk: list[tuple[str, float]] = []
+        self._last_distance_warning = None
+
         self._latencies: deque[float] = deque(maxlen=100)
         self._frame_times: deque[float] = deque(maxlen=30)
         self._hand_counts: deque[int] = deque(maxlen=60)
@@ -877,34 +1327,79 @@ class HandTrackingThread(QThread):
     def set_draw_connections(self, value: bool) -> None:
         self._cfg.draw_connections = value
 
-    def set_draw_body_skeleton(self, value: bool) -> None:
-        self._cfg.draw_body_skeleton = value
+    def set_draw_body(self, value: bool) -> None:
+        self._cfg.draw_body = value
 
-    def _get_body_tracker(self) -> Optional["BodyTracker"]:
-        """Crea BodyTracker (MediaPipe Pose) la primera vez que hace falta,
-        no al iniciar el hilo: es un diagnostico opcional (checkbox "Dibujar
-        esqueleto (Pose)"), no debe costarle descarga de modelo ni CPU a
-        quien nunca lo activa. Puramente visual - su resultado no se usa en
-        self._classifier ni en self._auto_segmenter/self._dtw_recognizer."""
-        if BodyTracker is None:
-            return None
-        if self._body_tracker is None and not self._body_tracker_failed:
-            try:
-                self._body_tracker = BodyTracker()
-                log.info("BodyTracker (MediaPipe Pose) listo para diagnostico visual.")
-            except Exception as e:
-                self._body_tracker_failed = True
-                log.exception("No se pudo inicializar BodyTracker (Pose): %s", e)
-        return self._body_tracker
-
-    def reset_word_state(self) -> None:
+    def reset_word_state(self, has_letters: bool = False) -> None:
+        """Palabra nueva (has_letters=False) o corregida con Retroceso
+        (has_letters=True si le quedan letras: el espacio automatico debe
+        seguir cerrandola). En ambos casos la ultima letra se puede volver a
+        signar de inmediato."""
         self._frames_without_hand = 0
         self._space_already_committed = False
         self._last_committed_label = None
+        self._release_frames = 0
+        self._word_has_letters = has_letters
         self._stable_letter = None
         self._stable_frames = 0
         self._smoother.reset()
         self._reset_dynamic_state()
+
+    def request_hands_reinit(self) -> None:
+        """Pide recrear el HandLandmarker con los umbrales actuales de la
+        config (lo hace run(), en este hilo, antes del siguiente frame)."""
+        self._reinit_hands_requested = True
+
+    def _commit_letter(self, letter: str) -> None:
+        self.letter_committed_signal.emit(letter)
+        self._last_committed_label = letter
+        self._release_frames = 0
+        self._word_has_letters = True
+
+    def _update_release(self, letter: Optional[str]) -> None:
+        """Cuenta los frames en que la sena NO es la ultima letra confirmada
+        (otra letra, ninguna o sin mano). Al llegar a repeat_release_frames,
+        esa letra se puede volver a confirmar: asi se escriben LL, RR, EE."""
+        if self._last_committed_label is None:
+            return
+        if letter == self._last_committed_label:
+            self._release_frames = 0
+            return
+        self._release_frames += 1
+        if self._release_frames >= self._cfg.repeat_release_frames:
+            released = self._last_committed_label
+            self._last_committed_label = None
+            self._release_frames = 0
+            # La repeticion debe sostenerse otros stable_frames_to_commit
+            # frames: si la mano solo se ausento, el conteo de esa misma letra
+            # seguia alto y se hubiera repetido en cuanto volviera. (Si ya se
+            # esta haciendo otra letra, su conteo no se toca.)
+            if self._stable_letter == released:
+                self._stable_letter = None
+                self._stable_frames = 0
+
+    def _select_hand(self, detections: FrameDetections) -> Optional[HandDetection]:
+        """Mano que deletrea para el alfabeto estatico. Con una sola, esa. Con
+        varias, la de la mano dominante (traducida a la etiqueta de MediaPipe,
+        ver MEDIAPIPE_LABEL_OF_HAND). Antes se elegia la etiqueta "Right", que
+        en este programa es la mano IZQUIERDA de la persona: con las dos manos
+        en cuadro se clasificaba la que no hacia la sena."""
+        if not detections.hands:
+            return None
+        if len(detections.hands) == 1:
+            return detections.hands[0]
+        label = MEDIAPIPE_LABEL_OF_HAND[self._cfg.dominant_hand]
+        dominant = [h for h in detections.hands if h.handedness == label]
+        return max(dominant or detections.hands, key=lambda h: h.confidence)
+
+    def _classify_static(self, hand: HandDetection) -> list[tuple[str, float]]:
+        landmarks_2d = hand.landmarks_2d
+        if self._cfg.dominant_hand == "Left":
+            # Reflejo horizontal: la mano izquierda se ve como una derecha,
+            # que es la que espera el modelo. La z no cambia con el reflejo.
+            landmarks_2d = landmarks_2d.copy()
+            landmarks_2d[:, 0] = 1.0 - landmarks_2d[:, 0]
+        return self._classifier.predict_topk_from_hand(landmarks_2d, hand.landmarks_3d, k=3)
 
 
     def set_stable_frames_to_commit(self, value: int) -> None:
@@ -947,12 +1442,46 @@ class HandTrackingThread(QThread):
     # ---- ciclo principal --------------------------------------------------
 
     def run(self) -> None:
-        if not self._init_mediapipe():
-            return
+        # Los modelos se cierran aqui, al salir, en ESTE hilo. Antes los
+        # cerraba stop() desde el hilo de la GUI aunque el hilo siguiera
+        # corriendo (si no terminaba en 3 s), con MediaPipe todavia en uso.
+        try:
+            if self._init_mediapipe():
+                self._loop()
+        finally:
+            self._close_models()
 
+    def _close_models(self) -> None:
+        for solution in (self._hands_solution, self._body_tracker):
+            if solution is not None:
+                try:
+                    solution.close()
+                except Exception:
+                    pass
+        self._hands_solution = None
+        self._body_tracker = None
+
+    def _loop(self) -> None:
         timestamp_ms = 0
 
         while self._run_flag:
+            if self._reinit_hands_requested:
+                self._reinit_hands_requested = False
+                try:
+                    new_solution = self._create_hand_landmarker()
+                except Exception:
+                    log.exception("No se pudo aplicar el nuevo umbral de deteccion")
+                else:
+                    old, self._hands_solution = self._hands_solution, new_solution
+                    try:
+                        old.close()
+                    except Exception:
+                        pass
+                    log.info(
+                        "Umbral de deteccion de manos aplicado: %.2f",
+                        self._cfg.min_detection_confidence,
+                    )
+
             try:
                 frame = self._frame_queue.get(timeout=0.1)
             except queue.Empty:
@@ -971,72 +1500,33 @@ class HandTrackingThread(QThread):
                 continue
 
             detections = self._parse_results(results)
-
-            # Pose (esqueleto del cuerpo): en paralelo a las manos, puramente
-            # visual/diagnostico (ver body_tracker.py). Solo corre si el
-            # checkbox esta activado, y su resultado se usa UNICAMENTE dentro
-            # de _render() para dibujar - jamas llega a self._classifier, a
-            # self._smoother ni a self._auto_segmenter/_process_dynamic_frame.
-            body_detection = None
-            if self._cfg.draw_body_skeleton:
-                tracker = self._get_body_tracker()
-                if tracker is not None:
-                    try:
-                        body_detection = tracker.detect(mp_image)
-                    except Exception as e:
-                        log.exception("BodyTracker.detect() falló: %s", e)
-
-            annotated = self._render(frame, detections, body_detection)
+            if self._body_tracker is not None:
+                # Sin timestamp_ms a proposito: BodyTracker usa tiempo real
+                # (con el +1 de las manos la pose se retrasa, ver body_tracker.py).
+                try:
+                    detections.body = self._body_tracker.detect(mp_image)
+                except Exception as e:
+                    log.exception("MediaPipe Pose falló: %s", e)
+            annotated = self._render(frame, detections)
 
             self._update_keypoint_buffer(detections)
-            self._update_word_state(detections)
+            frame_h, frame_w = frame.shape[:2]
+            auto = self._auto_mode and not self._dynamic_mode
+            # En modo automatico, manos bajo la linea de reposo cuentan como
+            # "sin mano" para el espacio automatico (bajar las manos sin
+            # sacarlas de cuadro cierra la palabra). None = sin hombros.
+            in_space = (
+                hands_in_signing_space(detections.hands, detections.body, frame_w, frame_h)
+                if auto else None
+            )
+            self._update_word_state(detections, resting=in_space is False)
 
-            sign_text = "—"
-            sign_conf = 0.0
             if self._dynamic_mode:
                 sign_text, sign_conf = self._process_dynamic_frame(detections)
-            elif self._classifier is not None and detections.num_hands > 0:
-                hand = next(
-                    (h for h in detections.hands if h.handedness == "Right"),
-                    detections.hands[0],
-                )
-                try:
-                    topk = self._classifier.predict_topk_from_hand(
-                        hand.landmarks_2d, hand.landmarks_3d, k=3,
-                    )
-                    smoothed = self._smoother.push(topk)
-
-                    if self._diagnostic_mode:
-                        self.sign_diagnostic_signal.emit(topk)
-
-                    if smoothed.letter is not None:
-                        sign_text = smoothed.letter
-                        sign_conf = smoothed.confidence
-                        if smoothed.letter == self._stable_letter:
-                            self._stable_frames += 1
-                        else:
-                            self._stable_letter = smoothed.letter
-                            self._stable_frames = 1
-
-                        if (
-                            self._stable_frames >= self._cfg.stable_frames_to_commit
-                            and smoothed.letter != self._last_committed_label
-                        ):
-                            self.letter_committed_signal.emit(smoothed.letter)
-                            self._last_committed_label = smoothed.letter
-                    else:
-                        self._stable_frames = 0
-                        if smoothed.raw_top1 and smoothed.raw_top1[1] > 0.35:
-                            sign_text = f"?{smoothed.raw_top1[0]}"
-                            sign_conf = smoothed.raw_top1[1]
-                        else:
-                            sign_text = "..."
-                except Exception as e:
-                    log.exception("Error en clasificador: %s", e)
-                    sign_text = "—"
-            elif self._classifier is None and detections.num_hands > 0:
-                sign_text = f"{detections.num_hands} mano(s)"
-                sign_conf = 1.0
+            elif auto:
+                sign_text, sign_conf = self._process_auto_frame(detections, frame_w, frame_h, in_space)
+            else:
+                sign_text, sign_conf, _ = self._process_static_frame(detections)
 
             self.change_pixmap_signal.emit(annotated)
             self.hands_detected_signal.emit(detections)
@@ -1046,6 +1536,342 @@ class HandTrackingThread(QThread):
             dt = time.perf_counter() - t0
             self._update_metrics(dt, detections.num_hands)
 
+
+    # ---- alfabeto estatico ---------------------------------------------------
+
+    def _process_static_frame(
+        self, detections: FrameDetections, allow_commit: bool = True
+    ) -> tuple[str, float, bool]:
+        """Alfabeto estatico: clasifica la mano del frame, suaviza y fija la
+        letra tras stable_frames_to_commit frames estables. Devuelve (texto
+        de Estado, confianza, si se fijo una letra en este frame).
+
+        allow_commit=False (modo automatico con la mano en movimiento o en
+        reposo) sigue mostrando la letra, pero no cuenta frames estables: la
+        cuenta empieza de nuevo cuando la mano se queda quieta."""
+        sign_text, sign_conf, committed = "—", 0.0, False
+        if self._classifier is not None and detections.num_hands > 0:
+            hand = self._select_hand(detections)
+            try:
+                topk = self._classify_static(hand)
+                self._last_static_topk = topk
+                smoothed = self._smoother.push(topk)
+                self._update_release(smoothed.letter)
+
+                if self._diagnostic_mode:
+                    self.sign_diagnostic_signal.emit(topk)
+
+                if smoothed.letter is not None:
+                    sign_text = smoothed.letter
+                    sign_conf = smoothed.confidence
+                    if not allow_commit:
+                        self._stable_letter = None
+                        self._stable_frames = 0
+                    elif smoothed.letter == self._stable_letter:
+                        self._stable_frames += 1
+                    else:
+                        self._stable_letter = smoothed.letter
+                        self._stable_frames = 1
+
+                    if (
+                        allow_commit
+                        and self._stable_frames >= self._cfg.stable_frames_to_commit
+                        and smoothed.letter != self._last_committed_label
+                    ):
+                        self._commit_letter(smoothed.letter)
+                        committed = True
+                else:
+                    self._stable_frames = 0
+                    if smoothed.raw_top1 and smoothed.raw_top1[1] > 0.35:
+                        sign_text = f"?{smoothed.raw_top1[0]}"
+                        sign_conf = smoothed.raw_top1[1]
+                    else:
+                        sign_text = "..."
+            except Exception as e:
+                log.exception("Error en clasificador: %s", e)
+                sign_text = "—"
+        elif self._classifier is None and detections.num_hands > 0:
+            sign_text = f"{detections.num_hands} mano(s)"
+            sign_conf = 1.0
+        elif self._classifier is not None:
+            # Sin mano tambien cuenta como "interrumpir la sena" para
+            # poder repetir la letra (bajar la mano un instante).
+            self._update_release(None)
+        return sign_text, sign_conf, committed
+
+    # ---- modo automatico (estatico + dinamico + palabras) ---------------------
+
+    def _new_activity_segmenter(self) -> Optional["AutoSegmenter"]:
+        """Corte de actividades del modo automatico: el del modo palabras de
+        segmentador_automatico.py (linea de reposo, PALABRAS_*)."""
+        if AutoSegmenter is None:
+            return None
+        return AutoSegmenter(
+            no_hand_ms_to_end=PALABRAS_REST_MS_TO_END,
+            min_sequence_ms=PALABRAS_MIN_SEQUENCE_MS,
+            max_duration_ms=PALABRAS_MAX_SEQUENCE_MS,
+        )
+
+    def set_auto_mode(self, enabled: bool) -> None:
+        self._auto_mode = bool(enabled) and self._activity_segmenter is not None
+        self._activity_segmenter = self._new_activity_segmenter()
+        self._activity_letters = []
+        self._wrist_track.clear()
+
+    @property
+    def auto_mode(self) -> bool:
+        return self._auto_mode
+
+    @property
+    def word_labels(self) -> list[str]:
+        if self._word_recognizers is None:
+            return []
+        return [word_display(label) for label in self._word_recognizers[1].labels]
+
+    @staticmethod
+    def _raised_hands(hands: dict, body: Optional[BodyDetection], frame_w: int, frame_h: int) -> int:
+        """Cuantas manos tienen la muneca sobre la linea de reposo (sin
+        hombros en cuadro: cuantas manos hay)."""
+        line_y = rest_line_y(body, frame_w, frame_h)
+        if line_y is None:
+            return len(hands)
+        return sum(1 for h in hands.values() if h.landmarks_2d[0, 1] * frame_h < line_y)
+
+    def _hand_is_still(
+        self, hand: Optional[HandDetection], frame_w: int, frame_h: int, now: float
+    ) -> bool:
+        """True si la muneca de `hand` casi no se movio en los ultimos
+        AUTO_SPEED_WINDOW frames seguidos con mano: velocidad entre el
+        promedio de los 3 primeros y el de los 3 ultimos, en tamanos de mano
+        por segundo, <= AUTO_STATIC_MAX_SPEED. Comparar promedios, y no
+        sumar el recorrido frame a frame, ignora el temblor de MediaPipe."""
+        if hand is None:
+            self._wrist_track.clear()
+            return False
+        px = hand.landmarks_2d[:, :2] * np.array([frame_w, frame_h], dtype=np.float32)
+        self._wrist_track.append((now, float(px[0, 0]), float(px[0, 1]), float(np.linalg.norm(px[9] - px[0]))))
+        if len(self._wrist_track) < AUTO_SPEED_WINDOW:
+            return False
+        track = np.array(self._wrist_track, dtype=np.float64)
+        first, last = track[:3].mean(axis=0), track[-3:].mean(axis=0)
+        elapsed = last[0] - first[0]
+        hand_size = float(np.median(track[:, 3]))
+        if elapsed <= 0 or hand_size < 1.0:
+            return False
+        speed = float(np.linalg.norm(last[1:3] - first[1:3])) / hand_size / elapsed
+        return speed <= AUTO_STATIC_MAX_SPEED
+
+    def _process_auto_frame(
+        self,
+        detections: FrameDetections,
+        frame_w: int,
+        frame_h: int,
+        in_space: Optional[bool],
+    ) -> tuple[str, float]:
+        """Un frame del modo automatico (ver el comentario de AUTO_* al inicio
+        del archivo). in_space: hands_in_signing_space de este frame (None si
+        no se ven los hombros)."""
+        assert self._activity_segmenter is not None
+        now = time.perf_counter()
+
+        # 1. Resultado de una clasificacion DTW que termino en su hilo.
+        try:
+            result = self._auto_result_queue.get_nowait()
+        except queue.Empty:
+            pass
+        else:
+            self._auto_classifying = False
+            self._apply_auto_result(result)
+
+        # 2. Letras estaticas: solo con UNA mano arriba, quieta.
+        hands_by_side: dict[str, HandDetection] = {}
+        for h in detections.hands:
+            if h.handedness not in hands_by_side:
+                hands_by_side[h.handedness] = h
+        raised = self._raised_hands(hands_by_side, detections.body, frame_w, frame_h)
+        hand = self._select_hand(detections) if detections.num_hands > 0 else None
+        still = self._hand_is_still(hand, frame_w, frame_h, now)
+        sign_text, sign_conf, committed = self._process_static_frame(
+            detections, allow_commit=still and in_space is not False and raised <= 1
+        )
+
+        # 3. Actividad (subir la mano, senar, bajarla): letras dinamicas y palabras.
+        active = in_space if in_space is not None else bool(hands_by_side)
+        vector = np.concatenate([
+            build_dynamic_feature_vector(hands_by_side),
+            body_location_features(hands_by_side, detections.body, frame_w, frame_h),
+        ])
+        event = self._activity_segmenter.push(active, vector, now)
+        if event is not None and event[0] == "inicio":
+            self._activity_letters = []
+            self._activity_start = now
+        if committed:
+            self._activity_letters.append(self._last_committed_label)
+        if event is not None and event[0] != "inicio":
+            kind, sequence = event
+            letters, self._activity_letters = self._activity_letters, []
+            # El segmentador corta PALABRAS_REST_MS_TO_END despues del ultimo
+            # frame activo; eso no es parte de la sena.
+            duration_s = max(0.0, now - self._activity_start - PALABRAS_REST_MS_TO_END / 1000.0)
+            if kind == "fin_valida":
+                self._start_auto_classification(sequence, letters, now, duration_s)
+            elif len(sequence) >= 6 and not letters:
+                self.auto_result_signal.emit({"kind": "corta", "code": "corta", "topk": [],
+                                              "detail": "seña muy corta"})
+
+        # 4. Fase y consejos para la interfaz.
+        if self._auto_classifying:
+            self._set_phase("clasificando")
+        else:
+            self._set_phase("seña" if self._activity_segmenter.state == "grabando" else "reposo")
+        if now - self._last_guidance >= 0.25:
+            self._last_guidance = now
+            unsure = None
+            if sign_text.startswith("?") and len(self._last_static_topk) >= 2:
+                unsure = self._last_static_topk[:2]
+            self.guidance_signal.emit({
+                "hands": detections.num_hands,
+                "raised": raised,
+                "body_tracking": self._body_tracker is not None,
+                "body_visible": rest_line_y(detections.body, frame_w, frame_h) is not None,
+                "too_close": self._last_distance_warning is not None,
+                "two_raised_still": raised >= 2 and still,
+                "static_unsure": unsure if still else None,
+                "moving_letter": (not still and raised == 1 and detections.num_hands > 0
+                                  and len(sign_text) == 1 and sign_text.isalpha()),
+            })
+
+        # 5. Texto de Estado.
+        if self._auto_classifying:
+            return (f"Clasificando... ({now - self._auto_classify_start:.0f}s)", 0.0)
+        if detections.num_hands > 0 and sign_text != "—":
+            return (sign_text, sign_conf)
+        return (self._auto_idle_text, 0.0)
+
+    def _set_phase(self, phase: str) -> None:
+        if phase != self._phase:
+            self._phase = phase
+            self.phase_signal.emit(phase)
+
+    def _start_auto_classification(
+        self, sequence: list[np.ndarray], letters: list[str], now: float, duration_s: float = 0.0
+    ) -> None:
+        if self._auto_classifying:
+            # Igual que el modo dinamico: no se encolan dos clasificaciones.
+            log.warning("[auto] seña descartada: la clasificacion anterior aun no termina (%d frames)", len(sequence))
+            self._auto_idle_text = "Seña descartada (clasificando la anterior)"
+            return
+        if self._dtw_recognizer is None and self._word_recognizers is None:
+            return
+        self._auto_classifying = True
+        self._auto_classify_start = now
+        threading.Thread(
+            target=self._classify_auto_sequence, args=(sequence, letters, duration_s), daemon=True
+        ).start()
+
+    def _classify_auto_sequence(
+        self, sequence: list[np.ndarray], letters: Optional[list[str]] = None, duration_s: float = 0.0
+    ) -> None:
+        """En un hilo aparte (como _classify_dynamic_sequence): decide si la
+        actividad fue una letra dinamica o una palabra y deja en la cola un
+        dict (kind, topk, best_dist, d_word, d_letter, letters, stats,
+        duration_s), o None si fallo."""
+        result: Optional[dict] = None
+        try:
+            seq = np.asarray(sequence, dtype=np.float64)
+            if self._cfg.dominant_hand == "Left":
+                # Plantillas de mano derecha (ver _classify_dynamic_sequence);
+                # tambien refleja el bloque de cuerpo.
+                seq = mirror_and_swap_hands(seq)
+            hands = seq[:, :126]
+            # Letras: consulta a ~LETTER_DTW_FPS, como sus plantillas. En una
+            # laptop a 30 fps se toma 1 de cada 2 frames; en la Pi, que
+            # procesa ~15 fps, la secuencia completa.
+            fps = len(hands) / duration_s if duration_s > 0.2 else TEMPLATE_FPS
+            letter_step = max(1, int(round(fps / LETTER_DTW_FPS)))
+            letter_query = hands[::letter_step] if len(hands) >= 2 * letter_step else hands
+            letter_dist = self._dtw_recognizer.compute_distances(letter_query) if self._dtw_recognizer else {}
+            best_letter = min(letter_dist.values(), default=float("inf"))
+            best_word = float("inf")
+            if self._word_recognizers is not None:
+                hands_only, with_body = self._word_recognizers
+                best_word = min(hands_only.compute_distances(hands).values(), default=float("inf"))
+            base = {"d_word": best_word, "d_letter": best_letter, "letters": list(letters or []),
+                    "stats": sign_stats(seq, duration_s), "duration_s": duration_s}
+            if best_word < AUTO_WORD_PREFERENCE * best_letter:
+                word_dist = with_body.compute_distances(seq)
+                result = dict(base, kind="palabra", topk=distances_to_topk(word_dist, 3, WORD_TEMPERATURE),
+                              best_dist=min(word_dist.values()))
+            elif letter_dist:
+                result = dict(base, kind="letra", topk=distances_to_topk(letter_dist, 3), best_dist=best_letter)
+        except Exception as e:
+            log.exception("Error en la clasificacion automatica: %s", e)
+        self._auto_result_queue.put(result)
+
+    def _apply_auto_result(self, result: Optional[dict]) -> None:
+        """Escribe (o no) la letra o palabra de una actividad y avisa a la
+        interfaz con auto_result_signal: {kind, code, label, topk, detail,
+        stats, letters, too_long}. code: "ok", "ambigua", "desconocida",
+        "deletreo_largo", "deletreo", "letra_dudosa" o "error"."""
+        if result is None:
+            self._auto_idle_text = "Error al clasificar la seña (ver consola)"
+            self.auto_result_signal.emit({"kind": "error", "code": "error", "topk": [], "detail": "error"})
+            return
+        kind, topk, letters = result["kind"], result["topk"], result["letters"]
+        label, conf = topk[0]
+        too_long = result["duration_s"] >= PALABRAS_MAX_SEQUENCE_MS / 1000.0 - 0.5
+        if kind == "palabra":
+            committed, margin, reason = word_commit_decision(topk, result["best_dist"])
+            code = "ok" if committed else ("desconocida" if result["best_dist"] > WORD_MAX_DISTANCE else "ambigua")
+            shown = [(word_display(w), c) for w, c in topk]
+            if committed and len(letters) > AUTO_MAX_RETRACTED_LETTERS:
+                committed, code = False, "deletreo_largo"
+                reason = f"se fijaron {len(letters)} letras: fue deletreo"
+            if committed:
+                if letters:
+                    self.letters_retracted_signal.emit(letters)
+                self._commit_word(label)
+                self._auto_idle_text = f"{word_display(label)} (palabra, {conf * 100:.0f}%)"
+                detail = f"palabra agregada (margen {margin * 100:.0f}pp)"
+                if letters:
+                    detail += f", reemplaza {''.join(letters)}"
+            else:
+                self._auto_idle_text = f"¿{word_display(label)}? - no agregada"
+                detail = f"palabra no agregada: {reason}"
+            label = word_display(label)
+        elif letters:
+            # Deletreo: las letras estaticas ya se escribieron; el DTW de la
+            # actividad completa no agrega una letra dinamica encima.
+            committed, shown, code = False, topk, "deletreo"
+            detail = f"deletreo ({''.join(letters)}): se conservan las letras"
+        else:
+            committed, margin, rule = dynamic_commit_decision(topk)
+            shown = topk
+            code = "ok" if committed else "letra_dudosa"
+            if committed:
+                self._commit_letter(label)
+                self._auto_idle_text = f"{label} ({conf * 100:.0f}%)"
+                detail = f"letra agregada (regla {rule}, margen {margin * 100:.0f}pp)"
+            else:
+                self._auto_idle_text = f"¿{label}? ({conf * 100:.0f}%) - no agregada"
+                detail = f"letra no agregada (margen {margin * 100:.0f}pp)"
+        log.info(
+            "[auto] %s: %s | distancia solo manos: palabra %.2f, letra %.2f -> %s",
+            kind, "  ".join(f"{w} {c * 100:.1f}%" for w, c in shown), result["d_word"], result["d_letter"], detail,
+        )
+        self.auto_result_signal.emit({
+            "kind": kind, "code": code, "label": label, "topk": shown, "detail": detail,
+            "stats": result["stats"], "letters": letters, "too_long": too_long,
+        })
+
+    def _commit_word(self, label: str) -> None:
+        """Escribe la palabra y la cierra, como si se hubieran bajado las
+        manos el tiempo del espacio automatico."""
+        self._commit_letter(word_display(label))
+        self.space_committed_signal.emit()
+        self._space_already_committed = True
+        self._word_has_letters = False
+        self._last_committed_label = None
 
     # ---- instrumentacion por seña (duracion, frames, fps, hueco maximo) ---
 
@@ -1116,11 +1942,18 @@ class HandTrackingThread(QThread):
         #    hasta que arranque una seña nueva, en vez de volver a "..." en
         #    el siguiente frame (antes duraba <33ms en pantalla).
         try:
-            letter, conf, topk = self._dynamic_result_queue.get_nowait()
+            result = self._dynamic_result_queue.get_nowait()
         except queue.Empty:
             pass
         else:
             self._dynamic_classifying = False
+            if result is None:
+                # La clasificacion fallo (ver _classify_dynamic_sequence):
+                # antes no llegaba nada y _dynamic_classifying se quedaba en
+                # True para siempre, descartando todas las senas siguientes.
+                self._dynamic_idle_text = "Error al clasificar la seña (ver consola)"
+                return (self._dynamic_idle_text, 0.0)
+            letter, conf, topk = result
             self.sign_diagnostic_signal.emit(topk)
             should_commit, margin, rule = dynamic_commit_decision(topk)
             top_str = "  ".join(f"{w} {c * 100:.1f}%" for w, c in topk)
@@ -1129,8 +1962,7 @@ class HandTrackingThread(QThread):
                 # K, Q o Z comprometida por la regla EXPERIMENTAL de margen
                 # (ver dynamic_commit_decision): se etiqueta distinto para que
                 # quede claro que no vino de la regla normal de confianza.
-                self.letter_committed_signal.emit(letter)
-                self._last_committed_label = letter
+                self._commit_letter(letter)
                 self._dynamic_idle_text = f"{letter} {conf * 100:.1f}% (margen alto)"
                 log.info(
                     "[dinamico] top-3: %s -> agregada por regla EXPERIMENTAL (margen=%.1fpp >= %.0fpp)",
@@ -1142,8 +1974,7 @@ class HandTrackingThread(QThread):
                 # e is_nq_blocking_pair): un margen tan amplio sobre Ñ
                 # especificamente es señal solida incluso con el umbral mas
                 # estricto de este par.
-                self.letter_committed_signal.emit(letter)
-                self._last_committed_label = letter
+                self._commit_letter(letter)
                 self._dynamic_idle_text = f"{letter} {conf * 100:.1f}% (margen alto, par Ñ/Q)"
                 log.info(
                     "[dinamico] top-3: %s -> agregada por regla EXPERIMENTAL reforzada, par Ñ/Q (margen=%.1fpp >= %.0fpp)",
@@ -1152,16 +1983,14 @@ class HandTrackingThread(QThread):
             elif rule == "margen":
                 # Grupo normal comprometido por margen amplio aunque la
                 # confianza absoluta no llegara a DYN_MIN_CONF.
-                self.letter_committed_signal.emit(letter)
-                self._last_committed_label = letter
+                self._commit_letter(letter)
                 self._dynamic_idle_text = f"{letter} {conf * 100:.1f}% (margen amplio)"
                 log.info(
                     "[dinamico] top-3: %s -> agregada por margen amplio (margen=%.1fpp >= %.0fpp)",
                     top_str, margin * 100, DYN_NORMAL_MIN_MARGIN * 100,
                 )
             elif rule == "confianza":
-                self.letter_committed_signal.emit(letter)
-                self._last_committed_label = letter
+                self._commit_letter(letter)
                 self._dynamic_idle_text = f"{letter} ({conf * 100:.0f}%)"
                 log.info("[dinamico] top-3: %s -> agregada (confianza=%.1f%%)", top_str, conf * 100)
             elif is_experimental_dynamic_letter(letter):
@@ -1271,37 +2100,60 @@ class HandTrackingThread(QThread):
         desde otro hilo aqui no se entregaria de forma confiable)."""
         assert self._dtw_recognizer is not None
         try:
+            if self._cfg.dominant_hand == "Left":
+                # Las plantillas son de la mano derecha (585 de 586, ver
+                # MEDIAPIPE_LABEL_OF_HAND): reflejar la sena e intercambiar
+                # los slots de mano la vuelve comparable con ellas.
+                sequence = list(mirror_and_swap_hands(np.asarray(sequence, dtype=np.float64)))
             topk = self._dtw_recognizer.predict_topk(sequence, k=3)
         except Exception as e:
             log.exception("Error en DTWRecognizer: %s", e)
+            # Sin esto _dynamic_classifying se quedaba en True para siempre.
+            self._dynamic_result_queue.put(None)
             return
         letter, conf = topk[0]
         self._dynamic_result_queue.put((letter, conf, topk))
 
 
+    def _create_hand_landmarker(self):
+        # Asegurar que el modelo esté descargado.
+        model_path = ensure_hand_model(Path.home() / ".sign_translator" / "models")
+
+        BaseOptions = mp.tasks.BaseOptions
+        HandLandmarker = mp.tasks.vision.HandLandmarker
+        HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
+        VisionRunningMode = mp.tasks.vision.RunningMode
+
+        options = HandLandmarkerOptions(
+            base_options=BaseOptions(model_asset_path=str(model_path)),
+            running_mode=VisionRunningMode.VIDEO,
+            num_hands=self._cfg.max_num_hands,
+            min_hand_detection_confidence=self._cfg.min_detection_confidence,
+            min_hand_presence_confidence=self._cfg.min_detection_confidence,
+            min_tracking_confidence=self._cfg.min_tracking_confidence,
+        )
+        return HandLandmarker.create_from_options(options)
+
     def _init_mediapipe(self) -> bool:
         try:
             log.info("Inicializando MediaPipe Hand Landmarker (Tasks API)...")
-
-            # Asegurar que el modelo esté descargado.
             models_dir = Path.home() / ".sign_translator" / "models"
-            model_path = ensure_hand_model(models_dir)
-
-            BaseOptions = mp.tasks.BaseOptions
-            HandLandmarker = mp.tasks.vision.HandLandmarker
-            HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
-            VisionRunningMode = mp.tasks.vision.RunningMode
-
-            options = HandLandmarkerOptions(
-                base_options=BaseOptions(model_asset_path=str(model_path)),
-                running_mode=VisionRunningMode.VIDEO,
-                num_hands=self._cfg.max_num_hands,
-                min_hand_detection_confidence=self._cfg.min_detection_confidence,
-                min_hand_presence_confidence=self._cfg.min_detection_confidence,
-                min_tracking_confidence=self._cfg.min_tracking_confidence,
-            )
-            self._hands_solution = HandLandmarker.create_from_options(options)
+            self._hands_solution = self._create_hand_landmarker()
             log.info("MediaPipe Hand Landmarker listo.")
+
+            # El cuerpo es opcional: si el modelo de pose no se puede cargar
+            # (p. ej. sin internet la primera vez), las manos y el alfabeto
+            # siguen funcionando igual, solo sin esqueleto.
+            if self._cfg.body_tracking:
+                try:
+                    tracker = BodyTracker(self._cfg.pose_model, models_dir)
+                    self._body_tracker = AsyncBodyTracker(tracker) if self._cfg.pose_async else tracker
+                    log.info("MediaPipe Pose Landmarker (%s%s) listo.", self._cfg.pose_model,
+                             ", en paralelo" if self._cfg.pose_async else "")
+                except Exception:
+                    log.exception("No se pudo iniciar MediaPipe Pose; se sigue sin esqueleto del cuerpo")
+                    self._body_tracker = None
+
             self.model_loaded_signal.emit()
             return True
         except Exception as e:
@@ -1352,37 +2204,23 @@ class HandTrackingThread(QThread):
 
         return det
 
-    def _render(
-        self,
-        frame: np.ndarray,
-        detections: FrameDetections,
-        body: Optional["BodyDetection"] = None,
-    ) -> np.ndarray:
+    def _render(self, frame: np.ndarray, detections: FrameDetections) -> np.ndarray:
         out = frame.copy()
 
-        # Esqueleto de pose: se dibuja ANTES del "return out" de "sin manos"
-        # de abajo, para que se vea aunque todavia no se levanten las manos.
-        # Puramente visual: no cambia nada de lo que sigue (deteccion de
-        # manos, clasificacion, ni el texto/banner de mas abajo).
-        if self._cfg.draw_body_skeleton and body is not None and draw_body_skeleton is not None:
-            try:
-                draw_body_skeleton(out, body, detections.hands)
-            except Exception:
-                log.exception("Error dibujando esqueleto de pose")
+        # Antes que las manos (y antes del return de "sin manos"): el
+        # esqueleto se ve aunque no haya ninguna mano en cuadro.
+        if detections.body is not None and self._cfg.draw_body:
+            draw_body_skeleton(out, detections.body, detections.hands)
+            if self._auto_mode and not self._dynamic_mode:
+                # Arriba de la linea empieza la sena; bajar las manos la termina.
+                draw_rest_line(out, detections.body)
 
-            if self._diagnostic_mode and body_location_features is not None:
-                hands_by_side: dict[str, HandDetection] = {}
-                for h in detections.hands:
-                    if h.handedness not in hands_by_side:
-                        hands_by_side[h.handedness] = h
-                h_frame, w_frame = out.shape[:2]
-                vec = body_location_features(hands_by_side, body, w_frame, h_frame)
-                texto = "Pose (b0..b8): " + " ".join(f"{v:+.2f}" for v in vec)
-                y_texto = h_frame - 15
-                cv2.putText(out, texto, (10, y_texto), cv2.FONT_HERSHEY_SIMPLEX,
-                            0.45, (0, 0, 0), 3, cv2.LINE_AA)
-                cv2.putText(out, texto, (10, y_texto), cv2.FONT_HERSHEY_SIMPLEX,
-                            0.45, (0, 215, 255), 1, cv2.LINE_AA)
+        warning = self._distance_warning.update(
+            detections.hands, out.shape[1], out.shape[0], time.monotonic(),
+        )
+        self._last_distance_warning = warning
+        if warning is not None:
+            draw_warning(out, warning)
 
         if detections.num_hands == 0:
             cv2.putText(
@@ -1436,17 +2274,21 @@ class HandTrackingThread(QThread):
 
         self._keypoint_buffer.append(vec)
 
-    def _update_word_state(self, detections: FrameDetections) -> None:
-        if detections.num_hands == 0:
+    def _update_word_state(self, detections: FrameDetections, resting: bool = False) -> None:
+        """Espacio automatico tras no_hand_frames_for_space frames sin mano
+        (o, en modo automatico, con las manos en reposo: resting)."""
+        if detections.num_hands == 0 or resting:
             self._frames_without_hand += 1
             if (
                 self._frames_without_hand >= self._cfg.no_hand_frames_for_space
                 and not self._space_already_committed
-                and self._last_committed_label is not None
+                and self._word_has_letters
             ):
                 self.space_committed_signal.emit()
                 self._space_already_committed = True
+                self._word_has_letters = False
                 self._last_committed_label = None
+                self._release_frames = 0
                 self._stable_letter = None
                 self._stable_frames = 0
                 self._smoother.reset()
@@ -1479,19 +2321,111 @@ class HandTrackingThread(QThread):
         except statistics.StatisticsError:
             pass
 
-    def stop(self) -> None:
+    def stop(self, timeout_ms: int = 3000) -> bool:
+        """Pide terminar y espera. Devuelve False si el hilo sigue corriendo:
+        el llamador debe conservar la referencia hasta que termine (ver
+        SignLanguageApp._retire_thread). Los modelos los cierra run() al salir."""
         self._run_flag = False
-        self.wait(3000)
-        if self._hands_solution is not None:
+        return self.wait(timeout_ms)
+
+
+# =========================================================================== #
+# Voz (texto a voz del sistema)
+# =========================================================================== #
+
+# Orden de preferencia de voces en macOS. Las "Eloquence" (Eddy, Flo,
+# Grandma...) existen para cada idioma pero suenan robóticas.
+_MAC_LOCALE_ORDER = ("es_MX", "es_US", "es_419", "es_ES")
+_MAC_PREFERRED_VOICES = ("Paulina", "Juan", "Mónica", "Jorge")
+
+# Windows: la voz del sistema (System.Speech) por PowerShell. El texto va por
+# variable de entorno, no dentro del comando, para no tener que escaparlo.
+_WINDOWS_TTS_SCRIPT = (
+    "Add-Type -AssemblyName System.Speech; "
+    "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+    "$v = $s.GetInstalledVoices() | Where-Object { $_.VoiceInfo.Culture.Name -like 'es-*' } "
+    "| Select-Object -First 1; "
+    "if ($v) { $s.SelectVoice($v.VoiceInfo.Name) }; "
+    "$s.Speak($env:LSM_TTS_TEXT)"
+)
+
+
+def _pick_mac_spanish_voice() -> Optional[str]:
+    try:
+        out = subprocess.run(
+            ["say", "-v", "?"], capture_output=True, text=True, timeout=10,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    # Formato: "Paulina (Español (México)) es_MX    # ¡Hola! Me llamo Paulina."
+    voices = []
+    for line in out.splitlines():
+        m = re.match(r"^(.+?)\s+([a-z]{2}_[A-Z0-9]+)\s+#", line)
+        if m and m.group(2).startswith("es_"):
+            voices.append((m.group(1).strip(), m.group(2)))
+    if not voices:
+        return None
+
+    def rank(voice: tuple[str, str]) -> tuple[int, int]:
+        name, locale = voice
+        loc = _MAC_LOCALE_ORDER.index(locale) if locale in _MAC_LOCALE_ORDER else len(_MAC_LOCALE_ORDER)
+        preferred = 0 if name.split(" (")[0] in _MAC_PREFERRED_VOICES else 1
+        return (loc, preferred)
+
+    return min(voices, key=rank)[0]
+
+
+class Speaker:
+    """Lee palabras en voz alta con el TTS del sistema sin bloquear la UI.
+
+    macOS: `say`. Linux / Raspberry Pi: `espeak-ng` o `espeak`. Windows:
+    System.Speech por PowerShell.
+    """
+
+    def __init__(self):
+        self._base_cmd: Optional[list[str]] = None
+        if shutil.which("say"):
+            self._base_cmd = ["say"]
+        elif shutil.which("espeak-ng"):
+            self._base_cmd = ["espeak-ng", "-v", "es-419"]
+        elif shutil.which("espeak"):
+            self._base_cmd = ["espeak", "-v", "es-la"]
+        elif sys.platform == "win32" and shutil.which("powershell"):
+            self._base_cmd = ["powershell", "-NoProfile", "-NonInteractive", "-Command", _WINDOWS_TTS_SCRIPT]
+        self._queue: queue.Queue[str] = queue.Queue()
+        self._worker: Optional[threading.Thread] = None
+
+    @property
+    def available(self) -> bool:
+        return self._base_cmd is not None
+
+    def say(self, text: str) -> None:
+        if not self.available or not text.strip():
+            return
+        if self._worker is None:
+            self._worker = threading.Thread(target=self._run, name="tts", daemon=True)
+            self._worker.start()
+        self._queue.put(text)
+
+    def _run(self) -> None:
+        # Las palabras se leen en orden, sin solaparse.
+        cmd = list(self._base_cmd)
+        if cmd[0] == "say":
+            voice = _pick_mac_spanish_voice()   # tarda ~0.2 s: fuera de la UI
+            if voice:
+                cmd += ["-v", voice]
+        powershell = cmd[0] == "powershell"
+        while True:
+            text = self._queue.get()
             try:
-                self._hands_solution.close()
-            except Exception:
-                pass
-        if self._body_tracker is not None:
-            try:
-                self._body_tracker.close()
-            except Exception:
-                pass
+                subprocess.run(
+                    cmd if powershell else cmd + [text],
+                    env={**os.environ, "LSM_TTS_TEXT": text} if powershell else None,
+                    timeout=30, check=False,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+            except (OSError, subprocess.SubprocessError) as e:
+                log.warning("No se pudo leer en voz alta: %s", e)
 
 
 # =========================================================================== #
@@ -1520,344 +2454,339 @@ class SignLanguageApp(QMainWindow):
         self._watchdog_active = False
 
         self._available_cameras: list[int] = []
-        self._dynamic_mode_enabled = False
 
-        self.setWindowTitle(f"Traductor LSM v{APP_VERSION}")
-        self.setMinimumSize(QSize(1100, 720))
+        # Hilos que no terminaron a tiempo al pararlos. Hay que conservar la
+        # referencia hasta que acaben: si Python destruye un QThread en
+        # marcha, Qt aborta el proceso ("Destroyed while thread is still
+        # running"). Pasaba si el watchdog reiniciaba un hilo trabado.
+        self._retiring_threads: list[QThread] = []
+
+        self.speaker = Speaker()
+
+        # Recrear el HandLandmarker es caro: se espera a que el slider de
+        # confianza de deteccion se detenga antes de aplicarlo.
+        self._threshold_apply_timer = QTimer(self)
+        self._threshold_apply_timer.setSingleShot(True)
+        self._threshold_apply_timer.setInterval(400)
+        self._threshold_apply_timer.timeout.connect(self._apply_threshold)
+
+        # Estado de la interfaz: fase de la sena, letras pendientes (de la
+        # sena en curso, que una palabra todavia puede reemplazar), hasta
+        # cuando se muestra el ultimo resultado y desde cuando se cumple cada
+        # condicion de los consejos en vivo.
+        self._phase = "detenido"
+        self._pending = 0
+        # Primera letra fija de la sena en curso, retenida (no escrita): en
+        # la pausa de una palabra (HOLA en la frente) el clasificador estatico
+        # alcanza a fijar una letra; si se escribiera de inmediato, se veria
+        # aparecer y borrarse cuando llega la palabra. Se escribe al terminar
+        # la sena o en cuanto llega una segunda letra (_spelling: es deletreo).
+        self._held: list[str] = []
+        self._spelling = False
+        self._result_hold_until = 0.0
+        self._guidance_since: dict[str, float] = {}
+        self._flash_timer = QTimer(self)
+        self._flash_timer.setSingleShot(True)
+        self._flash_timer.timeout.connect(lambda: self._apply_phase_style(self._phase))
+        self._settings_dialog: Optional[SettingsDialog] = None
+
+        self.setWindowTitle("Traductor LSM")
+        self.setMinimumSize(QSize(1180, 760))
+        self.setStyleSheet(STYLESHEET)
 
         self._build_ui()
         self._restore_window_state()
+        # Las plantillas se cargan en segundo plano mientras la persona se
+        # acomoda, para que Iniciar no congele la ventana (en la Raspberry Pi,
+        # la primera vez, varios segundos).
+        threading.Thread(target=preload_models, name="precarga", daemon=True).start()
 
     # ---- UI ---------------------------------------------------------------
 
     def _build_ui(self) -> None:
-        self._build_toolbar()
+        self._build_actions()
+        self._build_controls()
         self._build_central_widget()
         self._build_status_bar()
+        self._render_sentence()
+        self._apply_phase_style("detenido")
 
-    def _build_toolbar(self) -> None:
-        toolbar = QToolBar("Principal")
-        toolbar.setObjectName("MainToolBar")  
-        toolbar.setMovable(False)
-        self.addToolBar(toolbar)
+    def _build_actions(self) -> None:
+        """Atajos de teclado (sin barra de herramientas: los botones estan en
+        la ventana)."""
+        def action(text: str, keys: list, slot) -> QAction:
+            act = QAction(text, self)
+            act.setShortcuts([QKeySequence(k) for k in keys])
+            act.triggered.connect(slot)
+            self.addAction(act)
+            return act
 
-        self.action_start = QAction("▶ Iniciar", self)
-        self.action_start.setShortcut(QKeySequence("Ctrl+R"))
-        self.action_start.triggered.connect(self.start_system)
-        toolbar.addAction(self.action_start)
-
-        self.action_stop = QAction("■ Detener", self)
-        self.action_stop.setShortcut(QKeySequence("Ctrl+T"))
-        self.action_stop.triggered.connect(self.stop_system)
+        self.action_start = action("Iniciar", ["Ctrl+R"], self.start_system)
+        self.action_stop = action("Detener", ["Ctrl+T"], self.stop_system)
         self.action_stop.setEnabled(False)
-        toolbar.addAction(self.action_stop)
+        action("Captura", ["Ctrl+S"], self.save_screenshot)
+        action("Borrar letra", [Qt.Key.Key_Backspace], self.delete_last_letter)
+        action("Borrar palabra", ["Ctrl+Backspace"], self.clear_current_word)
+        action("Terminar palabra", [Qt.Key.Key_Return, Qt.Key.Key_Enter, "Ctrl+Space"], self.insert_space)
+        action("Ajustes", ["Ctrl+,"], self.open_settings)
+        action("Guía", ["F1"], self.open_guide)
 
-        toolbar.addSeparator()
+    def _build_controls(self) -> None:
+        """Controles de ajustes tecnicos. Viven en la ventana de Ajustes, pero
+        se crean aqui porque start_system y el watchdog leen sus valores."""
+        def slider(lo: int, hi: int, value: int, slot, tip: str) -> QSlider:
+            s = QSlider(Qt.Orientation.Horizontal)
+            s.setRange(lo, hi)
+            s.setValue(value)
+            s.setToolTip(tip)
+            s.valueChanged.connect(slot)
+            return s
 
-        self.action_dynamic_mode = QAction("🤟 Alfabeto dinámico (J K Ñ Q X Z)", self)
-        self.action_dynamic_mode.setCheckable(True)
-        self.action_dynamic_mode.setShortcut(QKeySequence("Ctrl+D"))
-        self.action_dynamic_mode.setToolTip(
-            "Alterna entre el alfabeto estático (A-Y, frame a frame) y el\n"
-            "alfabeto dinámico (J,K,Ñ,Q,X,Z, señas con movimiento)."
-        )
-        self.action_dynamic_mode.toggled.connect(self._on_toggle_dynamic_mode)
-        toolbar.addAction(self.action_dynamic_mode)
+        self.stable_frames_slider = slider(
+            3, 25, self.cfg.stable_frames_to_commit, self._on_stable_frames_changed,
+            "Cuántos frames seguidos debe mantenerse una letra para fijarla.\n"
+            "Bajo = más rápido, más errores. Alto = más lento, más seguro.")
+        self.stable_frames_value_label = QLabel(str(self.cfg.stable_frames_to_commit))
+        self.min_confidence_slider = slider(
+            30, 90, round(self.cfg.min_letter_confidence * 100), self._on_min_confidence_changed,
+            "Qué tan seguro debe estar el modelo para que una letra fija cuente.")
+        self.min_confidence_value_label = QLabel(f"{self.cfg.min_letter_confidence:.2f}")
+        self.min_margin_slider = slider(
+            0, 50, round(self.cfg.min_letter_margin * 100), self._on_min_margin_changed,
+            "Diferencia mínima entre la 1.ª y la 2.ª letra más probables.")
+        self.min_margin_value_label = QLabel(f"{self.cfg.min_letter_margin:.2f}")
+        self.threshold_slider = slider(
+            10, 95, int(self.cfg.min_detection_confidence * 100), self._on_threshold_changed,
+            "Confianza mínima para detectar una mano.")
+        self.threshold_value_label = QLabel(f"{int(self.cfg.min_detection_confidence * 100)}%")
 
-        toolbar.addSeparator()
+        self.hand_combo = QComboBox()
+        self.hand_combo.addItem("Derecha", "Right")
+        self.hand_combo.addItem("Izquierda", "Left")
+        self.hand_combo.setCurrentIndex(self.hand_combo.findData(self.cfg.dominant_hand))
+        self.hand_combo.setToolTip(
+            "Con la izquierda, las señas se reflejan para compararlas con\n"
+            "el modelo y las plantillas, que son de la mano derecha.")
+        self.hand_combo.currentIndexChanged.connect(self._on_dominant_hand_changed)
 
-        action_screenshot = QAction("📷 Captura", self)
-        action_screenshot.setShortcut(QKeySequence("Ctrl+S"))
-        action_screenshot.triggered.connect(self.save_screenshot)
-        toolbar.addAction(action_screenshot)
+        self.cb_speak = QCheckBox("Leer cada palabra en voz alta al terminarla")
+        if self.speaker.available:
+            self.cb_speak.setChecked(self.cfg.speak_words)
+        else:
+            self.cb_speak.setEnabled(False)
+            self.cb_speak.setToolTip("No se encontró un motor de voz.\n"
+                                     "Linux / Raspberry Pi: sudo apt install espeak-ng")
+        self.cb_speak.toggled.connect(self._on_speak_toggled)
 
-        action_export = QAction("💾 Exportar historial", self)
-        action_export.triggered.connect(self.export_history)
-        toolbar.addAction(action_export)
+        self.cb_landmarks = QCheckBox("Puntos de las manos")
+        self.cb_landmarks.setChecked(self.cfg.draw_landmarks)
+        self.cb_landmarks.toggled.connect(self._on_draw_landmarks)
+        self.cb_connections = QCheckBox("Conexiones de las manos")
+        self.cb_connections.setChecked(self.cfg.draw_connections)
+        self.cb_connections.toggled.connect(self._on_draw_connections)
+        self.cb_body = QCheckBox("Esqueleto del cuerpo y línea de reposo")
+        self.cb_body.setChecked(self.cfg.draw_body)
+        self.cb_body.setEnabled(self.cfg.body_tracking)
+        self.cb_body.toggled.connect(self._on_draw_body)
 
-        toolbar.addSeparator()
+        self.cb_diagnostic = QCheckBox("Mostrar las 3 letras más probables en cada frame")
+        self.cb_diagnostic.toggled.connect(self._on_diagnostic_toggled)
+        self.diagnostic_label = QLabel("")
+        self.diagnostic_label.setStyleSheet("font-family: monospace; font-size: 12px;")
+        self.diagnostic_label.setWordWrap(True)
+        self.diagnostic_label.hide()
 
-        action_clear = QAction("⌫ Borrar palabra", self)
-        action_clear.setShortcut(QKeySequence("Ctrl+Backspace"))
-        action_clear.triggered.connect(self.clear_current_word)
-        toolbar.addAction(action_clear)
-
-        action_space = QAction("␣ Espacio manual", self)
-        action_space.setShortcut(QKeySequence("Ctrl+Space"))
-        action_space.triggered.connect(self.insert_space)
-        toolbar.addAction(action_space)
+    @staticmethod
+    def _labeled_row(text: str, widget: QWidget, value: Optional[QLabel] = None) -> QHBoxLayout:
+        row = QHBoxLayout()
+        label = QLabel(text)
+        label.setMinimumWidth(150)
+        row.addWidget(label)
+        row.addWidget(widget, stretch=1)
+        if value is not None:
+            value.setMinimumWidth(44)
+            row.addWidget(value)
+        return row
 
     def _build_central_widget(self) -> None:
         central = QWidget()
         self.setCentralWidget(central)
-        main = QHBoxLayout(central)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(18, 14, 18, 10)
+        root.setSpacing(14)
 
-        # Panel video.
-        video_box = QVBoxLayout()
-        self.image_label = QLabel("Pulsa Iniciar (Ctrl+R) para comenzar")
-        self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.image_label.setStyleSheet(
-            "background-color: #1a1a1a; color: #888; font-size: 14px; border-radius: 8px;"
-        )
-        self.image_label.setMinimumSize(640, 480)
-        self.image_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        video_box.addWidget(self.image_label, stretch=1)
-
-        word_frame = QFrame()
-        word_frame.setFrameShape(QFrame.Shape.StyledPanel)
-        word_layout = QVBoxLayout(word_frame)
-        word_title = QLabel("PALABRA EN CONSTRUCCIÓN")
-        word_title.setStyleSheet("font-size: 11px; color: #777; font-weight: bold;")
-        self.word_label = QLabel("")
-        self.word_label.setStyleSheet(
-            "font-size: 36px; font-weight: bold; color: #1a5490; "
-            "letter-spacing: 4px; padding: 8px;"
-        )
-        self.word_label.setMinimumHeight(60)
-        word_layout.addWidget(word_title)
-        word_layout.addWidget(self.word_label)
-        video_box.addWidget(word_frame)
-
-        # Panel lateral.
-        side = QVBoxLayout()
-
-        title = QLabel("ESTADO")
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        title.setStyleSheet("font-weight: bold; font-size: 14px; color: #555;")
-        side.addWidget(title)
-
-        self.sign_label = QLabel("—")
-        self.sign_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.sign_label.setStyleSheet(
-            "font-size: 32px; color: #2E86C1; font-weight: bold;"
-            "border: 2px solid #d0d0d0; border-radius: 12px; padding: 18px;"
-        )
-        self.sign_label.setMinimumHeight(100)
-        side.addWidget(self.sign_label)
-
-        self.classifier_info_label = QLabel(self._classifier_status_text())
-        self.classifier_info_label.setWordWrap(True)
-        self.classifier_info_label.setStyleSheet("color: #777; font-size: 11px; font-style: italic;")
-        self.classifier_info_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        side.addWidget(self.classifier_info_label)
-
-        side.addSpacing(8)
-        clf_title = QLabel("AJUSTES DE RECONOCIMIENTO")
-        clf_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        clf_title.setStyleSheet("font-weight: bold; font-size: 12px; color: #555;")
-        side.addWidget(clf_title)
-
-        stab_row = QHBoxLayout()
-        stab_label = QLabel("Estabilidad:")
-        stab_label.setToolTip(
-            "Cuántos frames seguidos debe mantenerse una letra para fijarla.\n"
-            "Bajo = más rápido, más errores. Alto = más lento, más seguro."
-        )
-        stab_row.addWidget(stab_label)
-        self.stable_frames_slider = QSlider(Qt.Orientation.Horizontal)
-        self.stable_frames_slider.setRange(3, 25)
-        self.stable_frames_slider.setValue(self.cfg.stable_frames_to_commit)
-        self.stable_frames_slider.valueChanged.connect(self._on_stable_frames_changed)
-        self.stable_frames_value_label = QLabel(str(self.cfg.stable_frames_to_commit))
-        self.stable_frames_value_label.setMinimumWidth(28)
-        stab_row.addWidget(self.stable_frames_slider, stretch=1)
-        stab_row.addWidget(self.stable_frames_value_label)
-        side.addLayout(stab_row)
-
-        conf_row = QHBoxLayout()
-        conf_label = QLabel("Conf. mín:")
-        conf_label.setToolTip(
-            "Qué tan seguro debe estar el modelo para que la letra cuente.\n"
-            "Alto = solo letras muy claras. Bajo = acepta predicciones inseguras."
-        )
-        conf_row.addWidget(conf_label)
-        self.min_confidence_slider = QSlider(Qt.Orientation.Horizontal)
-        self.min_confidence_slider.setRange(30, 90)
-        self.min_confidence_slider.setValue(55)
-        self.min_confidence_slider.valueChanged.connect(self._on_min_confidence_changed)
-        self.min_confidence_value_label = QLabel("0.55")
-        self.min_confidence_value_label.setMinimumWidth(40)
-        conf_row.addWidget(self.min_confidence_slider, stretch=1)
-        conf_row.addWidget(self.min_confidence_value_label)
-        side.addLayout(conf_row)
-
-        margin_row = QHBoxLayout()
-        margin_label = QLabel("Margen:")
-        margin_label.setToolTip(
-            "Diferencia mínima entre la 1ª y 2ª letra más probables.\n"
-            "Alto = bloquea cuando el modelo duda (M vs N, V vs W).\n"
-            "Bajo = acepta predicciones aunque sean parejas."
-        )
-        margin_row.addWidget(margin_label)
-        self.min_margin_slider = QSlider(Qt.Orientation.Horizontal)
-        self.min_margin_slider.setRange(0, 50)
-        self.min_margin_slider.setValue(15)
-        self.min_margin_slider.valueChanged.connect(self._on_min_margin_changed)
-        self.min_margin_value_label = QLabel("0.15")
-        self.min_margin_value_label.setMinimumWidth(40)
-        margin_row.addWidget(self.min_margin_slider, stretch=1)
-        margin_row.addWidget(self.min_margin_value_label)
-        side.addLayout(margin_row)
-
-        # Toggle: modo diagnóstico
-        self.cb_diagnostic = QCheckBox("Modo diagnóstico (mostrar top-3)")
-        self.cb_diagnostic.setToolTip(
-            "Muestra las 3 letras más probables en cada frame.\n"
-            "Útil para entender por qué una letra falla."
-        )
-        self.cb_diagnostic.toggled.connect(self._on_diagnostic_toggled)
-        side.addWidget(self.cb_diagnostic)
-
-        self.diagnostic_label = QLabel("")
-        self.diagnostic_label.setStyleSheet(
-            "font-family: monospace; font-size: 11px; color: #888;"
-            "background: #f5f5f5; border-radius: 4px; padding: 6px;"
-        )
-        self.diagnostic_label.setMinimumHeight(48)
-        self.diagnostic_label.setWordWrap(True)
-        self.diagnostic_label.hide()
-        side.addWidget(self.diagnostic_label)
-
-        side.addSpacing(8)
-
-        cam_row = QHBoxLayout()
-        cam_row.addWidget(QLabel("Cámara:"))
+        # Encabezado: titulo, camara, guia, ajustes e iniciar/detener.
+        header = QHBoxLayout()
+        titles = QVBoxLayout()
+        title = QLabel("Traductor LSM")
+        title.setObjectName("AppTitle")
+        subtitle = QLabel("Lengua de Señas Mexicana a texto y voz")
+        subtitle.setObjectName("AppSubtitle")
+        titles.addWidget(title)
+        titles.addWidget(subtitle)
+        header.addLayout(titles)
+        header.addStretch()
         self.camera_combo = QComboBox()
-        self.camera_combo.addItem(f"#{self.cfg.camera_index}", self.cfg.camera_index)
+        self.camera_combo.addItem(f"Cámara #{self.cfg.camera_index}", self.cfg.camera_index)
+        self.camera_combo.setMinimumWidth(130)
         self.refresh_cameras_btn = QPushButton("↻")
-        self.refresh_cameras_btn.setFixedWidth(32)
         self.refresh_cameras_btn.setToolTip("Buscar cámaras conectadas")
         self.refresh_cameras_btn.clicked.connect(self._refresh_cameras)
-        cam_row.addWidget(self.camera_combo, stretch=1)
-        cam_row.addWidget(self.refresh_cameras_btn)
-        side.addLayout(cam_row)
+        guide_btn = QPushButton("❔ Guía")
+        guide_btn.setToolTip("Cómo hacer las señas (F1)")
+        guide_btn.clicked.connect(self.open_guide)
+        settings_btn = QPushButton("⚙ Ajustes")
+        settings_btn.setToolTip("Ajustes de cámara, reconocimiento y voz (Ctrl+,)")
+        settings_btn.clicked.connect(self.open_settings)
+        self.start_button = QPushButton("▶  Iniciar")
+        self.start_button.setObjectName("Primary")
+        self.start_button.setMinimumWidth(130)
+        self.start_button.setToolTip("Iniciar o detener la cámara (Ctrl+R / Ctrl+T)")
+        self.start_button.clicked.connect(self._toggle_system)
+        for w in (self.camera_combo, self.refresh_cameras_btn, guide_btn, settings_btn, self.start_button):
+            w.setCursor(Qt.CursorShape.PointingHandCursor)
+            header.addWidget(w)
+        root.addLayout(header)
 
-        thr_row = QHBoxLayout()
-        thr_row.addWidget(QLabel("Confianza:"))
-        self.threshold_slider = QSlider(Qt.Orientation.Horizontal)
-        self.threshold_slider.setRange(10, 95)
-        self.threshold_slider.setValue(int(self.cfg.min_detection_confidence * 100))
-        self.threshold_slider.setToolTip("Confianza mínima para detectar una mano")
-        self.threshold_slider.valueChanged.connect(self._on_threshold_changed)
-        self.threshold_value_label = QLabel(f"{int(self.cfg.min_detection_confidence * 100)}%")
-        self.threshold_value_label.setMinimumWidth(40)
-        thr_row.addWidget(self.threshold_slider, stretch=1)
-        thr_row.addWidget(self.threshold_value_label)
-        side.addLayout(thr_row)
+        body = QHBoxLayout()
+        body.setSpacing(14)
+        root.addLayout(body, stretch=1)
 
-        self.cb_landmarks = QCheckBox("Dibujar puntos (círculos)")
-        self.cb_landmarks.setChecked(self.cfg.draw_landmarks)
-        self.cb_landmarks.toggled.connect(self._on_draw_landmarks)
-        side.addWidget(self.cb_landmarks)
+        # Columna izquierda: video y texto traducido.
+        left = QVBoxLayout()
+        left.setSpacing(14)
+        video_card = Card()
+        self.image_label = QLabel("Presiona  ▶ Iniciar  para encender la cámara")
+        self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.image_label.setMinimumSize(640, 420)
+        self.image_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        video_card.body.addWidget(self.image_label, stretch=1)
+        video_footer = QHBoxLayout()
+        self.phase_pill = Pill()
+        video_footer.addWidget(self.phase_pill)
+        self.hint_label = QLabel("Sube la mano sobre la línea punteada para empezar una seña.")
+        self.hint_label.setObjectName("Muted")
+        video_footer.addWidget(self.hint_label, stretch=1)
+        video_card.body.addLayout(video_footer)
+        left.addWidget(video_card, stretch=1)
 
-        self.cb_connections = QCheckBox("Dibujar conexiones (estructura)")
-        self.cb_connections.setChecked(self.cfg.draw_connections)
-        self.cb_connections.toggled.connect(self._on_draw_connections)
-        side.addWidget(self.cb_connections)
+        text_card = Card("Texto traducido")
+        self.sentence_label = QLabel()
+        self.sentence_label.setWordWrap(True)
+        self.sentence_label.setTextFormat(Qt.TextFormat.RichText)
+        self.sentence_label.setMinimumHeight(70)
+        self.sentence_label.setStyleSheet("font-size: 30px; font-weight: 600; letter-spacing: 1px;")
+        text_card.body.addWidget(self.sentence_label)
+        buttons = QHBoxLayout()
+        for text, tip, slot in (
+            ("⌫  Borrar letra", "Borra la última letra (Retroceso)", self.delete_last_letter),
+            ("✕  Borrar palabra", "Borra la palabra en curso (Ctrl+Retroceso)", self.clear_current_word),
+            ("␣  Terminar palabra", "Cierra la palabra en curso (Enter)", self.insert_space),
+            ("🔊  Leer", "Lee en voz alta la última palabra", self.speak_last),
+            ("💾  Guardar texto", "Guarda todo el texto en un archivo", self.export_history),
+            ("🗑  Limpiar", "Borra todo el texto", self.clear_all),
+        ):
+            b = big_button(text, tip)
+            b.clicked.connect(slot)
+            buttons.addWidget(b)
+        text_card.body.addLayout(buttons)
+        left.addWidget(text_card)
+        body.addLayout(left, stretch=62)
 
-        self.cb_body_skeleton = QCheckBox("Dibujar esqueleto (Pose)")
-        self.cb_body_skeleton.setToolTip(
-            "Solo visual/diagnostico (MediaPipe Pose). No afecta el "
-            "reconocimiento de letras estaticas ni dinamicas."
-        )
-        self.cb_body_skeleton.setChecked(self.cfg.draw_body_skeleton)
-        self.cb_body_skeleton.toggled.connect(self._on_draw_body_skeleton)
-        side.addWidget(self.cb_body_skeleton)
+        # Columna derecha: sena actual y retroalimentacion.
+        right = QVBoxLayout()
+        right.setSpacing(14)
+        sign_card = Card("Seña")
+        self.sign_label = QLabel("—")
+        self.sign_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.sign_label.setMinimumHeight(110)
+        self.sign_kind_label = QLabel("Esperando")
+        self.sign_kind_label.setObjectName("Muted")
+        self.sign_kind_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        sign_card.body.addWidget(self.sign_label)
+        sign_card.body.addWidget(self.sign_kind_label)
+        self.candidates = CandidateBars()
+        sign_card.body.addWidget(self.candidates)
+        self._set_sign("—", COLORS["muted"], "Esperando")
+        right.addWidget(sign_card)
 
-        side.addSpacing(8)
-
-        side.addWidget(QLabel("HISTORIAL"))
-        self.history_view = QPlainTextEdit()
-        self.history_view.setReadOnly(True)
-        self.history_view.setMaximumHeight(150)
-        self.history_view.setStyleSheet("font-family: monospace; font-size: 12px;")
-        side.addWidget(self.history_view)
-
-        side.addStretch()
-
-        main.addLayout(video_box, stretch=7)
-        main.addLayout(side, stretch=3)
+        fb_card = Card("Retroalimentación")
+        self.feedback = FeedbackPanel()
+        fb_card.body.addWidget(self.feedback, stretch=1)
+        right.addWidget(fb_card, stretch=1)
+        body.addLayout(right, stretch=38)
 
     def _build_status_bar(self) -> None:
         bar = QStatusBar()
         self.setStatusBar(bar)
-
-        self.status_engine = QLabel("⚙ MediaPipe Hands")
-        self.status_camera = QLabel("● Cámara: detenida")
+        self.status_camera = QLabel("● Cámara detenida")
+        self.status_body = QLabel("Cuerpo: —")
         self.status_hands = QLabel("✋ Manos: 0")
         self.status_fps = QLabel("FPS: —")
         self.status_latency = QLabel("Latencia: —")
+        for w in (self.status_camera, self.status_body, self.status_hands, self.status_fps, self.status_latency):
+            bar.addPermanentWidget(w)
 
-        bar.addPermanentWidget(self.status_engine)
-        bar.addPermanentWidget(self._sep())
-        bar.addPermanentWidget(self.status_camera)
-        bar.addPermanentWidget(self._sep())
-        bar.addPermanentWidget(self.status_hands)
-        bar.addPermanentWidget(self._sep())
-        bar.addPermanentWidget(self.status_fps)
-        bar.addPermanentWidget(self._sep())
-        bar.addPermanentWidget(self.status_latency)
+    def open_settings(self) -> None:
+        if self._settings_dialog is None:
+            cam_row = QHBoxLayout()
+            cam_row.addWidget(QLabel("La cámara se elige arriba, junto a Iniciar."))
+            self._settings_dialog = SettingsDialog([
+                ("Letras fijas (A-Y)", [
+                    self._labeled_row("Estabilidad (frames)", self.stable_frames_slider, self.stable_frames_value_label),
+                    self._labeled_row("Confianza mínima", self.min_confidence_slider, self.min_confidence_value_label),
+                    self._labeled_row("Margen mínimo", self.min_margin_slider, self.min_margin_value_label),
+                ]),
+                ("Cámara y detección", [
+                    cam_row,
+                    self._labeled_row("Detección de manos", self.threshold_slider, self.threshold_value_label),
+                ]),
+                ("Persona", [self._labeled_row("Mano que deletrea", self.hand_combo), self.cb_speak]),
+                ("Dibujo sobre el video", [self.cb_landmarks, self.cb_connections, self.cb_body]),
+                ("Diagnóstico", [self.cb_diagnostic, self.diagnostic_label]),
+            ], self)
+        self._settings_dialog.show()
+        self._settings_dialog.raise_()
 
-    @staticmethod
-    def _sep() -> QFrame:
-        s = QFrame()
-        s.setFrameShape(QFrame.Shape.VLine)
-        s.setFrameShadow(QFrame.Shadow.Sunken)
-        return s
+    def open_guide(self) -> None:
+        profiles = word_profiles()
+        lines = [how_to_sign(label, prof) for label, prof in sorted(profiles.items())]
+        GuideDialog(lines, self).exec()
 
-    def _dynamic_recognizer_available(self) -> bool:
-        models_dir = Path(__file__).resolve().parent
-        dynamic_dir = models_dir / "datos_dinamicas"
-        return (
-            AutoSegmenter is not None and DTWRecognizer is not None
-            and dynamic_dir.is_dir() and any(dynamic_dir.iterdir())
+    # ---- estado visual ----------------------------------------------------
+
+    def _set_sign(self, text: str, color: str, kind: str) -> None:
+        # Se llama en cada frame: setStyleSheet obliga a Qt a recalcular el
+        # estilo, asi que solo se toca si algo cambio.
+        if (text, color, kind) == getattr(self, "_sign_state", None):
+            return
+        self._sign_state = (text, color, kind)
+        size = 64 if len(text) <= 2 else (40 if len(text) <= 9 else 30)
+        self.sign_label.setText(text)
+        self.sign_label.setStyleSheet(f"font-size: {size}px; font-weight: 800; color: {color};")
+        self.sign_kind_label.setText(kind)
+
+    def _apply_phase_style(self, phase: str) -> None:
+        text, color = PHASE_STYLE.get(phase, PHASE_STYLE["reposo"])
+        # En reposo el marco queda discreto, pero la etiqueta se tiene que leer.
+        self.phase_pill.set(text, COLORS["muted"] if phase in ("reposo", "detenido") else color)
+        self.image_label.setStyleSheet(
+            f"background: #0b1220; color: {COLORS['muted']}; font-size: 16px;"
+            f"border: 3px solid {color}; border-radius: 12px;"
         )
 
-    def _static_help_text(self) -> str:
-        from sign_classifier import MODEL_FILENAME, LABELS_FILENAME
-        models_dir = Path(__file__).resolve().parent
-        onnx_path = models_dir / MODEL_FILENAME
-        labels_path = models_dir / LABELS_FILENAME
-
-        dynamic_line = (
-            "Alfabeto dinámico (J,K,Ñ,Q,X,Z) disponible: Ctrl+D para activarlo."
-            if self._dynamic_recognizer_available() else
-            "Alfabeto dinámico no disponible (faltan plantillas o fastdtw/scipy)."
+    def _flash(self, phase: str, ms: int = 1400) -> None:
+        """Marco verde (reconocida) o ambar (repetir) por un momento."""
+        text, color = PHASE_STYLE[phase]
+        self.phase_pill.set(text, color)
+        self.image_label.setStyleSheet(
+            f"background: #0b1220; color: {COLORS['muted']}; font-size: 16px;"
+            f"border: 3px solid {color}; border-radius: 12px;"
         )
+        self._flash_timer.start(ms)
 
-        if onnx_path.exists() and labels_path.exists():
-            return (
-                "Modo ESTÁTICO activo (alfabeto, 21 letras A-Y).\n"
-                "Mantén una seña ~12 frames para fijar la letra.\n"
-                "Baja las manos ~25 frames para insertar un espacio.\n"
-                f"{dynamic_line}"
-            )
-        return (
-            "Sin modelo de clasificación cargado.\n"
-            f"Coloca {MODEL_FILENAME} y {LABELS_FILENAME} en:\n{models_dir}\n"
-            f"{dynamic_line}"
-        )
-
-    def _dynamic_help_text(self) -> str:
-        labels = self.ai_thread.dynamic_labels if self.ai_thread is not None else []
-        letras = ", ".join(labels) if labels else "J, K, Ñ, Q, X, Z"
-        return (
-            f"Modo DINÁMICO activo ({letras}).\n"
-            "1) Levanta la mano y haz la seña completa.\n"
-            "2) Bájala al terminar: se clasifica sola, sin presionar nada.\n"
-            f"Fin de seña tras ~{DYN_NO_HAND_MS_TO_END}ms sin mano "
-            f"(tope máx. {DYN_MAX_SEQUENCE_MS / 1000:.0f}s por seña).\n"
-            "Ctrl+D para volver al alfabeto estático."
-        )
-
-    def _classifier_status_text(self) -> str:
-        # El texto de ayuda cambia segun el modo activo (item 1 del pedido):
-        # explica el flujo dinamico (levantar mano / señar / bajar mano)
-        # cuando ese modo esta encendido, o el estatico en caso contrario.
-        if self._dynamic_mode_enabled:
-            return self._dynamic_help_text()
-        return self._static_help_text()
-
+    def _render_sentence(self) -> None:
+        self.sentence_label.setText(sentence_html(self.history, self.current_word, self._pending))
 
     def _restore_window_state(self) -> None:
         geom = self.settings.value("window/geometry")
@@ -1880,6 +2809,10 @@ class SignLanguageApp(QMainWindow):
         self.ai_thread.hands_detected_signal.connect(self.update_hands)
         self.ai_thread.letter_committed_signal.connect(self.on_letter_committed)
         self.ai_thread.space_committed_signal.connect(self.on_space_committed)
+        self.ai_thread.auto_result_signal.connect(self._on_auto_result)
+        self.ai_thread.letters_retracted_signal.connect(self.on_letters_retracted)
+        self.ai_thread.phase_signal.connect(self._on_phase)
+        self.ai_thread.guidance_signal.connect(self._on_guidance)
         self.ai_thread.metrics_signal.connect(self.update_metrics)
         self.ai_thread.error_signal.connect(self._on_ai_error)
         self.ai_thread.model_loaded_signal.connect(self._on_model_loaded)
@@ -1893,6 +2826,11 @@ class SignLanguageApp(QMainWindow):
 
         self.action_start.setEnabled(False)
         self.status_camera.setText("● Conectando...")
+        self.start_button.setText("■  Detener")
+        self.start_button.setObjectName("Danger")
+        self.start_button.setStyleSheet("")    # que tome el estilo de #Danger
+        self.image_label.setText("Encendiendo la cámara…")
+        self._on_phase("reposo")
 
         self.camera_thread = CameraThread(self.frame_queue, self.cfg.camera_index)
         self.ai_thread = HandTrackingThread(self.frame_queue, self.cfg)
@@ -1901,7 +2839,6 @@ class SignLanguageApp(QMainWindow):
         self.ai_thread.set_min_confidence(self.min_confidence_slider.value() / 100.0)
         self.ai_thread.set_min_margin(self.min_margin_slider.value() / 100.0)
         self.ai_thread.set_diagnostic_mode(self.cb_diagnostic.isChecked())
-        self._apply_pending_dynamic_mode()
 
         self.camera_thread.error_signal.connect(self._on_camera_error)
         self.camera_thread.status_signal.connect(lambda s: self.status_camera.setText(f"● {s}"))
@@ -1923,16 +2860,48 @@ class SignLanguageApp(QMainWindow):
 
         self.action_stop.setEnabled(True)
 
+    def _retire_thread(self, thread: QThread) -> None:
+        """Para el hilo; si no termina a tiempo, guarda la referencia hasta
+        que termine (ver _retiring_threads) en vez de soltarla."""
+        if thread is self.ai_thread:
+            # Que un hilo viejo que todavia no sale no siga mandando video o
+            # letras a la ventana mientras corre el nuevo.
+            for signal in (
+                thread.change_pixmap_signal, thread.sign_detected_signal,
+                thread.sign_diagnostic_signal, thread.hands_detected_signal,
+                thread.letter_committed_signal, thread.space_committed_signal,
+                thread.metrics_signal, thread.error_signal,
+                thread.model_loaded_signal, thread.heartbeat_signal,
+                thread.auto_result_signal, thread.letters_retracted_signal,
+                thread.phase_signal, thread.guidance_signal,
+            ):
+                try:
+                    signal.disconnect()
+                except TypeError:
+                    pass
+        if thread.stop():
+            return
+        log.warning("%s no terminó a tiempo; se espera en segundo plano", type(thread).__name__)
+        self._retiring_threads.append(thread)
+        thread.finished.connect(lambda t=thread: self._forget_thread(t))
+        if thread.isFinished():   # termino justo entre stop() y el connect
+            self._forget_thread(thread)
+
+    def _forget_thread(self, thread: QThread) -> None:
+        if thread in self._retiring_threads:
+            self._retiring_threads.remove(thread)
+
     def stop_system(self) -> None:
         self._watchdog_active = False
         self._watchdog.stop()
+        self._threshold_apply_timer.stop()
 
         if self.camera_thread is not None:
-            self.camera_thread.stop()
+            self._retire_thread(self.camera_thread)
             self.camera_thread = None
 
         if self.ai_thread is not None:
-            self.ai_thread.stop()
+            self._retire_thread(self.ai_thread)
             self.ai_thread = None
 
         while not self.frame_queue.empty():
@@ -1941,28 +2910,44 @@ class SignLanguageApp(QMainWindow):
             except queue.Empty:
                 break
 
-        self.image_label.setText("Cámara detenida")
         self.image_label.setPixmap(QPixmap())
-        self.sign_label.setText("—")
-        self.status_camera.setText("● Cámara: detenida")
+        self.image_label.setText("Cámara detenida. Presiona  ▶ Iniciar  para continuar")
+        self._set_sign("—", COLORS["muted"], "Esperando")
+        self.candidates.set_candidates([])
+        self.feedback.set_live(None)
+        self._guidance_since.clear()
+        self._pending = 0
+        self._render_sentence()
+        self._flash_timer.stop()
+        self._on_phase("detenido")
+        self.status_camera.setText("● Cámara detenida")
+        self.status_body.setText("Cuerpo: —")
         self.status_hands.setText("✋ Manos: 0")
         self.status_fps.setText("FPS: —")
         self.status_latency.setText("Latencia: —")
 
         self.action_start.setEnabled(True)
         self.action_stop.setEnabled(False)
+        self.start_button.setText("▶  Iniciar")
+        self.start_button.setObjectName("Primary")
+        self.start_button.setStyleSheet("")
+
+    def _toggle_system(self) -> None:
+        if self.camera_thread is None and self.ai_thread is None:
+            self.start_system()
+        else:
+            self.stop_system()
 
     def _restart_ai_thread(self) -> None:
         log.warning("Watchdog: reiniciando hilo de IA")
         if self.ai_thread is not None:
-            self.ai_thread.stop()
+            self._retire_thread(self.ai_thread)
         self.ai_thread = HandTrackingThread(self.frame_queue, self.cfg)
         self._wire_ai_thread()
         self.ai_thread.set_stable_frames_to_commit(self.stable_frames_slider.value())
         self.ai_thread.set_min_confidence(self.min_confidence_slider.value() / 100.0)
         self.ai_thread.set_min_margin(self.min_margin_slider.value() / 100.0)
         self.ai_thread.set_diagnostic_mode(self.cb_diagnostic.isChecked())
-        self._apply_pending_dynamic_mode()
         self.ai_thread.start()
         self._last_heartbeat = time.time()
         self.statusBar().showMessage("IA reiniciada por inactividad", 3000)
@@ -1971,56 +2956,13 @@ class SignLanguageApp(QMainWindow):
     def _on_threshold_changed(self, value: int) -> None:
         self.threshold_value_label.setText(f"{value}%")
         self.cfg.min_detection_confidence = value / 100.0
+        # Antes solo se guardaba en la config y no tenia efecto hasta el
+        # siguiente Iniciar: el detector se crea con el umbral una sola vez.
+        self._threshold_apply_timer.start()
 
-    def _warn_dynamic_unavailable(self) -> None:
-        QMessageBox.warning(
-            self, "Alfabeto dinámico no disponible",
-            "No se encontraron plantillas dinámicas (datos_dinamicas/) o "
-            "falta instalar fastdtw/scipy.\n\n"
-            "Corre recolector_dinamico.py o procesar_dataset_dinamico.py, "
-            "y revisa la consola al iniciar la app para más detalle.",
-        )
-        self._dynamic_mode_enabled = False
-        self.action_dynamic_mode.blockSignals(True)
-        self.action_dynamic_mode.setChecked(False)
-        self.action_dynamic_mode.blockSignals(False)
-        self.classifier_info_label.setText(self._classifier_status_text())
-
-    def _on_toggle_dynamic_mode(self, checked: bool) -> None:
-        # Solo podemos saber si el reconocedor dinamico esta disponible una
-        # vez que existe ai_thread (se crea al Iniciar). Si todavia no existe,
-        # guardamos la preferencia y se valida/aplica en start_system() via
-        # _apply_pending_dynamic_mode().
-        if checked and self.ai_thread is not None and not self.ai_thread.has_dynamic_recognizer:
-            self._warn_dynamic_unavailable()
-            return
-
-        self._dynamic_mode_enabled = checked
+    def _apply_threshold(self) -> None:
         if self.ai_thread is not None:
-            self.ai_thread.set_dynamic_mode(checked)
-
-        # El texto de ayuda de abajo del Estado y el panel top-3 dependen del
-        # modo activo (items 1 y 2 del pedido), no solo del checkbox de
-        # diagnostico estatico.
-        self.classifier_info_label.setText(self._classifier_status_text())
-        self.sign_label.setText("Esperando mano" if checked else "—")
-
-        if checked:
-            self.diagnostic_label.show()
-            self.diagnostic_label.setText("Esperando seña...")
-            labels = self.ai_thread.dynamic_labels if self.ai_thread is not None else []
-            self.statusBar().showMessage(f"Modo dinámico activo ({', '.join(labels)})", 4000)
-        else:
-            if not self.cb_diagnostic.isChecked():
-                self.diagnostic_label.hide()
-            self.statusBar().showMessage("Modo estático activo (alfabeto A-Y)", 3000)
-
-    def _apply_pending_dynamic_mode(self) -> None:
-        assert self.ai_thread is not None
-        if self._dynamic_mode_enabled and not self.ai_thread.has_dynamic_recognizer:
-            self._warn_dynamic_unavailable()
-            return
-        self.ai_thread.set_dynamic_mode(self._dynamic_mode_enabled)
+            self.ai_thread.request_hands_reinit()
 
     def _on_draw_landmarks(self, checked: bool) -> None:
         self.cfg.draw_landmarks = checked
@@ -2032,10 +2974,10 @@ class SignLanguageApp(QMainWindow):
         if self.ai_thread is not None:
             self.ai_thread.set_draw_connections(checked)
 
-    def _on_draw_body_skeleton(self, checked: bool) -> None:
-        self.cfg.draw_body_skeleton = checked
+    def _on_draw_body(self, checked: bool) -> None:
+        self.cfg.draw_body = checked
         if self.ai_thread is not None:
-            self.ai_thread.set_draw_body_skeleton(checked)
+            self.ai_thread.set_draw_body(checked)
 
     def _on_stable_frames_changed(self, value: int) -> None:
         self.stable_frames_value_label.setText(str(value))
@@ -2046,14 +2988,25 @@ class SignLanguageApp(QMainWindow):
     def _on_min_confidence_changed(self, value: int) -> None:
         v = value / 100.0
         self.min_confidence_value_label.setText(f"{v:.2f}")
+        self.cfg.min_letter_confidence = v
         if self.ai_thread is not None:
             self.ai_thread.set_min_confidence(v)
 
     def _on_min_margin_changed(self, value: int) -> None:
         v = value / 100.0
         self.min_margin_value_label.setText(f"{v:.2f}")
+        self.cfg.min_letter_margin = v
         if self.ai_thread is not None:
             self.ai_thread.set_min_margin(v)
+
+    def _on_dominant_hand_changed(self, _index: int) -> None:
+        # HandTrackingThread lee self.cfg (el mismo objeto) en cada frame.
+        self.cfg.dominant_hand = self.hand_combo.currentData()
+        if self.ai_thread is not None:
+            self.ai_thread.reset_word_state(has_letters=bool(self.current_word.strip()))
+
+    def _on_speak_toggled(self, checked: bool) -> None:
+        self.cfg.speak_words = checked
 
     def _on_diagnostic_toggled(self, checked: bool) -> None:
         if checked:
@@ -2073,31 +3026,71 @@ class SignLanguageApp(QMainWindow):
             bar = "█" * bar_len + "░" * (20 - bar_len)
             lines.append(f"{i+1}. {letter}  {bar} {conf*100:5.1f}%")
 
-        if self._dynamic_mode_enabled:
-            # Item 2: top-3 siempre visible al terminar cada clasificacion
-            # dinamica (no solo con el checkbox de diagnostico), marcando si
-            # se agrego la letra o no y por que, con el mismo criterio
-            # (dynamic_commit_decision) que usa HandTrackingThread para
-            # decidir el commit real.
-            should_commit, margin, rule = dynamic_commit_decision(topk)
-            if rule == "experimental":
-                lines.append(f"→ agregada por regla experimental (margen {margin * 100:.1f}pp)")
-            elif rule == "experimental_nq":
-                lines.append(f"→ agregada por regla experimental reforzada, par Ñ/Q (margen {margin * 100:.1f}pp)")
-            elif rule == "margen":
-                lines.append(f"→ agregada por margen amplio (margen {margin * 100:.1f}pp)")
-            elif rule == "confianza":
-                lines.append(f"→ agregada (confianza {topk[0][1] * 100:.1f}%)")
-            elif is_experimental_dynamic_letter(topk[0][0]):
-                if is_nq_blocking_pair(topk):
-                    lines.append("→ par Ñ/Q: margen insuficiente, no se agregó (regla reforzada)")
-                else:
-                    lines.append("→ modo experimental, no se agregó")
-            else:
-                lines.append("→ baja confianza, no se agregó")
-            self.diagnostic_label.show()
-
         self.diagnostic_label.setText("\n".join(lines))
+
+    def _on_auto_result(self, info: dict) -> None:
+        """Resultado de una sena con movimiento: la tarjeta de la sena, el
+        top-3, el marco del video y el mensaje de retroalimentacion con lo
+        que hay que corregir (interfaz_lsm.feedback_for_result)."""
+        code = info.get("code", "")
+        kind = info.get("kind", "")
+        fb = feedback_for_result(info, word_profiles())
+        topk = info.get("topk") or []
+        if code == "ok":
+            self._set_sign(info.get("label", ""), COLORS["ok"], "Palabra" if kind == "palabra" else "Letra")
+            self.candidates.set_candidates(topk, COLORS["ok"])
+            self._flash("ok")
+        elif code in ("deletreo", "deletreo_largo"):
+            return
+        else:
+            shown = f"¿{topk[0][0]}?" if topk else "?"
+            self._set_sign(shown, COLORS["warn"], "Repite la seña")
+            self.candidates.set_candidates(topk, COLORS["warn"])
+            self._flash("repetir", 2200)
+        self._result_hold_until = time.time() + 2.5
+        if fb is not None:
+            self.feedback.add(fb)
+
+    def _on_phase(self, phase: str) -> None:
+        self._phase = phase
+        if phase in ("reposo", "detenido"):
+            # La sena termino y ya se resolvio: la letra retenida se escribe
+            # (si una palabra la reemplazo, ya se quito) y las demas dejan de
+            # estar pendientes.
+            self._flush_held()
+            self._spelling = False
+            if self._pending:
+                self._pending = 0
+                self._render_sentence()
+        if not self._flash_timer.isActive():
+            self._apply_phase_style(phase)
+        hints = {
+            "detenido": "Presiona Iniciar para encender la cámara.",
+            "reposo": "Sube la mano sobre la línea punteada para empezar una seña.",
+            "seña": "Haz la seña completa y baja las manos al terminar.",
+            "clasificando": "Reconociendo la seña…",
+        }
+        self.hint_label.setText(hints.get(phase, ""))
+
+    def _on_guidance(self, state: dict) -> None:
+        """Estado del frame (~4 por segundo): barra de estado y consejo en
+        vivo, que solo aparece si la condicion dura un rato."""
+        now = time.time()
+        conditions = {
+            "sin_cuerpo": state.get("hands", 0) > 0 and state.get("body_tracking") and not state.get("body_visible"),
+            "dos_manos": bool(state.get("two_raised_still")),
+            "duda": bool(state.get("static_unsure")),
+            "moviendo": bool(state.get("moving_letter")),
+        }
+        for key, active in conditions.items():
+            if active:
+                self._guidance_since.setdefault(key, now)
+            else:
+                self._guidance_since.pop(key, None)
+        held = {key: now - since for key, since in self._guidance_since.items()}
+        self.feedback.set_live(guidance_feedback(state, held))
+        if state.get("body_tracking"):
+            self.status_body.setText("Cuerpo: visible" if state.get("body_visible") else "Cuerpo: no se ve")
 
     def _on_model_loaded(self) -> None:
         self.statusBar().showMessage("MediaPipe Hands listo", 3000)
@@ -2120,10 +3113,28 @@ class SignLanguageApp(QMainWindow):
             self._restart_ai_thread()
 
     def update_sign(self, text: str, conf: float) -> None:
-        self.sign_label.setText(text)
+        """Texto de Estado del hilo en cada frame. En la tarjeta solo se
+        muestra la letra fija que se esta formando (la fase y los resultados
+        de las senas con movimiento llegan por sus propias senales)."""
+        letter = text[1:] if text.startswith("?") else text
+        is_letter = len(letter) == 1 and letter.isalpha()
+        if time.time() < self._result_hold_until and not (is_letter and self._phase == "seña"):
+            return
+        if is_letter and not text.startswith("?"):
+            self._set_sign(letter, COLORS["text"], f"Letra · {conf * 100:.0f}% · mantén la mano quieta")
+        elif is_letter:
+            self._set_sign(letter, COLORS["muted"], "¿Letra? Ajusta la forma de la mano")
+        elif self._phase == "seña":
+            self._set_sign("…", COLORS["accent"], "Haciendo seña")
+        elif self._phase == "clasificando":
+            self._set_sign("…", COLORS["info"], "Reconociendo")
+        elif time.time() >= self._result_hold_until:
+            self._set_sign("—", COLORS["muted"], "Esperando")
 
     def update_hands(self, detections: FrameDetections) -> None:
-        self.status_hands.setText(f"✋ Manos: {detections.num_hands}")
+        text = f"✋ Manos: {detections.num_hands}"
+        if self.status_hands.text() != text:
+            self.status_hands.setText(text)
 
     def update_metrics(self, m: InferenceMetrics) -> None:
         self.status_fps.setText(f"FPS: {m.fps:.1f}")
@@ -2133,39 +3144,113 @@ class SignLanguageApp(QMainWindow):
         if cv_img is None or cv_img.size == 0:
             return
         self._last_annotated_frame = cv_img
-        rgb = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
-        h, w, ch = rgb.shape
-        qt_img = QImage(rgb.data, w, h, ch * w, QImage.Format.Format_RGB888).copy()
-        scaled = qt_img.scaled(
-            self.image_label.width(), self.image_label.height(),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        self.image_label.setPixmap(QPixmap.fromImage(scaled))
+        # Escalado con OpenCV (vectorizado, rapido en ARM) y QImage en BGR
+        # directo: sin la conversion a RGB ni el escalado suave de Qt, que en
+        # la Raspberry Pi se comian tiempo del hilo de la ventana en cada frame.
+        h, w = cv_img.shape[:2]
+        box_w = max(1, self.image_label.width() - 8)
+        box_h = max(1, self.image_label.height() - 8)
+        scale = min(box_w / w, box_h / h)
+        if abs(scale - 1.0) > 0.01:
+            cv_img = cv2.resize(cv_img, (max(1, int(w * scale)), max(1, int(h * scale))),
+                                interpolation=cv2.INTER_LINEAR)
+        img = np.ascontiguousarray(cv_img)
+        qt_img = QImage(img.data, img.shape[1], img.shape[0], img.strides[0], QImage.Format.Format_BGR888)
+        self.image_label.setPixmap(QPixmap.fromImage(qt_img))
 
 
     def on_letter_committed(self, letter: str) -> None:
+        in_sign = len(letter) == 1 and self._phase in ("seña", "clasificando")
+        if in_sign and not self._spelling and not self._held:
+            self._held.append(letter)
+            self._set_sign(letter, COLORS["accent"], "Letra · se escribe al bajar la mano")
+            self._result_hold_until = time.time() + 1.0
+            return
+        if in_sign and self._held:
+            self._spelling = True    # segunda letra en la misma sena: es deletreo
+            self._flush_held(pending=True)
         if len(letter) > 1 and self.current_word and not self.current_word.endswith(" "):
             self.current_word += " "
         self.current_word += letter
-        self.word_label.setText(self.current_word)
+        if in_sign:
+            self._pending += 1       # una palabra de esta misma sena todavia puede reemplazarla
+            self._set_sign(letter, COLORS["ok"], "Letra agregada")
+            self._result_hold_until = time.time() + 1.0
+        self._render_sentence()
+
+    def _flush_held(self, pending: bool = False) -> None:
+        if not self._held:
+            return
+        self.current_word += "".join(self._held)
+        if pending:
+            self._pending += len(self._held)
+        self._held.clear()
+        self._render_sentence()
+
+    def on_letters_retracted(self, letters: list) -> None:
+        """Borra del final de la palabra en curso las letras estaticas que
+        una palabra completa reemplaza (modo automatico). Si ya no estan al
+        final (Enter o Retroceso de por medio), no se toca nada."""
+        if self._held and list(letters) == self._held:
+            self._held.clear()       # nunca se escribio: basta con olvidarla
+            return
+        tail = "".join(letters)
+        current = self.current_word.rstrip(" ")
+        if tail and current.endswith(tail):
+            self.current_word = current[: -len(tail)].rstrip(" ")
+            self._pending = max(0, self._pending - len(tail))
+            self._render_sentence()
 
     def on_space_committed(self) -> None:
+        self._flush_held()
         if not self.current_word.strip():
             return
         word = self.current_word.strip()
         self.history.append(word)
-        self.history_view.appendPlainText(word)
         self.current_word = ""
-        self.word_label.setText("")
+        self._pending = 0
+        self._render_sentence()
         if self.ai_thread is not None:
             self.ai_thread.reset_word_state()
+        if self.cfg.speak_words:
+            self.speaker.say(word.lower())
+
+    def delete_last_letter(self) -> None:
+        if self._held:
+            self._held.pop()
+            self._set_sign("—", COLORS["muted"], "Letra borrada")
+            return
+        if not self.current_word:
+            return
+        self.current_word = self.current_word[:-1].rstrip(" ")
+        self._pending = min(self._pending, len(self.current_word))
+        self._render_sentence()
+        # Tras corregir, la letra se puede volver a signar de inmediato, y si
+        # a la palabra le quedan letras el espacio automatico la sigue cerrando.
+        if self.ai_thread is not None:
+            self.ai_thread.reset_word_state(has_letters=bool(self.current_word.strip()))
 
     def clear_current_word(self) -> None:
         self.current_word = ""
-        self.word_label.setText("")
+        self._held.clear()
+        self._pending = 0
+        self._render_sentence()
         if self.ai_thread is not None:
             self.ai_thread.reset_word_state()
+
+    def clear_all(self) -> None:
+        self.history.clear()
+        self.clear_current_word()
+        self.feedback.clear()
+
+    def speak_last(self) -> None:
+        text = self.current_word.strip() or (self.history[-1] if self.history else "")
+        if not text:
+            return
+        if not self.speaker.available:
+            QMessageBox.information(self, "Sin voz", "No se encontró un motor de voz en este equipo.")
+            return
+        self.speaker.say(text.lower())
 
     def insert_space(self) -> None:
         self.on_space_committed()
@@ -2202,7 +3287,15 @@ class SignLanguageApp(QMainWindow):
         )
         if not path:
             return
-        ok = cv2.imwrite(path, self._last_annotated_frame)
+        # cv2.imwrite no acepta rutas con caracteres no ASCII en Windows (la
+        # carpeta del equipo es "...\Lenguaje de señas\..."): se codifica el
+        # PNG en memoria y se escribe con Python.
+        ok, png = cv2.imencode(".png", self._last_annotated_frame)
+        if ok:
+            try:
+                Path(path).write_bytes(png.tobytes())
+            except OSError:
+                ok = False
         if ok:
             self.statusBar().showMessage(f"Captura guardada: {path}", 3000)
         else:
@@ -2234,6 +3327,10 @@ class SignLanguageApp(QMainWindow):
         if self.config_path is not None:
             self.cfg.save(self.config_path)
         self.stop_system()
+        # Un hilo que no termino a tiempo tiene que acabar antes de que el
+        # proceso salga, o Qt aborta al destruirlo.
+        for thread in list(self._retiring_threads):
+            thread.wait(5000)
         event.accept()
 
 
@@ -2260,12 +3357,14 @@ def main() -> int:
     config_path.parent.mkdir(parents=True, exist_ok=True)
 
     cfg = AppConfig.load(config_path)
+    # Mismas validaciones que config.json (ej. --threshold 7 o --max-hands 0
+    # hacian fallar a MediaPipe al iniciar).
     if args.camera is not None:
-        cfg.camera_index = args.camera
+        cfg.set_validated("camera_index", args.camera)
     if args.threshold is not None:
-        cfg.min_detection_confidence = args.threshold
+        cfg.set_validated("min_detection_confidence", args.threshold)
     if args.max_hands is not None:
-        cfg.max_num_hands = args.max_hands
+        cfg.set_validated("max_num_hands", args.max_hands)
 
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)

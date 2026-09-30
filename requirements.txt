@@ -2,7 +2,11 @@
 #   pip install -r requirements.txt
 numpy>=1.24
 PyQt6>=6.5,<6.8
-mediapipe>=0.10.14
+# mediapipe 1.0.1 se cae en macOS al iniciar cualquier detector (manos o
+# pose): "graph_service.h ... Service is unavailable" (Metal). 1.0.0 y
+# 0.10.x funcionan. En Windows/Linux la 1.0.1 no tiene ese problema.
+mediapipe>=0.10.14,!=1.0.1; sys_platform == "darwin"
+mediapipe>=0.10.14; sys_platform != "darwin"
 onnxruntime>=1.16
 # mediapipe ya instala opencv-contrib-python. No añadas también
 # opencv-python: ambos paquetes instalan el módulo cv2 y chocan.

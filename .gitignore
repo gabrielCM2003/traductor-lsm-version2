@@ -6,3 +6,10 @@ __pycache__/
 .vscode/
 .idea/
 .DS_Store
+# Lo regenera DTWRecognizer (dtw_recognizer.py) cada vez que arranca senas.py.
+labels_dinamicas.json
+# Muestras que se descartaron con 'd' en segmentador_automatico.py --grabar.
+datos_descartados/
+# Cache de plantillas del DTW (lo regenera dtw_recognizer.py si cambian)
+.cache_plantillas_*.npz
+.cache_plantillas_*.tmp.npz

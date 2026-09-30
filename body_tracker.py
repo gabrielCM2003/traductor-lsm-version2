@@ -1,22 +1,14 @@
 """Esqueleto del cuerpo (MediaPipe Pose Landmarker) para ubicar las manos
 respecto a la persona.
 
-MODULO PORTADO desde traductor-lsm-version2 (rama integrar-esqueleto-cuerpo,
-commit cceb263, autor kidflash117) y AISLADO a proposito en este repo: nadie
-lo importa todavia (ni senas.py, ni los recolectores, ni segmentador_automatico.py
-lo usan). Es un complemento para reconocer PALABRAS completas mas adelante, no
-reemplaza ni modifica el alfabeto estatico, el alfabeto dinamico (DTW) ni el
-segmentador actual, que siguen funcionando exactamente igual.
-
 El vector de 126 de las manos (normalize_keypoints en sign_classifier.py)
 centra cada mano en su muneca y la escala por su tamano: describe la FORMA de
 la mano, pero borra a proposito DONDE esta. Para el alfabeto eso esta bien,
 pero para las palabras no alcanza (la misma forma de mano en la frente o en el
 pecho son senas distintas). Este modulo agrega esa informacion como un bloque
 APARTE de N_BODY_FEATURES valores (ver body_location_features), sin tocar el
-vector de 126 ni la logica de hand_to_feature_vector/normalize_keypoints de
-sign_classifier.py: el alfabeto estatico, el dinamico (DTW) y lsm_words.onnx
-siguen funcionando igual si este modulo nunca se importa.
+vector de 126: el alfabeto estatico, el dinamico (DTW) y lsm_words.onnx
+siguen funcionando igual.
 
 Se usa MediaPipe Pose y no YOLOv8-pose porque viene en el mismo paquete
 mediapipe que ya usa el proyecto (sin torch ni ultralytics, que ademas exige
@@ -58,11 +50,9 @@ POSE_MODELS = ("lite", "full")
 # "full" por defecto: medido contra "lite" con la persona quieta, tiembla
 # menos (0.34 px contra 0.88 px de desviacion) a cambio de ~2.6 ms mas por
 # frame (8.8 contra 6.2 ms en una laptop). En la Raspberry Pi, si hace falta
-# el tiempo de CPU, se puede bajar a "lite"; conviene grabar y reconocer con
-# el mismo modelo.
+# el tiempo de CPU, se puede bajar a "lite" (pose_model en la config de
+# senas.py); conviene grabar y reconocer con el mismo modelo.
 DEFAULT_POSE_MODEL = "full"
-# Misma carpeta que ensure_hand_model en senas.py, para que ambos modelos
-# (manos y pose) se descarguen y queden juntos.
 DEFAULT_MODELS_DIR = Path.home() / ".sign_translator" / "models"
 
 # Indices del esqueleto de 33 puntos de MediaPipe Pose (solo los que se usan).
@@ -94,17 +84,12 @@ MIN_SHOULDER_WIDTH_PX = 20.0
 # menos de esta fraccion del ancho de hombros de la muneca que estima la pose.
 HAND_MATCH_MAX_DIST = 0.6
 
-# Linea de reposo para una futura segmentacion de PALABRAS por pose: una mano
-# con la muneca por DEBAJO de esta linea se considera en reposo (no esta
-# senando), aunque siga en cuadro. Va en anchos de hombro bajo el centro de
-# los hombros, para que no dependa de la distancia a la camara: 1.3 anchos
-# cae mas o menos a la altura del ombligo, por debajo de las senas mas bajas
-# (las del estomago). Si en la practica corta senas bajas, subirlo.
-#
-# NOTA: aqui solo vive la funcion (rest_line_y/hands_in_signing_space). NO
-# esta conectada a segmentador_automatico.py en este repo - ver Tarea 3 del
-# analisis (investigacion, no implementacion) antes de decidir si conviene
-# cambiar el disparador de segmentacion de Hands a Pose.
+# Linea de reposo para segmentar PALABRAS (segmentador_automatico.py --modo
+# palabras): una mano con la muneca por DEBAJO de esta linea se considera en
+# reposo (no esta senando), aunque siga en cuadro. Va en anchos de hombro bajo
+# el centro de los hombros, para que no dependa de la distancia a la camara:
+# 1.3 anchos cae mas o menos a la altura del ombligo, por debajo de las senas
+# mas bajas (las del estomago). Si en la practica corta senas bajas, subirlo.
 REST_LINE_SHOULDER_WIDTHS = 1.3
 REST_LINE_COLOR = (255, 200, 0)   # azul claro (BGR)
 
@@ -183,11 +168,14 @@ class BodyDetection:
         )
 
 
-def parse_pose(results) -> Optional[BodyDetection]:
-    """Resultado de PoseLandmarker -> BodyDetection, o None si no hay nadie en cuadro."""
-    if not results.pose_landmarks:
+def parse_pose(results, index: int = 0) -> Optional[BodyDetection]:
+    """Resultado de PoseLandmarker -> BodyDetection, o None si no hay nadie en cuadro.
+
+    index elige la persona cuando el detector se creo con num_poses > 1
+    (extraer_palabras_videos.py, videos con mas gente en cuadro)."""
+    if not results.pose_landmarks or index >= len(results.pose_landmarks):
         return None
-    lms = results.pose_landmarks[0]
+    lms = results.pose_landmarks[index]
     image_xyz = np.array([[lm.x, lm.y, lm.z] for lm in lms], dtype=np.float32)
     # visibility/presence son Optional en la API de Tasks; sin dato cuenta como no visible.
     visibility = np.array(
@@ -199,9 +187,9 @@ def parse_pose(results) -> Optional[BodyDetection]:
         dtype=np.float32,
     )
     world_xyz = np.zeros((N_POSE_LANDMARKS, 3), dtype=np.float32)
-    if results.pose_world_landmarks:
+    if results.pose_world_landmarks and index < len(results.pose_world_landmarks):
         world_xyz = np.array(
-            [[lm.x, lm.y, lm.z] for lm in results.pose_world_landmarks[0]],
+            [[lm.x, lm.y, lm.z] for lm in results.pose_world_landmarks[index]],
             dtype=np.float32,
         )
     return BodyDetection(image_xyz=image_xyz, visibility=visibility, presence=presence, world_xyz=world_xyz)
@@ -275,8 +263,8 @@ def hands_in_signing_space(
 ) -> Optional[bool]:
     """True si alguna mano detectada tiene la muneca por encima de la linea de
     reposo (esta senando); False si todas estan por debajo o no hay ninguna;
-    None si no se ven los hombros, para que el llamador decida (por ejemplo,
-    volver al criterio actual de segmentador_automatico.py: hay mano o no)."""
+    None si no se ven los hombros, para que el llamador decida (el segmentador
+    vuelve al criterio de siempre: hay mano o no)."""
     line_y = rest_line_y(body, frame_w, frame_h)
     if line_y is None:
         return None
@@ -307,14 +295,10 @@ def body_location_features(
     bandera [8], para que el modelo distinga "sin cuerpo" de "mano en el origen".
 
     `hands` es el mismo dict {"Left": HandDetection, "Right": HandDetection}
-    (ver la clase HandDetection en senas.py) que reciben build_feature_vector
-    (recolectores) y build_dynamic_feature_vector (senas.py), con los mismos
-    slots - por eso este modulo NO reimplementa nada de hand_to_feature_vector
-    ni normalize_keypoints (sign_classifier.py): reutiliza directamente los
-    landmarks crudos (landmarks_2d) que ya trae ese mismo objeto. Las
-    coordenadas se pasan a pixeles antes de medir: MediaPipe las normaliza
-    dividiendo x entre el ancho e y entre el alto por separado, y medir
-    distancias asi deformaria la geometria 4:3.
+    que reciben build_feature_vector (recolectores) y build_dynamic_feature_vector
+    (senas.py), con los mismos slots. Las coordenadas se pasan a pixeles antes
+    de medir: MediaPipe las normaliza dividiendo x entre el ancho e y entre el
+    alto por separado, y medir distancias asi deformaria la geometria 4:3.
     """
     vec = np.zeros(N_BODY_FEATURES, dtype=np.float32)
     if body is None or not body.visible(LEFT_SHOULDER, RIGHT_SHOULDER, MOUTH_LEFT, MOUTH_RIGHT):
