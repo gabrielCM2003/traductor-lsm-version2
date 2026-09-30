@@ -38,9 +38,9 @@ El repositorio incluye también la documentación del **guante instrumentado** d
 | `lsm_alphabet.onnx`, `lsm_alphabet.onnx.data` | Modelo entrenado del alfabeto estático (red pequeña, 63 entradas: 21 puntos × 3) |
 | `lsm_labels.json` | Etiquetas del modelo estático y tipo de normalización |
 | `guante.py` | Guante con ESP32: recibe los datos por WiFi (UDP), los compara con el dataset del guante y decide cuándo escribir la seña |
-| `grabar_guante.py` | Graba muestras del guante en `datos_guante/dataset_guante.jsonl` (`--probar` para reconocer sin grabar) |
-| `simular_guante.py` | ESP32 falsa: manda muestras del dataset por UDP para probar sin el guante |
-| `datos_guante/` | Dataset del guante (una línea JSON por muestra: persona, etiqueta y 2 s de lecturas) |
+| `grabar_guante.py` | Graba muestras de cada guante: derecho en `datos_guante/dataset_guante.jsonl`, izquierdo (`--mano I`) en `datos_guante/dataset_guante_izquierdo.jsonl` y frases con los dos (`--mano DI`) en `datos_guante/dataset_guante_ambas.jsonl` (`--probar` para reconocer sin grabar) |
+| `simular_guante.py` | ESP32 falsa: manda muestras del dataset por UDP para probar sin el guante (`--mano I` para el izquierdo, `--mano DI` para frases) |
+| `datos_guante/` | Dataset de cada guante (una línea JSON por muestra: persona, mano, etiqueta y 2 s de lecturas) |
 | `tests/` | Pruebas unitarias: configuración, alfabeto estático, modo automático, DTW con cuerpo, retroalimentación, ventana y guante |
 | `probar_modo_dinamico_senas.py` | Pruebas de regresión del alfabeto dinámico integrado en `senas.py` |
 | `requirements.txt` | Dependencias de Python |
@@ -145,23 +145,40 @@ Pasando los 15 videos de prueba por la app como cámara, con pose lite, a 30 y a
 
 ### Guante (ESP32)
 
-El guante lleva 6 sensores inerciales (pulgar, índice, medio, anular, meñique y dorso de la mano). La ESP32 crea la red WiFi `GUANTE_LSM` (IP `192.168.4.1`) y manda por UDP (puerto 4210) un JSON por lectura, unas 21 por segundo, al equipo que le dice `hola`:
+El guante lleva 6 sensores inerciales (pulgar, índice, medio, anular, meñique y dorso de la mano). La Raspberry crea la red WiFi `GUANTE_LSM` (2.4 GHz, IP `10.42.0.1`) y la ESP32 se conecta como cliente y manda, sin handshake ni respuesta, un JSON por datagrama UDP a `10.42.0.1:4210`, unas 25 lecturas por segundo. Los dos guantes mandan al mismo puerto y se separan por `"h"`: `"D"` (derecho) e `"I"` (izquierdo); también se aceptan `"R"`/`"L"`, minúsculas y `"der"`/`"izq"`. Solo se reconocen paquetes con `err` 0:
 
 ```json
-{"pulgar": [ax, ay, az, gx, gy, gz, pitch, roll], "indice": [...], "medio": [...], "anular": [...], "menique": [...], "mano": [...], "err": 0}
+{"n": 12, "t": 3400, "h": "D", "err": 0, "pulgar": [ax, ay, az, gx, gy, gz, pitch, roll], "indice": [...], "medio": [...], "anular": [...], "menique": [...], "mano": [...]}
 ```
 
-1. Conecta la Raspberry a la red del guante: `sudo nmcli device wifi connect GUANTE_LSM password lsm12345`
-2. Graba muestras de cada seña (6 o más por seña; mejor de varias personas): `python grabar_guante.py`. Cada muestra son 2 s tras la cuenta atrás (2, 1, ¡ya!). Las etiquetas de más de una letra son palabras (`POR FAVOR` se guarda como `POR_FAVOR`).
-3. Revisa cómo reconoce: `python grabar_guante.py --probar` (muestra cuántas acierta dejando cada muestra fuera y el umbral de distancia).
-4. El traductor conecta el guante solo al abrir; no hay botón ni opción para activarlo. Conectarlo no cambia la pantalla: solo la barra de estado y la caja **Sensores del guante**, que muestra la última lectura de cada sensor.
+1. Levanta el hotspot en la Raspberry: `nmcli con up Hotspot` (desconecta la Raspberry de cualquier otra red WiFi). Solo un programa a la vez puede escuchar el puerto 4210: si `senas.py` está abierto, `grabar_guante.py` falla con «Address already in use» (y al revés). `ss -lunp | grep 4210` dice quién lo tiene.
+2. Graba muestras de cada seña (6 o más por seña; mejor de varias personas): `python grabar_guante.py` para el guante derecho y `python grabar_guante.py --mano I` para el izquierdo. Cada guante tiene su propio dataset, porque el izquierdo lleva los sensores en espejo y sus lecturas no se parecen a las del derecho. Cada muestra son 2 s tras la cuenta atrás (2, 1, ¡ya!). Las etiquetas de más de una letra son palabras (`POR FAVOR` se guarda como `POR_FAVOR`). Si eliges una mano y solo llegan datos de la otra, el programa te lo avisa.
+3. Frases de dos manos: `python grabar_guante.py --mano DI` con los dos guantes puestos. Cada muestra dura 3 s (`--segundos` para cambiarlo; todas las de un dataset deben durar lo mismo) y se guarda en `datos_guante/dataset_guante_ambas.jsonl`. Las etiquetas con espacios son frases (`BUENOS DIAS` se guarda como `BUENOS_DIAS`).
+4. Graba también `NADA` en cada dataset (6 o más: manos quietas, moviéndose entre señas, deletreando con una mano). Nunca se escribe; sirve para que lo que no es seña no salga como la seña más parecida. Con frases de dos manos es casi obligatorio: con pocas frases grabadas, cualquier combinación de posturas se parece a alguna.
+5. Revisa cómo reconoce: `python grabar_guante.py --probar` (o `--mano I --probar`, `--mano DI --probar`). Muestra cuántas acierta dejando cada muestra fuera y el umbral de distancia.
+6. El traductor conecta los guantes solo al abrir; no hay botón ni opción para activarlos. Se reconoce cada guante que tenga dataset; un guante sin dataset solo muestra sus sensores. Conectarlos no cambia la pantalla: solo la barra de estado y las cajas **Guante derecho** y **Guante izquierdo**, que muestran la última lectura de cada sensor.
+
+**Si un guante no aparece** (la caja dice «sin datos»), la barra de estado dice por qué, después de ⚠:
+
+- `10.42.0.x manda "h":"X"`: el firmware de ese guante manda otra mano; cámbialo a `"D"` o `"I"`.
+- `10.42.0.x y 10.42.0.y mandan los dos "h":"D"`: los dos guantes tienen el mismo firmware; al izquierdo le falta `"h":"I"`. Las lecturas se mezclan y el derecho tampoco se reconoce bien.
+- `I: solo llegan paquetes con err=N`: el guante llega pero un sensor falla. Su caja muestra las lecturas con el aviso, pero no se reconoce hasta que `err` vuelva a 0.
+
+**Frases con los dos guantes:**
+
+- Con los dos guantes conectados y `dataset_guante_ambas.jsonl` grabado, el traductor junta cada lectura del derecho con la del izquierdo más cercana en el tiempo y compara los últimos 3 s (lo que dura cada frase grabada) con las frases del dataset. Las dos manos tienen que parecerse cada una por su lado: la distancia es la de la mano que peor coincide.
+- Mientras los dos guantes reconocen una frase, los guantes solos no escriben letras; si alcanzaron a escribir alguna letra a media frase (hasta 3), se borra cuando llega la frase, como hace la cámara con las palabras.
+- Después de escribir una frase, no se escribe otra hasta que pase lo que dura una frase (3 s).
+- La cámara no conoce las frases: se escriben aunque ella vea las manos.
+- **Ctrl+Shift+G:** captura una frase con cuenta atrás.
 
 **Cámara y guante juntos (una sola respuesta):**
 
+- La cámara se combina con el guante de la **mano que deletrea** (Ajustes → Mano que deletrea): el derecho con «Derecha», el izquierdo con «Izquierda».
 - Cuando la cámara ve la mano, su respuesta y la del guante se combinan y **tienen que coincidir**: si coinciden, se escribe con más confianza; si la cámara duda entre dos (A o B) y el guante siente una de ellas, esa se escribe; si cada uno dice otra seña, no se escribe nada y el panel dice «¿B o C? La cámara ve B y el guante siente C». Vale para las letras fijas (en cada momento) y para las letras con movimiento y las palabras (al bajar la mano, con lo que el guante sintió durante toda la seña).
 - El guante solo opina de las señas que tiene grabadas: si la cámara ve una letra que el guante no conoce (por ejemplo D), decide la cámara sola.
 - Si la cámara no reconoce la seña (no se parece a nada) y el guante está muy seguro (80% o más), se escribe lo del guante.
-- Si la cámara no ve la mano (el guante oscuro no se detecta, la mano sale de cuadro o la cámara está apagada), el guante escribe por su cuenta.
+- Si la cámara no ve la mano (el guante oscuro no se detecta, la mano sale de cuadro o la cámara está apagada), cada guante escribe por su cuenta. Si los dos escriben la misma seña en menos de 1.5 s (por ejemplo, una palabra de dos manos grabada en ambos), se escribe una sola vez.
 - En el video, la mano con guante siempre muestra sus 21 puntos (aunque el dibujo esté apagado en Ajustes) y encima una flecha por sensor: la dirección es su roll y el largo baja con el pitch. Si la cámara no encuentra la mano, las flechas salen en un recuadro «Guante» abajo a la izquierda. La zona de la mano se aclara un poco; el resto de la imagen no cambia.
 - Para que el guante escriba palabras hay que grabarlas con `grabar_guante.py` (`HOLA`, `MAMA` o `MAMÁ`, `GRACIAS`...); se escriben igual que las de la cámara.
 
@@ -169,9 +186,9 @@ El guante lleva 6 sensores inerciales (pulgar, índice, medio, anular, meñique 
 - **Ctrl+G:** captura con cuenta atrás, igual que al grabar; útil para señas con movimiento o con el automático apagado (Ajustes → Guante).
 - El reconocimiento compara la ventana de los últimos 2 s con las muestras del dataset (vecinos más cercanos). Si la distancia a la seña más parecida supera el umbral (calibrado solo con el propio dataset), o si duda entre dos señas, no escribe nada.
 
-Sin el guante: `python simular_guante.py --senas L,A,Y` y, en otra terminal, `python senas.py --guante --glove-ip 127.0.0.1`.
+Sin el guante: `python senas.py` y, en otra terminal, `python simular_guante.py --senas L,A,Y` (manda paquetes `"h": "D"` a `127.0.0.1:4210`). Para el izquierdo, en otra terminal más: `python simular_guante.py --mano I` (usa el dataset izquierdo). Para frases: `python simular_guante.py --mano DI` (manda las dos manos).
 
-La IP, el puerto y el archivo del dataset se cambian en `~/.sign_translator/config.json` (`glove_ip`, `glove_port`, `glove_dataset`) o con `--glove-ip` y `--glove-dataset`.
+El puerto y los datasets se cambian en `~/.sign_translator/config.json` (`glove_port`, `glove_dataset`, `glove_dataset_left`, `glove_dataset_both`) o con `--glove-dataset` / `--glove-dataset-left` / `--glove-dataset-both`. La barra de estado muestra la recepción de cada guante, p. ej. `🧤 D 25.0 Hz, err 0 · I 24.5 Hz, err 0`.
 
 ### Crear las plantillas de palabras desde videos
 
@@ -233,7 +250,7 @@ Ver `ESTADO_PROYECTO_COMPLETO.md` para el detalle completo (qué está probado c
 
 - Alfabeto estático (21 letras) y alfabeto dinámico completo (J, K, Ñ, Q, X, Z) funcionales, probados con varias personas.
 - **Palabras completas:** 59 plantillas de 5 palabras, sacadas de videos de 3 personas del equipo. Reconociendo a cada persona solo con las plantillas de las otras dos (como un usuario nuevo): 56/59 bien, y se escriben 54 de esas 56 sin agregar errores; los 3 errores son AYUDA↔GRACIAS. Falta probar con más personas y cámaras. El modelo `lsm_words.onnx` sigue siendo de prueba y el modo automático no lo usa.
-- **Guante:** el lector (`guante.py`) y el reconocimiento están integrados en el traductor. El dataset actual tiene 30 muestras de una sola persona (A, B, C, L, Y); dejando cada muestra fuera acierta 30/30, pero falta grabar más señas y a más personas.
+- **Guante:** el lector (`guante.py`) y el reconocimiento están integrados en el traductor. El dataset del guante derecho tiene 30 muestras de una sola persona (A, B, C, L, Y); dejando cada muestra fuera acierta 30/30, pero falta grabar más señas y a más personas. El guante izquierdo ya se recibe y se reconoce, pero todavía no tiene muestras (`python grabar_guante.py --mano I`). Las frases de dos manos están integradas y probadas solo con frases sintéticas; falta grabar frases reales (`python grabar_guante.py --mano DI`) y medir cómo las reconoce.
 - La precisión del alfabeto estático todavía no está medida con personas que no participaron en el entrenamiento original.
 - Todo el desarrollo y las métricas de latencia se midieron en la laptop de desarrollo, no en la Raspberry Pi 5 real.
 

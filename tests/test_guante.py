@@ -20,15 +20,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import guante  # noqa: E402
 from guante import (  # noqa: E402
-    DEFAULT_DATASET, MIN_FRAMES, N_VALUES, SENSOR_NAMES, GloveClassifier, GloveReceiver, GloveResult,
-    GloveSession, GloveSpotter, clean_label, load_dataset, parse_packet,
+    DEFAULT_DATASET, GLOVE_BOTH, MIN_FRAMES, N_VALUES, SENSOR_NAMES, GloveBoth, GloveClassifier, GloveReceiver,
+    GloveResult, GloveSession, GloveSpotter, clean_label, decode_packet, default_dataset, load_dataset,
+    pair_frames, parse_glove, parse_hand, parse_packet, sample_seconds,
 )
 
 
-def esp_packet(vec, err=0) -> bytes:
+def esp_packet(vec, err=0, hand="D") -> bytes:
     v = np.asarray(vec, dtype=float).reshape(6, 8)
-    d = {name: row.tolist() for name, row in zip(SENSOR_NAMES, v)}
-    d["err"] = err
+    d = {"n": 1, "t": 40, "h": hand, "err": err}
+    d.update({name: row.tolist() for name, row in zip(SENSOR_NAMES, v)})
     return json.dumps(d).encode()
 
 
@@ -45,12 +46,35 @@ class TestPaquetes(unittest.TestCase):
     def test_paquetes_invalidos(self):
         vec = np.zeros(N_VALUES)
         self.assertIsNone(parse_packet(esp_packet(vec, err=1)))
+        # parse_packet es de una sola mano (la derecha por defecto); sin "h"
+        # tampoco se acepta.
+        self.assertIsNone(parse_packet(esp_packet(vec, hand="I")))
+        d = json.loads(esp_packet(vec))
+        del d["h"]
+        self.assertIsNone(parse_packet(json.dumps(d).encode()))
         self.assertIsNone(parse_packet(b"{no es json"))
         self.assertIsNone(parse_packet(b'{"pulgar": [1, 2]}'))
         self.assertIsNone(parse_packet(b"[1, 2, 3]"))
         d = json.loads(esp_packet(vec))
         d["mano"] = [1] * 7
         self.assertIsNone(parse_packet(json.dumps(d).encode()))
+
+    def test_paquete_izquierdo(self):
+        vec = np.arange(N_VALUES, dtype=float)
+        self.assertEqual(parse_packet(esp_packet(vec, hand="I"), hand="I"), vec.tolist())
+        self.assertEqual(decode_packet(esp_packet(vec, hand="I")), (vec.tolist(), "I", ""))
+        self.assertEqual(decode_packet(esp_packet(vec, hand="I", err=3))[1:], ("I", "err"))
+        self.assertEqual(decode_packet(esp_packet(vec, hand="X"))[1:], (None, "mano"))
+
+    def test_nombre_de_mano(self):
+        for txt in ("D", "d", "der", "derecha", "right"):
+            self.assertEqual(parse_hand(txt), "D")
+        for txt in ("I", "izq", "Izquierda", "left", "L"):
+            self.assertEqual(parse_hand(txt), "I")
+        with self.assertRaises(ValueError):
+            parse_hand("ambas")
+        self.assertEqual(default_dataset("D"), DEFAULT_DATASET)
+        self.assertEqual(default_dataset("I").name, "dataset_guante_izquierdo.jsonl")
 
 
 @unittest.skipUnless(DEFAULT_DATASET.exists(), "falta datos_guante/dataset_guante.jsonl")
@@ -160,6 +184,25 @@ class TestSesion(unittest.TestCase):
         self.assertEqual(res[0].data["commit"], "C")
         self.assertTrue(res[0].data["manual"])
         self.assertFalse(session.busy)
+
+    def test_guante_izquierdo_con_su_dataset(self):
+        """Dos sesiones sobre el mismo receptor: la izquierda (hand("I"), con
+        su propio dataset) solo ve las lecturas de "h": "I"."""
+        frames, labels, _ = load_dataset(DEFAULT_DATASET)
+        # Guante izquierdo de prueba: las mismas señas con las lecturas en espejo.
+        left_clf = GloveClassifier([-f for f in frames], labels)
+        right = GloveSession(self.rec, self.clf, auto=True)
+        left = GloveSession(self.rec.hand("I"), left_clf, auto=True)
+        t = 3000.0
+        commits = {"D": [], "I": []}
+        for _ in range(3):
+            for i, v in enumerate(self.sample["L"]):
+                self.rec.push(list(-v), now=t + i / 21.0, hand="I")
+            t += len(self.sample["L"]) / 21.0
+            for tick in np.arange(t - 2.0, t, 0.25):
+                for hand, session in (("D", right), ("I", left)):
+                    commits[hand] += [ev.data["commit"] for ev in session.tick(tick) if ev.kind == "resultado"]
+        self.assertEqual(commits, {"D": [], "I": ["L"]})
 
     def test_sin_datos_no_escribe(self):
         session = GloveSession(self.rec, self.clf, auto=True)
@@ -317,48 +360,269 @@ class TestCamaraMasGuante(unittest.TestCase):
         self.assertTrue(min(c) > min(self.senas.FINGER_COLORS["thumb"]))
 
 
+class TestDiagnostico(unittest.TestCase):
+    """Un guante que llega mal no debe parecer apagado: se acepta su "h" con
+    otra forma, se muestran sus lecturas con err y se avisa si dos ESP32
+    mandan la misma mano."""
+
+    def setUp(self):
+        self.rec = GloveReceiver()      # sin start(): se alimenta con handle_packet()
+        self.vec = np.linspace(-1, 1, N_VALUES)
+
+    def test_otras_formas_de_h(self):
+        for h, hand in (("L", "I"), ("i", "I"), ("izq", "I"), ("R", "D"), ("d", "D")):
+            self.assertEqual(decode_packet(esp_packet(self.vec, hand=h))[1:], (hand, ""), h)
+        self.assertEqual(decode_packet(esp_packet(self.vec, hand="X"))[1:], (None, "mano"))
+
+    def test_h_desconocida_se_avisa(self):
+        self.rec.handle_packet(esp_packet(self.vec, hand="X"), ("10.42.0.30", 5000), now=100.0)
+        self.assertFalse(self.rec.connected(100.1, "I"))
+        self.assertEqual(self.rec.problems(100.1), ['10.42.0.30 manda "h":"X" (usa "D" o "I")'])
+        self.assertEqual(self.rec.problems(110.0), [])
+
+    def test_solo_err_se_muestra(self):
+        for k in range(5):
+            self.rec.handle_packet(esp_packet(self.vec, hand="I", err=4), ("10.42.0.31", 5000), now=100.0 + k * 0.04)
+        self.assertFalse(self.rec.connected(100.3, "I"))
+        err, values = self.rec.err_reading(100.3, "I")
+        self.assertEqual(err, 4)
+        np.testing.assert_allclose(values, self.vec)
+        self.assertIn("I: solo llegan paquetes con err=4", self.rec.problems(100.3))
+        # Con paquetes buenos otra vez, se reconoce y deja de avisar.
+        self.rec.handle_packet(esp_packet(self.vec, hand="I"), ("10.42.0.31", 5000), now=100.4)
+        self.assertTrue(self.rec.connected(100.5, "I"))
+        self.assertIsNone(self.rec.err_reading(100.5, "I"))
+
+    def test_dos_esp_con_la_misma_mano(self):
+        """El firmware del izquierdo quedo con "h":"D": no se ve el izquierdo."""
+        for k in range(10):
+            self.rec.handle_packet(esp_packet(self.vec), ("10.42.0.30", 5000), now=100.0 + k * 0.04)
+            self.rec.handle_packet(esp_packet(-self.vec), ("10.42.0.31", 5001), now=100.02 + k * 0.04)
+        self.assertEqual(self.rec.connected_hands(100.5), ["D"])
+        self.assertEqual(self.rec.problems(100.5), ['10.42.0.30 y 10.42.0.31 mandan los dos "h":"D"'])
+
+
+class TestDosManos(unittest.TestCase):
+    """Frases con los dos guantes: GloveBoth junta las lecturas de las dos
+    manos (96 valores) y se reconocen contra un dataset de dos manos."""
+
+    @classmethod
+    def setUpClass(cls):
+        frames, labels, _ = load_dataset(DEFAULT_DATASET)
+        by_label: dict[str, list] = {}
+        for f, l in zip(frames, labels):
+            by_label.setdefault(l, []).append(f)
+        # Frases de prueba: una postura en cada mano (el izquierdo, en espejo).
+        cls.phrases = {"BUENOS_DIAS": ("A", "B"), "TE_QUIERO": ("L", "Y"), "MUCHAS_GRACIAS": ("C", "C")}
+        cls.samples, cls.labels = [], []
+        for phrase, (d, i) in cls.phrases.items():
+            for fd, fi in zip(by_label[d], by_label[i]):
+                n = min(len(fd), len(fi))
+                cls.samples.append(np.hstack([fd[:n], -fi[:n]]))
+                cls.labels.append(phrase)
+        cls.clf = GloveClassifier(cls.samples, cls.labels)
+
+    def test_nombres(self):
+        for txt in ("DI", "ambas", "Ambos", "2"):
+            self.assertEqual(parse_glove(txt), GLOVE_BOTH)
+        self.assertEqual(parse_glove("izq"), "I")
+        self.assertEqual(default_dataset(GLOVE_BOTH).name, "dataset_guante_ambas.jsonl")
+
+    def test_junta_por_tiempo(self):
+        t_d = np.arange(0, 1, 1 / 21)
+        t_i = np.arange(0.01, 1, 1 / 25)
+        f_d = np.ones((len(t_d), N_VALUES))
+        f_i = 2 * np.ones((len(t_i), N_VALUES))
+        both = pair_frames(t_d, f_d, t_i, f_i)
+        self.assertEqual(both.shape, (len(t_d), 2 * N_VALUES))
+        self.assertTrue(np.all(both[:, :N_VALUES] == 1) and np.all(both[:, N_VALUES:] == 2))
+        # El izquierdo se corta a la mitad: las lecturas del derecho sin pareja se sueltan.
+        both = pair_frames(t_d, f_d, t_i[t_i < 0.5], f_i[t_i < 0.5])
+        self.assertLess(len(both), len(t_d))
+        self.assertEqual(pair_frames(t_d, f_d, t_i[:0], f_i[:0]).shape, (0, 2 * N_VALUES))
+
+    def test_reconoce_frases(self):
+        ok, total = self.clf.leave_one_out()
+        self.assertGreaterEqual(ok / total, 0.9)
+
+    def feed(self, rec, sample, t0):
+        """Cada mano a su ritmo y desfasada, como dos ESP32 sin sincronizar."""
+        right, left = sample[:, :N_VALUES], sample[:, N_VALUES:]
+        for k, v in enumerate(right):
+            rec.push(list(v), now=t0 + k / 21.0, hand="D")
+        for k, v in enumerate(left):
+            rec.push(list(v), now=t0 + 0.017 + k / 21.0, hand="I")
+        return t0 + len(sample) / 21.0
+
+    def test_sesion_escribe_la_frase(self):
+        rec = GloveReceiver()
+        both = rec.hand(GLOVE_BOTH)
+        self.assertIsInstance(both, GloveBoth)
+        session = GloveSession(both, self.clf, auto=True, live_window_s=2.0)
+        sample = self.samples[self.labels.index("TE_QUIERO")]
+        t = 1000.0
+        commits = []
+        for _ in range(3):
+            t = self.feed(rec, sample, t)
+            for tick in np.arange(t - 2.0, t, 0.25):
+                commits += [ev.data["commit"] for ev in session.tick(tick) if ev.kind == "resultado"]
+        self.assertEqual(commits, ["TE_QUIERO"])
+
+    def test_no_dos_frases_seguidas(self):
+        """Tras escribir una frase, otra en menos de lo que dura una frase no
+        se escribe (la ventana pasa por la frase parecida al sostenerla)."""
+        rec = GloveReceiver()
+        session = GloveSession(rec.hand(GLOVE_BOTH), self.clf, auto=True, live_window_s=2.0, min_gap_s=2.0)
+        t = 1000.0
+        commits = []
+        for name in ("TE_QUIERO", "BUENOS_DIAS", "BUENOS_DIAS"):
+            sample = self.samples[self.labels.index(name)]
+            t = self.feed(rec, sample, t)
+            for tick in (t - 0.25, t):
+                commits += [(ev.data["commit"], tick) for ev in session.tick(tick) if ev.kind == "resultado"]
+        self.assertEqual([c for c, _ in commits], ["TE_QUIERO", "BUENOS_DIAS"])
+        self.assertGreaterEqual(commits[1][1] - commits[0][1], 2.0)
+
+    def test_una_sola_mano_no_basta(self):
+        rec = GloveReceiver()
+        session = GloveSession(rec.hand(GLOVE_BOTH), self.clf, auto=True, live_window_s=2.0)
+        sample = self.samples[0]
+        for k, v in enumerate(sample[:, :N_VALUES]):
+            rec.push(list(v), now=2000.0 + k / 21.0, hand="D")
+        events = session.tick(2000.0 + len(sample) / 21.0)
+        self.assertEqual([ev.kind for ev in events], ["estado"])
+        self.assertFalse(events[0].data["connected"])
+
+    def test_mano_distinta_pesa(self):
+        """Con los dos guantes, cada mano tiene que parecerse: la distancia
+        es la de la mano que peor coincide, no el promedio."""
+        sample = self.samples[self.labels.index("TE_QUIERO")]
+        wrong = sample.copy()
+        wrong[:, N_VALUES:] = self.samples[self.labels.index("BUENOS_DIAS")][: len(sample), N_VALUES:]
+        feat = guante.frames_to_features(wrong)
+        d = self.clf._distances(feat)[self.clf.y == "TE_QUIERO"].min()
+        d_mean = np.sqrt(((self.clf.X - feat) ** 2).mean(axis=1))[self.clf.y == "TE_QUIERO"].min()
+        self.assertGreater(d, d_mean)
+
+    def test_nada_no_se_escribe(self):
+        """NADA (manos sin seña) se reconoce, pero nunca se acepta ni se
+        escribe, y no cuenta como seña del guante."""
+        rng = np.random.default_rng(1)
+        nada = [rng.normal(0, 1, (42, 2 * N_VALUES)) * 0.05 + 3 for _ in range(6)]
+        clf = GloveClassifier(self.samples + nada, self.labels + ["NADA"] * 6)
+        self.assertNotIn("NADA", clf.sign_labels)
+        res = clf.classify(nada[0])
+        self.assertEqual(res.label, "NADA")
+        self.assertFalse(res.accepted)
+        self.assertEqual(GloveSpotter(stable_ticks_word=1).update(res), None)
+
+    def test_dataset_de_frases(self):
+        """El dataset de dos manos se lee con 96 valores y dura lo grabado."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "dataset_guante_ambas.jsonl"
+            with open(path, "w", encoding="utf-8") as f:
+                for sample, label in zip(self.samples, self.labels):
+                    f.write(json.dumps({"persona": "prueba", "mano": "DI", "etiqueta": label, "segundos": 3.0,
+                                        "frames": sample.tolist()}) + "\n")
+            self.assertEqual(sample_seconds(path), 3.0)
+            clf = GloveClassifier.from_file(path)
+            self.assertEqual(clf.X.shape[1], 8 * N_VALUES)
+            self.assertEqual(clf.window_s, 3.0)
+            self.assertEqual(sorted(clf.labels), sorted(self.phrases))
+
+
 class TestUDP(unittest.TestCase):
-    """GloveReceiver contra una ESP32 falsa en localhost: manda "hola" y
-    recibe los paquetes que la ESP le regresa."""
+    """GloveReceiver escuchando en localhost: una ESP32 falsa le manda los
+    paquetes sin handshake (como el firmware), mezclados con basura, la mano
+    izquierda y paquetes con err."""
 
-    def test_hola_y_datos(self):
+    def free_port(self) -> int:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        return port
+
+    def test_separa_las_dos_manos(self):
+        """Los dos guantes mandan al mismo puerto: cada mano a su buffer; se
+        descarta basura, una mano desconocida y los paquetes con err."""
+        port = self.free_port()
+        rec = GloveReceiver(port, bind_ip="127.0.0.1")
+        rec.start()
+        esp_d = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        esp_i = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        vec_d = np.linspace(-1, 1, N_VALUES)
+        vec_i = np.linspace(1, -1, N_VALUES)
+        try:
+            for extra in (b"basura", esp_packet(vec_d, hand="X"), esp_packet(vec_d, err=2)):
+                esp_d.sendto(extra, ("127.0.0.1", port))
+            for _ in range(20):
+                esp_d.sendto(esp_packet(vec_d), ("127.0.0.1", port))
+                esp_i.sendto(esp_packet(vec_i, hand="I"), ("127.0.0.1", port))
+                time.sleep(0.01)
+            deadline = time.time() + 2.0
+            while (len(rec.window(2.0)) < 20 or len(rec.window(2.0, hand="I")) < 20) and time.time() < deadline:
+                time.sleep(0.05)
+            left = rec.hand("I")
+            self.assertTrue(rec.connected())
+            self.assertTrue(left.connected())
+            self.assertEqual(rec.connected_hands(), ["D", "I"])
+            self.assertEqual(len(rec.window(2.0)), 20)
+            self.assertEqual(len(left.window(2.0)), 20)
+            np.testing.assert_allclose(rec.window(2.0)[0], vec_d)
+            np.testing.assert_allclose(left.latest(), vec_i)
+            self.assertEqual(dict(rec.dropped), {"json": 1, "mano": 1, "err": 1})
+            self.assertTrue(rec.status_line().startswith("D "))
+            self.assertIn("err 1", rec.status_line())
+            self.assertTrue(left.status_line().startswith("I "))
+            self.assertIn("err 0", left.status_line())
+        finally:
+            esp_d.close()
+            esp_i.close()
+            rec.stop()
+
+    def test_solo_una_mano(self):
+        """Un receptor de una sola mano descarta la otra."""
+        port = self.free_port()
+        rec = GloveReceiver(port, bind_ip="127.0.0.1", hands="D")
+        rec.start()
         esp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        esp.bind(("127.0.0.1", 0))
-        esp.settimeout(2.0)
-        port = esp.getsockname()[1]
-        vec = np.linspace(-1, 1, N_VALUES)
-        stop = threading.Event()
+        try:
+            esp.sendto(esp_packet(np.zeros(N_VALUES), hand="I"), ("127.0.0.1", port))
+            deadline = time.time() + 2.0
+            while not rec.dropped and time.time() < deadline:
+                time.sleep(0.05)
+            self.assertEqual(dict(rec.dropped), {"mano": 1})
+            self.assertFalse(rec.connected())
+            with self.assertRaises(ValueError):
+                rec.hand("I")
+        finally:
+            esp.close()
+            rec.stop()
 
-        def serve():
-            try:
-                msg, addr = esp.recvfrom(64)
-            except socket.timeout:
-                return
-            self.assertEqual(msg, b"hola")
-            esp.sendto(b"basura", addr)
-            while not stop.is_set():
-                esp.sendto(esp_packet(vec), addr)
-                time.sleep(0.02)
-
-        th = threading.Thread(target=serve, daemon=True)
-        th.start()
-        rec = GloveReceiver("127.0.0.1", port)
+    def test_puerto_ocupado_falla(self):
+        """Sin SO_REUSEADDR: un segundo receptor no se abre en silencio."""
+        port = self.free_port()
+        rec = GloveReceiver(port, bind_ip="127.0.0.1")
         rec.start()
         try:
-            deadline = time.time() + 3.0
-            while not rec.connected() and time.time() < deadline:
-                time.sleep(0.05)
-            time.sleep(0.3)
-            self.assertTrue(rec.connected())
-            frames = rec.window(1.0)
-            self.assertGreater(len(frames), 5)
-            np.testing.assert_allclose(frames[0], vec)
-            self.assertGreaterEqual(rec.bad_packets, 1)
+            with self.assertRaises(OSError) as ctx:
+                GloveReceiver(port, bind_ip="127.0.0.1").start()
+            self.assertIn("Address already in use", str(ctx.exception))
         finally:
-            stop.set()
             rec.stop()
-            th.join(1.0)
-            esp.close()
+
+    def test_guante_se_desconecta(self):
+        """Sin paquetes, connected() pasa a False y el hilo sigue vivo."""
+        rec = GloveReceiver(self.free_port(), bind_ip="127.0.0.1")
+        rec.start()
+        try:
+            rec.push(np.zeros(N_VALUES).tolist(), now=time.time() - 5)
+            self.assertFalse(rec.connected())
+            self.assertTrue(rec._thread.is_alive())
+        finally:
+            rec.stop()
 
 
 if __name__ == "__main__":
