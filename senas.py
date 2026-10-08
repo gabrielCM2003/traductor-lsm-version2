@@ -8,10 +8,7 @@ import logging
 import os
 import platform
 import queue
-import re
-import shutil
 import statistics
-import subprocess
 import sys
 import threading
 import time
@@ -512,7 +509,6 @@ DEFAULT_CONFIG = {
     # Mano que deletrea, la de la PERSONA: "Right" | "Left" (ver
     # MEDIAPIPE_LABEL_OF_HAND para como se traduce a la etiqueta de MediaPipe).
     "dominant_hand": "Right",
-    "speak_words": False,
     "keypoint_buffer_size": 30,
     "queue_maxsize": 1,
     "watchdog_timeout_s": 5.0,
@@ -599,7 +595,6 @@ class AppConfig:
     min_letter_confidence: float = DEFAULT_CONFIG["min_letter_confidence"]
     min_letter_margin: float = DEFAULT_CONFIG["min_letter_margin"]
     dominant_hand: str = DEFAULT_CONFIG["dominant_hand"]
-    speak_words: bool = DEFAULT_CONFIG["speak_words"]
     keypoint_buffer_size: int = DEFAULT_CONFIG["keypoint_buffer_size"]
     queue_maxsize: int = DEFAULT_CONFIG["queue_maxsize"]
     watchdog_timeout_s: float = DEFAULT_CONFIG["watchdog_timeout_s"]
@@ -2758,105 +2753,6 @@ class HandTrackingThread(QThread):
 
 
 # =========================================================================== #
-# Voz (texto a voz del sistema)
-# =========================================================================== #
-
-# Orden de preferencia de voces en macOS. Las "Eloquence" (Eddy, Flo,
-# Grandma...) existen para cada idioma pero suenan robóticas.
-_MAC_LOCALE_ORDER = ("es_MX", "es_US", "es_419", "es_ES")
-_MAC_PREFERRED_VOICES = ("Paulina", "Juan", "Mónica", "Jorge")
-
-# Windows: la voz del sistema (System.Speech) por PowerShell. El texto va por
-# variable de entorno, no dentro del comando, para no tener que escaparlo.
-_WINDOWS_TTS_SCRIPT = (
-    "Add-Type -AssemblyName System.Speech; "
-    "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
-    "$v = $s.GetInstalledVoices() | Where-Object { $_.VoiceInfo.Culture.Name -like 'es-*' } "
-    "| Select-Object -First 1; "
-    "if ($v) { $s.SelectVoice($v.VoiceInfo.Name) }; "
-    "$s.Speak($env:LSM_TTS_TEXT)"
-)
-
-
-def _pick_mac_spanish_voice() -> Optional[str]:
-    try:
-        out = subprocess.run(
-            ["say", "-v", "?"], capture_output=True, text=True, timeout=10,
-        ).stdout
-    except (OSError, subprocess.SubprocessError):
-        return None
-    # Formato: "Paulina (Español (México)) es_MX    # ¡Hola! Me llamo Paulina."
-    voices = []
-    for line in out.splitlines():
-        m = re.match(r"^(.+?)\s+([a-z]{2}_[A-Z0-9]+)\s+#", line)
-        if m and m.group(2).startswith("es_"):
-            voices.append((m.group(1).strip(), m.group(2)))
-    if not voices:
-        return None
-
-    def rank(voice: tuple[str, str]) -> tuple[int, int]:
-        name, locale = voice
-        loc = _MAC_LOCALE_ORDER.index(locale) if locale in _MAC_LOCALE_ORDER else len(_MAC_LOCALE_ORDER)
-        preferred = 0 if name.split(" (")[0] in _MAC_PREFERRED_VOICES else 1
-        return (loc, preferred)
-
-    return min(voices, key=rank)[0]
-
-
-class Speaker:
-    """Lee palabras en voz alta con el TTS del sistema sin bloquear la UI.
-
-    macOS: `say`. Linux / Raspberry Pi: `espeak-ng` o `espeak`. Windows:
-    System.Speech por PowerShell.
-    """
-
-    def __init__(self):
-        self._base_cmd: Optional[list[str]] = None
-        if shutil.which("say"):
-            self._base_cmd = ["say"]
-        elif shutil.which("espeak-ng"):
-            self._base_cmd = ["espeak-ng", "-v", "es-419"]
-        elif shutil.which("espeak"):
-            self._base_cmd = ["espeak", "-v", "es-la"]
-        elif sys.platform == "win32" and shutil.which("powershell"):
-            self._base_cmd = ["powershell", "-NoProfile", "-NonInteractive", "-Command", _WINDOWS_TTS_SCRIPT]
-        self._queue: queue.Queue[str] = queue.Queue()
-        self._worker: Optional[threading.Thread] = None
-
-    @property
-    def available(self) -> bool:
-        return self._base_cmd is not None
-
-    def say(self, text: str) -> None:
-        if not self.available or not text.strip():
-            return
-        if self._worker is None:
-            self._worker = threading.Thread(target=self._run, name="tts", daemon=True)
-            self._worker.start()
-        self._queue.put(text)
-
-    def _run(self) -> None:
-        # Las palabras se leen en orden, sin solaparse.
-        cmd = list(self._base_cmd)
-        if cmd[0] == "say":
-            voice = _pick_mac_spanish_voice()   # tarda ~0.2 s: fuera de la UI
-            if voice:
-                cmd += ["-v", voice]
-        powershell = cmd[0] == "powershell"
-        while True:
-            text = self._queue.get()
-            try:
-                subprocess.run(
-                    cmd if powershell else cmd + [text],
-                    env={**os.environ, "LSM_TTS_TEXT": text} if powershell else None,
-                    timeout=30, check=False,
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                )
-            except (OSError, subprocess.SubprocessError) as e:
-                log.warning("No se pudo leer en voz alta: %s", e)
-
-
-# =========================================================================== #
 # Ventana principal
 # =========================================================================== #
 
@@ -2889,7 +2785,6 @@ class SignLanguageApp(QMainWindow):
         # running"). Pasaba si el watchdog reiniciaba un hilo trabado.
         self._retiring_threads: list[QThread] = []
 
-        self.speaker = Speaker()
 
         # Guante (ESP32): independiente de la camara. El QTimer evalua la
         # ventana de lecturas ~4 veces por segundo (el clasificador tarda
@@ -3021,15 +2916,6 @@ class SignLanguageApp(QMainWindow):
             "el modelo y las plantillas, que son de la mano derecha.")
         self.hand_combo.currentIndexChanged.connect(self._on_dominant_hand_changed)
 
-        self.cb_speak = QCheckBox("Leer cada palabra en voz alta al terminarla")
-        if self.speaker.available:
-            self.cb_speak.setChecked(self.cfg.speak_words)
-        else:
-            self.cb_speak.setEnabled(False)
-            self.cb_speak.setToolTip("No se encontró un motor de voz.\n"
-                                     "Linux / Raspberry Pi: sudo apt install espeak-ng")
-        self.cb_speak.toggled.connect(self._on_speak_toggled)
-
         self.cb_landmarks = QCheckBox("Puntos de las manos")
         self.cb_landmarks.setChecked(self.cfg.draw_landmarks)
         self.cb_landmarks.toggled.connect(self._on_draw_landmarks)
@@ -3094,7 +2980,7 @@ class SignLanguageApp(QMainWindow):
         titles = QVBoxLayout()
         title = QLabel("Traductor LSM")
         title.setObjectName("AppTitle")
-        subtitle = QLabel("Lengua de Señas Mexicana a texto y voz")
+        subtitle = QLabel("Lengua de Señas Mexicana a texto")
         subtitle.setObjectName("AppSubtitle")
         titles.addWidget(title)
         titles.addWidget(subtitle)
@@ -3110,7 +2996,7 @@ class SignLanguageApp(QMainWindow):
         guide_btn.setToolTip("Cómo se hace cada seña; se puede consultar con la cámara encendida (F1)")
         guide_btn.clicked.connect(self.open_manual)
         settings_btn = QPushButton("⚙ Ajustes")
-        settings_btn.setToolTip("Ajustes de cámara, reconocimiento y voz (Ctrl+,)")
+        settings_btn.setToolTip("Ajustes de cámara y reconocimiento (Ctrl+,)")
         settings_btn.clicked.connect(self.open_settings)
         self.start_button = QPushButton("▶  Iniciar")
         self.start_button.setObjectName("Primary")
@@ -3156,7 +3042,6 @@ class SignLanguageApp(QMainWindow):
             ("⌫  Borrar letra", "Borra la última letra (Retroceso)", self.delete_last_letter),
             ("✕  Borrar palabra", "Borra la palabra en curso (Ctrl+Retroceso)", self.clear_current_word),
             ("␣  Terminar palabra", "Cierra la palabra en curso (Enter)", self.insert_space),
-            ("🔊  Leer", "Lee en voz alta la última palabra", self.speak_last),
             ("💾  Guardar texto", "Guarda todo el texto en un archivo", self.export_history),
             ("🗑  Limpiar", "Borra todo el texto", self.clear_all),
         ):
@@ -3232,7 +3117,7 @@ class SignLanguageApp(QMainWindow):
                     cam_row,
                     self._labeled_row("Detección de manos", self.threshold_slider, self.threshold_value_label),
                 ]),
-                ("Persona", [self._labeled_row("Mano que deletrea", self.hand_combo), self.cb_speak]),
+                ("Persona", [self._labeled_row("Mano que deletrea", self.hand_combo)]),
                 ("Dibujo sobre el video", [self.cb_landmarks, self.cb_connections, self.cb_body]),
                 ("Guante (ESP32)", [self.cb_glove_auto, self.glove_info_label]),
                 ("Diagnóstico", [self.cb_diagnostic, self.diagnostic_label]),
@@ -3526,9 +3411,6 @@ class SignLanguageApp(QMainWindow):
         # La camara ahora combina con el guante de la otra mano.
         self._sync_glove_to_thread()
 
-    def _on_speak_toggled(self, checked: bool) -> None:
-        self.cfg.speak_words = checked
-
     def _on_diagnostic_toggled(self, checked: bool) -> None:
         if checked:
             self.diagnostic_label.show()
@@ -3753,8 +3635,6 @@ class SignLanguageApp(QMainWindow):
         self._render_sentence()
         if self.ai_thread is not None:
             self.ai_thread.reset_word_state()
-        if self.cfg.speak_words:
-            self.speaker.say(word.lower())
 
     def delete_last_letter(self) -> None:
         if self._held:
@@ -3783,15 +3663,6 @@ class SignLanguageApp(QMainWindow):
         self.history.clear()
         self.clear_current_word()
         self.feedback.clear()
-
-    def speak_last(self) -> None:
-        text = self.current_word.strip() or (self.history[-1] if self.history else "")
-        if not text:
-            return
-        if not self.speaker.available:
-            QMessageBox.information(self, "Sin voz", "No se encontró un motor de voz en este equipo.")
-            return
-        self.speaker.say(text.lower())
 
     def insert_space(self) -> None:
         self.on_space_committed()

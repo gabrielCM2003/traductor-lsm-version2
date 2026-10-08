@@ -290,24 +290,27 @@ def signer_crop(bodies: list[Optional[BodyDetection]], w: int, h: int) -> tuple[
     return int(round(x0)), int(round(y0)), int(round(cw)), int(round(ch))
 
 
-def read_frames(path: Path):
-    """(indice, frame BGR ya en espejo, como la camara en vivo) de cada frame."""
+def read_frames(path: Path, step: int = 1):
+    """(indice, frame BGR ya en espejo, como la camara en vivo) de 1 de cada
+    `step` frames, numerados de corrido (0, 1, 2...)."""
     cap = cv2.VideoCapture(str(path))
     if not cap.isOpened():
         raise RuntimeError("no se pudo abrir el video")
     try:
-        idx = 0
+        raw = idx = 0
         while True:
             ok, bgr = cap.read()
             if not ok:
                 return
-            yield idx, cv2.flip(bgr, 1)
-            idx += 1
+            if raw % step == 0:
+                yield idx, cv2.flip(bgr, 1)
+                idx += 1
+            raw += 1
     finally:
         cap.release()
 
 
-def extract_video(path: Path, hand_det, pose_det, ts_offset_ms: int
+def extract_video(path: Path, hand_det, pose_det, ts_offset_ms: int, max_fps: Optional[float] = None
                   ) -> tuple[list[Frame], list[list[Frame]], int, float, tuple[int, int, int, int]]:
     """Procesa el video en dos pasadas: 1) pose en la imagen completa, para
     seguir a quien sena y ubicar el recorte; 2) manos en el recorte, cuerpo y
@@ -315,10 +318,14 @@ def extract_video(path: Path, hand_det, pose_det, ts_offset_ms: int
     fps, recorte). Los timestamps siguen creciendo entre videos (ts_offset_ms)
     porque los detectores en modo VIDEO los exigen crecientes; son de tiempo
     real del video, no +1 por frame, porque la pose suaviza segun el tiempo
-    entre frames (ver BodyTracker)."""
+    entre frames (ver BodyTracker). Con max_fps, un video mas rapido (p. ej.
+    60 fps) se procesa con 1 de cada N frames, a la velocidad de la camara de
+    la app; el fps devuelto es el ya reducido."""
     cap = cv2.VideoCapture(str(path))
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     cap.release()
+    step = max(1, round(fps / max_fps)) if max_fps else 1
+    fps /= step
 
     def timestamp(idx: int) -> int:
         return ts_offset_ms + int(round(idx * 1000.0 / fps))
@@ -326,7 +333,7 @@ def extract_video(path: Path, hand_det, pose_det, ts_offset_ms: int
     bodies: list[Optional[BodyDetection]] = []
     previous_mid = None
     w = h = 0
-    for idx, bgr in read_frames(path):
+    for idx, bgr in read_frames(path, step):
         h, w = bgr.shape[:2]
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
         body = pick_signer(pose_det.detect_for_video(mp_image, timestamp(idx)), w, h, previous_mid)
@@ -348,7 +355,7 @@ def extract_video(path: Path, hand_det, pose_det, ts_offset_ms: int
     frames: list[Frame] = []
     signs: list[list[Frame]] = []
     last_body = None
-    for idx, bgr in read_frames(path):
+    for idx, bgr in read_frames(path, step):
         if idx >= len(bodies):
             break
         t_ms = idx * 1000.0 / fps

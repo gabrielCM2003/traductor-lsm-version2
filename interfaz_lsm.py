@@ -664,7 +664,7 @@ class StartPage(QWidget):
         hero = QLabel("Traductor LSM")
         hero.setObjectName("Hero")
         hero.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        sub = QLabel("Lengua de Señas Mexicana a texto y voz")
+        sub = QLabel("Lengua de Señas Mexicana a texto")
         sub.setObjectName("AppSubtitle")
         sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
         text = QLabel("Reconoce el abecedario completo y las palabras HOLA, GRACIAS, POR FAVOR, "
@@ -727,7 +727,7 @@ class ManualPage(QWidget):
 
 
 class SettingsDialog(QDialog):
-    """Ajustes tecnicos (camara, umbrales, dibujo, mano, voz, diagnostico).
+    """Ajustes tecnicos (camara, umbrales, dibujo, mano, diagnostico).
     La ventana le pasa los controles ya creados, conectados a sus handlers."""
 
     def __init__(self, sections: Sequence[tuple[str, Sequence[Any]]], parent: Optional[QWidget] = None):

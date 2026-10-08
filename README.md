@@ -1,6 +1,6 @@
 # Traductor LSM
 
-Aplicación de escritorio que reconoce la Lengua de Señas Mexicana (LSM) con una cámara. MediaPipe detecta los 21 puntos de cada mano y el esqueleto del cuerpo; un clasificador ONNX reconoce el **alfabeto estático** (21 letras: A, B, C, D, E, F, G, H, I, L, M, N, O, P, R, S, T, U, V, W, Y), un reconocedor por **DTW** reconoce el **alfabeto dinámico** (J, K, Ñ, Q, X, Z), que llevan movimiento en vez de postura fija, y las **palabras completas** HOLA, GRACIAS, POR FAVOR, AYUDA y MAMÁ. Las tres cosas se detectan a la vez, sin cambiar de modo. Las letras confirmadas forman palabras, y las palabras terminadas se guardan en un historial y se pueden leer en voz alta.
+Aplicación de escritorio que reconoce la Lengua de Señas Mexicana (LSM) con una cámara. MediaPipe detecta los 21 puntos de cada mano y el esqueleto del cuerpo; un clasificador ONNX reconoce el **alfabeto estático** (21 letras: A, B, C, D, E, F, G, H, I, L, M, N, O, P, R, S, T, U, V, W, Y), un reconocedor por **DTW** reconoce el **alfabeto dinámico** (J, K, Ñ, Q, X, Z), que llevan movimiento en vez de postura fija, y las **palabras completas** HOLA, GRACIAS, POR FAVOR, AYUDA y MAMÁ. Las tres cosas se detectan a la vez, sin cambiar de modo. Las letras confirmadas forman palabras, y las palabras terminadas se guardan en un historial que se puede guardar en un archivo de texto.
 
 El repositorio incluye también la documentación del **guante instrumentado** diseñado para el reto de LSM de Indivisa Ingenium 2026 (Universidad La Salle Oaxaca).
 
@@ -13,13 +13,13 @@ El repositorio incluye también la documentación del **guante instrumentado** d
 - **Modo automático**: letras estáticas, letras dinámicas y palabras al mismo tiempo, sin botones ni atajos para cambiar de modo (ver "Cómo reconoce el modo automático").
 - Esqueleto del cuerpo con MediaPipe Pose (hombros, brazos, cuello y cara) para saber dónde están las manos respecto a la persona, necesario para las palabras completas. Se muestra u oculta con la casilla "Dibujar esqueleto del cuerpo".
 - Interfaz gráfica construida con PyQt6.
-- Construcción de palabras letra por letra, con historial y lectura en voz alta.
+- Construcción de palabras letra por letra, con historial.
 
 ## Contenido
 
 | Archivo | Qué es |
 |---|---|
-| `senas.py` | Aplicación (PyQt6): cámara, MediaPipe, modo automático (letras estáticas, dinámicas y palabras), ventana y voz |
+| `senas.py` | Aplicación (PyQt6): cámara, MediaPipe, modo automático (letras estáticas, dinámicas y palabras) y ventana |
 | `interfaz_lsm.py` | Tema visual, menú inicial, manual de señas, componentes de la ventana y textos de retroalimentación (qué corregir de cada seña) |
 | `manual/` | Ilustraciones del manual de señas: `letras/` (abecedario) y `palabras/`, cada una con los puntos de donde se dibujó (.json) |
 | `generar_manual.py` | Genera las ilustraciones de `manual/` a partir de datos reales (videos del equipo y plantillas del CICESE) |
@@ -61,7 +61,7 @@ pip install -r requirements.txt
 
 En macOS, `requirements.txt` evita mediapipe 1.0.1, que se cae al iniciar los detectores en Mac.
 
-En Raspberry Pi con la cámara oficial, instala además Picamera2 con `sudo apt install python3-picamera2` y crea el entorno virtual con `--system-site-packages`. Para la voz en Linux: `sudo apt install espeak-ng`. macOS usa `say` y Windows la voz del sistema (System.Speech por PowerShell), que ya vienen instalados.
+En Raspberry Pi con la cámara oficial, instala además Picamera2 con `sudo apt install python3-picamera2` y crea el entorno virtual con `--system-site-packages`.
 
 ## Uso
 
@@ -122,10 +122,10 @@ Para regenerar todo: `python generar_manual.py --abecedario VIDEO --dinamicas --
 
 ### La interfaz
 
-- **Encabezado:** cámara, 📖 Manual (F1), ⚙ Ajustes (Ctrl+,: umbrales, mano que deletrea, voz, dibujo y diagnóstico) y ▶ Iniciar / ■ Detener.
+- **Encabezado:** cámara, 📖 Manual (F1), ⚙ Ajustes (Ctrl+,: umbrales, mano que deletrea, dibujo y diagnóstico) y ▶ Iniciar / ■ Detener.
 - **Video:** el marco cambia de color según lo que pasa: gris en reposo, azul mientras haces la seña, morado mientras la reconoce, verde si la reconoció y ámbar si hay que repetirla.
 - **Seña:** la letra que se está formando o la última letra o palabra reconocida, con sus 3 candidatas.
-- **Texto traducido:** las palabras terminadas en gris, la palabra en curso en blanco y, subrayadas en azul, las letras que la seña en curso todavía puede cambiar. Botones para borrar, terminar la palabra, leer en voz alta, guardar y limpiar.
+- **Texto traducido:** las palabras terminadas en gris, la palabra en curso en blanco y, subrayadas en azul, las letras que la seña en curso todavía puede cambiar. Botones para borrar, terminar la palabra, guardar y limpiar.
 - **Retroalimentación:** consejos en vivo ("No veo tus hombros", "¿B o P? Ajusta la forma de los dedos", "Para deletrear usa una sola mano", "Mano muy cerca de la cámara") y el resultado de cada seña con movimiento. Si una palabra no sale, compara cómo la hiciste con cómo se hace según sus plantillas: por ejemplo, "¿HOLA o MAMÁ? Tu mano quedó frente al pecho; HOLA se hace a la altura de la cabeza", "AYUDA se hace con las dos manos" o "La hiciste muy rápido".
 
 ### Rendimiento (Raspberry Pi 5)
@@ -235,7 +235,7 @@ En modo palabras, la seña termina al bajar las manos por debajo de la línea de
 
 Para repetir una letra (LL, RR, EE), relaja la mano un instante (o bájala) y vuelve a hacerla.
 
-En **Ajustes**, **Mano que deletrea** elige qué mano se clasifica cuando hay dos en cuadro. Con la izquierda, la seña se refleja para compararla con el modelo y las plantillas, que son de la mano derecha. **Leer palabras en voz alta** lee cada palabra al terminarla. Los valores de los sliders y estas opciones se guardan en la configuración.
+En **Ajustes**, **Mano que deletrea** elige qué mano se clasifica cuando hay dos en cuadro. Con la izquierda, la seña se refleja para compararla con el modelo y las plantillas, que son de la mano derecha. Los valores de los sliders y estas opciones se guardan en la configuración.
 
 ## Pruebas
 

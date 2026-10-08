@@ -17,5 +17,3 @@ py7zr
 
 # Raspberry Pi con cámara CSI (no se instala con pip):
 #   sudo apt install python3-picamera2
-# Voz en Linux / Raspberry Pi (macOS usa `say`, ya incluido):
-#   sudo apt install espeak-ng

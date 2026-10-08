@@ -97,7 +97,7 @@ class AppConfigTests(unittest.TestCase):
         self.assertEqual(senas.AppConfig.load(self.path), senas.AppConfig())
 
     def test_save_roundtrip(self):
-        cfg = senas.AppConfig(min_letter_confidence=0.7, dominant_hand="Left", speak_words=True)
+        cfg = senas.AppConfig(min_letter_confidence=0.7, dominant_hand="Left")
         cfg.save(self.path)
         self.assertEqual(senas.AppConfig.load(self.path), cfg)
 
