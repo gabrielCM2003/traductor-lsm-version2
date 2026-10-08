@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import errno
 import glob
 import json
@@ -494,6 +495,11 @@ HAND_MODEL_FILENAME = "hand_landmarker.task"
 
 DEFAULT_CONFIG = {
     "camera_index": 0,
+    # Como se abre la camara: "auto" (en la Raspberry Pi, la camara CSI por
+    # Picamera2, p. ej. la Raspberry Pi AI Camera / IMX500; si falla, una
+    # webcam USB por OpenCV), "picamera2" (solo la CSI) u "opencv" (solo
+    # webcam, con camera_index; para no usar la CSI aunque este conectada).
+    "camera_backend": "auto",
     "max_num_hands": 2,
     "min_detection_confidence": 0.5,
     "min_tracking_confidence": 0.5,
@@ -560,6 +566,7 @@ CONFIG_RANGES: dict[str, tuple[float, float]] = {
     "glove_port": (1, 65535),
 }
 CONFIG_CHOICES: dict[str, tuple[str, ...]] = {
+    "camera_backend": ("auto", "picamera2", "opencv"),
     "dominant_hand": ("Right", "Left"),
     "pose_model": POSE_MODELS,
 }
@@ -585,6 +592,7 @@ log = logging.getLogger("sign_translator")
 @dataclass
 class AppConfig:
     camera_index: int = DEFAULT_CONFIG["camera_index"]
+    camera_backend: str = DEFAULT_CONFIG["camera_backend"]
     max_num_hands: int = DEFAULT_CONFIG["max_num_hands"]
     min_detection_confidence: float = DEFAULT_CONFIG["min_detection_confidence"]
     min_tracking_confidence: float = DEFAULT_CONFIG["min_tracking_confidence"]
@@ -744,7 +752,7 @@ _PREFERRED_BACKEND = cv2.CAP_V4L2 if platform.system() == "Linux" else cv2.CAP_A
 # --------------------------------------------------------------------------- #
 #
 # En la Raspberry Pi 5 con Bookworm, las cámaras CSI (módulos oficiales:
-# imx708 / imx219 / ov5647) NO se exponen de forma fiable como /dev/videoX
+# imx708 / imx219 / ov5647, y la Raspberry Pi AI Camera, imx500) NO se exponen de forma fiable como /dev/videoX
 # para cv2.CAP_V4L2, porque se eliminó el firmware de cámara legacy. La forma
 # correcta de acceder a ellas es a través de libcamera, mediante Picamera2.
 #
@@ -761,24 +769,145 @@ def _picamera2_available() -> bool:
         return False
 
 
+# Raspberry Pi AI Camera (sensor Sony IMX500). Para este programa es una
+# camara CSI mas: MediaPipe corre en la CPU de la Pi y la red neuronal del
+# sensor no se usa. Lo que la distingue de las otras camaras oficiales:
+# - Necesita su firmware (sudo apt install imx500-all); sin el, libcamera no
+#   la detecta o la detecta pero no entrega imagen.
+# - Al encenderla se le sube el firmware al sensor y el primer cuadro puede
+#   tardar varios segundos (mas la primera vez despues de instalarlo).
+# - Modos del sensor: 4056x3040 a 10 fps y 2028x1520 a 30 fps (binning). Se
+#   pide el de 2028x1520 para no quedar en 10 fps; el ISP lo baja a 640x480.
+IMX500_SENSOR_SIZE = (2028, 1520)
+PICAM_FIRST_FRAME_TIMEOUT_S = 5.0       # camaras CSI normales
+IMX500_FIRST_FRAME_TIMEOUT_S = 20.0     # la AI Camera, mientras carga su firmware
+PICAM_READ_TIMEOUT_S = 1.0              # sin cuadro en este tiempo = lectura fallida
+PICAM_CLOSE_TIMEOUT_S = 3.0             # stop()/close() trabados no detienen el hilo de camara
+
+# Ultima instancia de Picamera2 abierta. libcamera deja abrir cada camara una
+# sola vez: si un hilo de camara viejo no termino a tiempo (ver
+# SignLanguageApp._retire_thread) y no la cerro, todas las reaperturas
+# fallarian con "Device or resource busy". Se cierra antes de abrir otra.
+_active_picam = None
+_active_picam_lock = threading.Lock()
+
+
+def _picamera2_cameras() -> list[dict]:
+    """Camaras que ve libcamera ([{"Model": "imx500", "Num": 0, ...}]); []
+    si Picamera2 no esta instalada o falla al listarlas. Nunca lanza."""
+    try:
+        from picamera2 import Picamera2  # type: ignore
+        return list(Picamera2.global_camera_info() or [])
+    except Exception as e:
+        log.debug("No se pudieron listar las cámaras de libcamera: %s", e)
+        return []
+
+
+def _is_imx500(info: dict) -> bool:
+    return "imx500" in str(info.get("Model", "")).lower()
+
+
+def _picamera_error_hint(error: BaseException, imx500: bool) -> str:
+    """Que decirle al usuario segun el error de Picamera2 / libcamera."""
+    text = str(error).strip() or type(error).__name__
+    low = text.lower()
+    if "busy" in low or "in use" in low or "did not complete" in low:
+        return ("la cámara está ocupada por otro programa (cierra rpicam-hello, "
+                "libcamera-hello u otra ventana del traductor)")
+    if "fpk" in low or "firmware" in low:
+        return "falta el firmware de la AI Camera: sudo apt install imx500-all y reinicia la Raspberry"
+    if "no detecta" in low:
+        return (text + ". Revisa el cable plano (bien metido y por el lado correcto en los dos "
+                "extremos) y prueba: rpicam-hello --list-cameras" +
+                ("" if imx500 else ". Si es la AI Camera: sudo apt install imx500-all"))
+    if isinstance(error, TimeoutError):
+        return text + (" (¿falta el firmware? sudo apt install imx500-all)" if imx500 else "")
+    return text
+
+
+def _run_with_timeout(fn, timeout_s: float, what: str) -> bool:
+    """Corre fn en un hilo aparte y espera a lo mas timeout_s; True si
+    termino. Para stop()/close() de Picamera2, que se pueden quedar trabados
+    si el sensor dejo de responder: asi el hilo de camara sigue y reintenta."""
+    done = threading.Event()
+
+    def target():
+        try:
+            fn()
+        except Exception as e:
+            log.debug("%s: %s", what, e)
+        finally:
+            done.set()
+
+    threading.Thread(target=target, name=what, daemon=True).start()
+    if done.wait(timeout_s):
+        return True
+    log.warning("%s no terminó en %.0f s; se sigue sin esperar", what, timeout_s)
+    return False
+
+
+def _close_picam(picam) -> None:
+    try:
+        picam.stop()
+    except Exception:
+        pass
+    picam.close()
+
+
+def _close_stale_picamera() -> None:
+    global _active_picam
+    with _active_picam_lock:
+        stale, _active_picam = _active_picam, None
+    if stale is not None:
+        log.warning("Picamera2: se cierra una instancia anterior que seguía abierta")
+        _run_with_timeout(lambda: _close_picam(stale), PICAM_CLOSE_TIMEOUT_S, "cerrar Picamera2 anterior")
+
+
 class PiCameraCapture:
     """Adaptador de Picamera2 con interfaz compatible con cv2.VideoCapture.
 
-    Solo se usa en Raspberry Pi con cámara CSI. Entrega frames en formato BGR
-    (igual que OpenCV) para que el pipeline existente no cambie.
+    Solo se usa en Raspberry Pi con cámara CSI (incluida la Raspberry Pi AI
+    Camera, IMX500). Entrega frames en formato BGR (igual que OpenCV) para que
+    el pipeline existente no cambie.
+
+    Nunca lanza: si algo falla al abrir, isOpened() es False y `error` dice
+    por que (CameraThread lo muestra y prueba con una webcam USB). read()
+    espera cada cuadro a lo mas PICAM_READ_TIMEOUT_S, para que un sensor que
+    deja de mandar imagen cuente como lectura fallida (y CameraThread
+    reconecte) en vez de congelar el video.
     """
 
     def __init__(self, width: int = 640, height: int = 480, framerate: int = 30):
+        global _active_picam
         self._picam = None
         self._opened = False
+        self._size = (int(width), int(height))
+        self._job = None            # captura pedida que todavia no llega
+        self._async = True          # capture_array(wait=False) + wait(timeout)
+        self.error = ""
+        self.model = ""
+        self.is_imx500 = False
+        self.description = "cámara CSI"
+        self.short_name = "CSI"
         try:
             from picamera2 import Picamera2  # type: ignore
 
-            self._picam = Picamera2()
-            config = self._picam.create_preview_configuration(
-                main={"size": (int(width), int(height)), "format": "RGB888"},
-            )
-            self._picam.configure(config)
+            cameras = Picamera2.global_camera_info() or []
+            if not cameras:
+                raise RuntimeError("libcamera no detecta ninguna cámara CSI")
+            info = cameras[0]
+            self.model = str(info.get("Model", "")).strip()
+            self.is_imx500 = _is_imx500(info)
+            if self.is_imx500:
+                self.description, self.short_name = "Raspberry Pi AI Camera (IMX500)", "AI Camera"
+            elif self.model:
+                self.description = f"cámara CSI ({self.model})"
+
+            _close_stale_picamera()
+            self._picam = Picamera2(0)
+            with _active_picam_lock:
+                _active_picam = self._picam
+            self._configure(width, height)
             # Fija el framerate vía duración de frame (en microsegundos).
             try:
                 frame_us = int(1_000_000 / max(1, framerate))
@@ -786,17 +915,79 @@ class PiCameraCapture:
             except Exception:
                 pass  # no es crítico si el sensor no lo soporta
             self._picam.start()
+            # Que de verdad llegue imagen: la AI Camera sin firmware arranca
+            # sin error pero nunca entrega un cuadro.
+            timeout = IMX500_FIRST_FRAME_TIMEOUT_S if self.is_imx500 else PICAM_FIRST_FRAME_TIMEOUT_S
+            if self._to_bgr(self._capture(timeout)) is None:
+                raise TimeoutError(f"la cámara no entregó imagen en {timeout:.0f} s")
             self._opened = True
-            log.info("Picamera2 iniciada (%dx%d @ %dfps)", width, height, framerate)
+            log.info("Picamera2 iniciada: %s (%dx%d @ %dfps)", self.description, width, height, framerate)
         except Exception as e:
-            log.error("No se pudo iniciar Picamera2: %s", e)
-            self._opened = False
-            if self._picam is not None:
-                try:
-                    self._picam.close()
-                except Exception:
-                    pass
-                self._picam = None
+            self.error = _picamera_error_hint(e, self.is_imx500)
+            log.error("No se pudo iniciar Picamera2 (%s): %s", self.description, self.error)
+            self.release()
+
+    def _configure(self, width: int, height: int) -> None:
+        # "RGB888" de Picamera2 son 3 bytes por pixel en orden [B, G, R]
+        # (nombres de formato de DRM/libcamera), lo mismo que usa OpenCV.
+        main = {"size": (int(width), int(height)), "format": "RGB888"}
+        attempts = [{"main": main}]
+        if self.is_imx500:
+            # Modo de 30 fps del sensor; si este Picamera2 no acepta sensor=,
+            # se deja que elija el modo.
+            attempts.insert(0, {"main": main, "sensor": {"output_size": IMX500_SENSOR_SIZE}})
+        for i, kwargs in enumerate(attempts):
+            try:
+                self._picam.configure(self._picam.create_preview_configuration(**kwargs))
+                return
+            except Exception as e:
+                if i == len(attempts) - 1:
+                    raise
+                log.warning("Picamera2: no se pudo usar el modo %s del sensor (%s); se deja el automático",
+                            IMX500_SENSOR_SIZE, e)
+
+    def _capture(self, timeout_s: float):
+        """Un cuadro, esperando a lo mas timeout_s; None si no llego. La
+        captura sigue pendiente y la siguiente llamada la vuelve a esperar,
+        para no apilar pedidos mientras el sensor no responde."""
+        picam = self._picam
+        if self._async:
+            try:
+                if self._job is None:
+                    self._job = picam.capture_array("main", wait=False)
+                frame = picam.wait(self._job, timeout=timeout_s)
+            except (TimeoutError, concurrent.futures.TimeoutError):
+                return None
+            except TypeError:
+                # Picamera2 viejo, sin wait=False / timeout: captura normal
+                # (bloqueante, como antes).
+                log.info("Picamera2 sin capturas con tiempo límite; se usa la captura normal")
+                self._async = False
+            else:
+                self._job = None
+                return frame
+        if self._job is not None:
+            job, self._job = self._job, None
+            return picam.wait(job)
+        return picam.capture_array("main")
+
+    def _to_bgr(self, frame) -> Optional[np.ndarray]:
+        """El cuadro como BGR uint8 de width x height, o None si llego algo
+        que no es una imagen (para que no tumbe a MediaPipe mas adelante)."""
+        if frame is None:
+            return None
+        frame = np.asarray(frame)
+        if frame.dtype != np.uint8 or frame.size == 0:
+            return None
+        if frame.ndim == 2:
+            frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+        elif frame.ndim == 3 and frame.shape[2] == 4:
+            frame = frame[:, :, :3]          # XRGB8888: [B, G, R, 255]
+        elif frame.ndim != 3 or frame.shape[2] != 3:
+            return None
+        if (frame.shape[1], frame.shape[0]) != self._size:
+            frame = cv2.resize(frame, self._size, interpolation=cv2.INTER_AREA)
+        return np.ascontiguousarray(frame)
 
     def isOpened(self) -> bool:
         return self._opened
@@ -806,13 +997,16 @@ class PiCameraCapture:
         if not self._opened or self._picam is None:
             return False, None
         try:
-            frame = self._picam.capture_array()  # RGB888 -> array RGB
-            # Picamera2 entrega RGB; el resto del código asume BGR (OpenCV).
-            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-            return True, frame
+            # Antes se convertia de RGB a BGR, pero "RGB888" ya llega en
+            # orden BGR (ver _configure): la conversion invertia rojo y azul.
+            frame = self._to_bgr(self._capture(PICAM_READ_TIMEOUT_S))
         except Exception as e:
             log.warning("Fallo al capturar frame de Picamera2: %s", e)
+            self._job = None
             return False, None
+        if frame is None:
+            return False, None
+        return True, frame
 
     def set(self, *args, **kwargs) -> bool:
         """Acepta las llamadas cap.set(...) de CameraThread sin hacer nada.
@@ -824,24 +1018,39 @@ class PiCameraCapture:
         return True
 
     def release(self) -> None:
-        if self._picam is not None:
-            try:
-                self._picam.stop()
-            except Exception:
-                pass
-            try:
-                self._picam.close()
-            except Exception:
-                pass
-        self._picam = None
+        global _active_picam
+        picam, self._picam = self._picam, None
         self._opened = False
+        self._job = None
+        if picam is None:
+            return
+        _run_with_timeout(lambda: _close_picam(picam), PICAM_CLOSE_TIMEOUT_S, "cerrar Picamera2")
+        with _active_picam_lock:
+            if _active_picam is picam:
+                _active_picam = None
+
+
+def _usb_video_nodes() -> list[int]:
+    """Numeros N de /dev/videoN que son webcams USB (driver uvcvideo). En la
+    Raspberry Pi 5, /dev/video0, 1... son de la camara CSI y su ISP, no
+    webcams, asi que el indice configurado puede no ser una webcam."""
+    nodes = []
+    for path in glob.glob("/sys/class/video4linux/video*"):
+        num = os.path.basename(path)[len("video"):]
+        if not num.isdigit():
+            continue
+        driver = os.path.realpath(os.path.join(path, "device", "driver"))
+        if os.path.basename(driver) == "uvcvideo":
+            nodes.append(int(num))
+    return sorted(nodes)
 
 
 def list_available_cameras(max_check: int = 5) -> list[int]:
     # En Raspberry Pi con cámara CSI, el escaneo de /dev/video* no es fiable
     # (los nodos suelen ser del ISP, no del sensor). Si Picamera2 está
-    # disponible, exponemos la cámara CSI como índice 0.
-    if _is_raspberry_pi() and _picamera2_available():
+    # disponible, exponemos la cámara CSI como índice 0. Si libcamera no ve
+    # ninguna (cable suelto, AI Camera sin firmware), se buscan webcams.
+    if _is_raspberry_pi() and _picamera2_available() and _picamera2_cameras():
         return [0]
 
     available: list[int] = []
@@ -1182,35 +1391,93 @@ def draw_warning(image: np.ndarray, text: str) -> None:
 # Hilo 1: cámara con reconexión
 # =========================================================================== #
 
-class CameraThread(QThread):
-    error_signal = pyqtSignal(str)
-    status_signal = pyqtSignal(str)
-    camera_lost_signal = pyqtSignal()
-    camera_recovered_signal = pyqtSignal()
+class CameraOpener:
+    """Abre la camara como la usa el traductor, sin Qt (CameraThread y los
+    scripts con bucle propio la comparten): en la Raspberry Pi, la camara CSI
+    por Picamera2 (la Raspberry Pi AI Camera) y, si falla, una webcam USB;
+    en otra computadora, la webcam `camera_index` por OpenCV. open() nunca
+    lanza: devuelve None y deja en last_error por que."""
 
-    def __init__(self, frame_queue: queue.Queue, camera_index: int):
-        super().__init__()
-        self._frame_queue = frame_queue
+    def __init__(self, camera_index: int = 0, backend: str = "auto"):
         self._camera_index = camera_index
-        self._run_flag = True
-        self._reconnect_delay_s = 1.0
-        self._max_reconnect_delay_s = 8.0
+        self._backend = backend
+        self.camera_name = ""       # que camara se abrio (para la barra de estado)
+        self.last_error = ""        # por que no se pudo abrir (para el mensaje de error)
 
-    def _open_camera(self):
+    def _use_picamera(self) -> bool:
+        if self._backend == "opencv":
+            return False
+        if self._backend == "picamera2":
+            return True
+        return _is_raspberry_pi() and _picamera2_available()
+
+    def open(self):
+        # Nada al abrir la camara puede tumbar el hilo (o el script): un error
+        # inesperado cuenta como "no se pudo abrir" y se reintenta como
+        # cualquier otro.
+        try:
+            return self._open()
+        except Exception as e:
+            self.last_error = f"error inesperado: {e}"
+            log.exception("Error inesperado al abrir la cámara")
+            return None
+
+    def _open(self):
         # En Raspberry Pi con cámara CSI, usar Picamera2 (libcamera) en lugar
         # de V4L2, que no expone el sensor de forma fiable en la Pi 5.
-        if _is_raspberry_pi() and _picamera2_available():
-            cap = PiCameraCapture(width=640, height=480, framerate=30)
-            if not cap.isOpened():
-                cap.release()
-                return None
+        if self._use_picamera():
+            cap = self._open_picamera()
+            if cap is not None or self._backend == "picamera2":
+                return cap
+            # Failsafe: si la camara CSI (AI Camera) falla, una webcam USB.
+            csi_error = self.last_error
+            log.warning("No se pudo usar la cámara CSI (%s); se prueba con una webcam USB", csi_error)
+            cap = self._open_opencv()
+            if cap is None:
+                self.last_error = f"Cámara CSI: {csi_error}\nWebcam USB: {self.last_error}"
+            else:
+                self.camera_name = f"{self.camera_name}; la cámara CSI falló"
             return cap
+        return self._open_opencv()
 
-        cap = cv2.VideoCapture(self._camera_index, _PREFERRED_BACKEND)
+    def _open_picamera(self):
+        if not _picamera2_available():
+            self.last_error = "Picamera2 no está instalada (sudo apt install python3-picamera2)"
+            return None
+        cap = PiCameraCapture(width=640, height=480, framerate=30)
+        if not cap.isOpened():
+            self.last_error = cap.error or "Picamera2 no se pudo abrir"
+            cap.release()
+            return None
+        self.camera_name = cap.short_name
+        return cap
+
+    def _open_opencv(self):
+        candidates = [self._camera_index]
+        # En la Raspberry Pi el indice configurado puede ser un nodo de la
+        # camara CSI (no da imagen por V4L2): se prueba que de imagen y, si
+        # no, se prueban las webcams USB.
+        verify = _is_raspberry_pi()
+        if verify:
+            candidates += [n for n in _usb_video_nodes() if n != self._camera_index]
+        for index in candidates:
+            cap = self._open_opencv_index(index, verify)
+            if cap is not None:
+                self.camera_name = "webcam USB" if verify else ""
+                if index != self._camera_index:
+                    log.info("Webcam USB en /dev/video%d (el índice configurado era %d)",
+                             index, self._camera_index)
+                return cap
+        self.last_error = ("no se encontró ninguna webcam USB que dé imagen" if verify
+                           else f"no se pudo abrir la cámara {self._camera_index}")
+        return None
+
+    def _open_opencv_index(self, index: int, verify: bool = False):
+        cap = cv2.VideoCapture(index, _PREFERRED_BACKEND)
         if not cap.isOpened():
             cap.release()
             # Reintento con backend automático por si no soporta V4L2.
-            cap = cv2.VideoCapture(self._camera_index)
+            cap = cv2.VideoCapture(index)
             if not cap.isOpened():
                 cap.release()
                 return None
@@ -1223,25 +1490,173 @@ class CameraThread(QThread):
         except Exception:
             pass
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        if verify and not any(cap.read()[0] for _ in range(5)):
+            cap.release()
+            return None
         return cap
+
+
+# Scripts con bucle propio (recolectores, segmentador): sin la camara, tras
+# este tiempo reconectando se rinden (en vez de esperar para siempre).
+CAMERA_GIVE_UP_S = 30.0
+
+
+class LiveCamera:
+    """Camara para los scripts con su propio bucle de OpenCV
+    (recolector_estatico.py, recolector_dinamico.py, segmentador_automatico.py).
+
+    Se abre igual que en el traductor (CameraOpener: la AI Camera en la
+    Raspberry Pi, con webcam USB de respaldo) y read() nunca lanza ni tumba
+    el script: si la camara deja de dar imagen, la cierra y la vuelve a
+    abrir sola, como CameraThread, y mientras tanto devuelve (False, None).
+    gave_up es True si lleva CAMERA_GIVE_UP_S sin imagen. Los cuadros salen
+    sin voltear, como de cv2.VideoCapture."""
+
+    FAILURES_TO_RECONNECT = 5
+
+    def __init__(self, camera_index: int = 0, backend: str = "auto"):
+        self._opener = CameraOpener(camera_index, backend)
+        self._cap = self._opener.open()
+        self._failures = 0
+        self._delay = 1.0
+        self._retry_at = 0.0
+        self._last_frame_at = time.monotonic()
+        self._lost_logged = False
+        if self._cap is not None:
+            log.info("Cámara abierta%s", f" ({self.camera_name})" if self.camera_name else "")
+
+    @property
+    def camera_name(self) -> str:
+        return self._opener.camera_name
+
+    @property
+    def last_error(self) -> str:
+        return self._opener.last_error
+
+    def isOpened(self) -> bool:
+        return self._cap is not None
+
+    @property
+    def lost_for_s(self) -> float:
+        """Segundos desde el ultimo cuadro bueno (0 mientras llegan)."""
+        return 0.0 if self._failures == 0 and self._cap is not None else time.monotonic() - self._last_frame_at
+
+    @property
+    def gave_up(self) -> bool:
+        return self.lost_for_s >= CAMERA_GIVE_UP_S
+
+    def read(self):
+        if self._cap is None:
+            if time.monotonic() < self._retry_at:
+                return False, None
+            self._cap = self._opener.open()
+            if self._cap is None:
+                self._delay = min(self._delay * 1.5, 8.0)
+                self._retry_at = time.monotonic() + self._delay
+                return False, None
+            log.info("Cámara reconectada%s", f" ({self.camera_name})" if self.camera_name else "")
+            self._failures = 0
+        try:
+            ret, frame = self._cap.read()
+        except Exception as e:
+            if self._failures == 0:
+                log.warning("Error al leer la cámara: %s", e)
+            ret, frame = False, None
+        if ret and frame is not None:
+            self._failures = 0
+            self._delay = 1.0
+            self._last_frame_at = time.monotonic()
+            self._lost_logged = False
+            return True, frame
+        self._failures += 1
+        if self._failures >= self.FAILURES_TO_RECONNECT:
+            if not self._lost_logged:
+                log.warning("La cámara no da imagen; reconectando...")
+                self._lost_logged = True
+            self._close()
+            self._retry_at = time.monotonic() + self._delay
+        return False, None
+
+    def placeholder(self, width: int = 640, height: int = 480) -> np.ndarray:
+        """Cuadro negro con el aviso de reconexion, para seguir mostrando la
+        ventana (y atendiendo ESC) mientras no hay imagen."""
+        frame = np.zeros((height, width, 3), dtype=np.uint8)
+        for y, text in ((height // 2 - 10, "Camara perdida, reconectando..."),
+                        (height // 2 + 25, f"{self.lost_for_s:.0f}s sin imagen  |  ESC=salir")):
+            cv2.putText(frame, text, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2, cv2.LINE_AA)
+        return frame
+
+    def _close(self) -> None:
+        cap, self._cap = self._cap, None
+        if cap is not None:
+            try:
+                cap.release()
+            except Exception as e:
+                log.warning("Error al cerrar la cámara: %s", e)
+
+    def release(self) -> None:
+        self._close()
+
+
+class CameraThread(QThread):
+    error_signal = pyqtSignal(str)
+    status_signal = pyqtSignal(str)
+    camera_lost_signal = pyqtSignal()
+    camera_recovered_signal = pyqtSignal()
+
+    def __init__(self, frame_queue: queue.Queue, camera_index: int, backend: str = "auto"):
+        super().__init__()
+        self._frame_queue = frame_queue
+        self._camera_index = camera_index
+        self._opener = CameraOpener(camera_index, backend)
+        self._run_flag = True
+        self._reconnect_delay_s = 1.0
+        self._max_reconnect_delay_s = 8.0
+
+    @property
+    def camera_name(self) -> str:
+        """Que camara se abrio (para la barra de estado)."""
+        return self._opener.camera_name
+
+    @property
+    def last_error(self) -> str:
+        """Por que no se pudo abrir (para el mensaje de error)."""
+        return self._opener.last_error
+
+    def _open_camera(self):
+        return self._opener.open()
 
     def run(self) -> None:
         cap = self._open_camera()
         if cap is None:
             msg = f"No se pudo abrir la cámara (índice {self._camera_index})."
+            if self.last_error:
+                msg += f"\n\n{self.last_error}"
             log.error(msg)
             self.error_signal.emit(msg)
             return
 
-        self.status_signal.emit("Cámara conectada")
-        log.info("Cámara abierta en índice %d", self._camera_index)
+        self.status_signal.emit(f"Cámara conectada ({self.camera_name})" if self.camera_name
+                                else "Cámara conectada")
+        log.info("Cámara abierta en índice %d%s", self._camera_index,
+                 f" ({self.camera_name})" if self.camera_name else "")
         consecutive_failures = 0
         camera_was_lost = False
         delay = self._reconnect_delay_s
 
         try:
             while self._run_flag:
-                ret, frame = cap.read()
+                if cap is None:
+                    # La reconexion anterior fallo: antes cap.read() sobre
+                    # None tumbaba el hilo y el video se quedaba congelado.
+                    ret, frame = False, None
+                else:
+                    try:
+                        ret, frame = cap.read()
+                    except Exception as e:     # una excepcion del driver no mata el hilo
+                        if consecutive_failures == 0:
+                            log.warning("Error al leer la cámara: %s", e)
+                        ret, frame = False, None
 
                 if not ret or frame is None:
                     consecutive_failures += 1
@@ -1252,7 +1667,11 @@ class CameraThread(QThread):
                         if not camera_was_lost:
                             self.camera_lost_signal.emit()
                             camera_was_lost = True
-                        cap.release()
+                        if cap is not None:
+                            try:
+                                cap.release()
+                            except Exception as e:
+                                log.warning("Error al cerrar la cámara: %s", e)
                         time.sleep(delay)
                         delay = min(delay * 1.5, self._max_reconnect_delay_s)
                         cap = self._open_camera()
@@ -1261,7 +1680,7 @@ class CameraThread(QThread):
                             continue
                         consecutive_failures = 0
                         delay = self._reconnect_delay_s
-                        log.info("Cámara reconectada")
+                        log.info("Cámara reconectada%s", f" ({self.camera_name})" if self.camera_name else "")
                         if camera_was_lost:
                             self.camera_recovered_signal.emit()
                             camera_was_lost = False
@@ -1283,7 +1702,10 @@ class CameraThread(QThread):
                     pass
         finally:
             if cap is not None:
-                cap.release()
+                try:
+                    cap.release()
+                except Exception as e:
+                    log.warning("Error al cerrar la cámara: %s", e)
             log.info("Hilo de cámara terminado")
 
     def stop(self, timeout_ms: int = 2000) -> bool:
@@ -3234,7 +3656,8 @@ class SignLanguageApp(QMainWindow):
         self.image_label.setText("Encendiendo la cámara…")
         self._on_phase("reposo")
 
-        self.camera_thread = CameraThread(self.frame_queue, self.cfg.camera_index)
+        self.camera_thread = CameraThread(self.frame_queue, self.cfg.camera_index,
+                                          backend=self.cfg.camera_backend)
         self.ai_thread = HandTrackingThread(self.frame_queue, self.cfg)
 
         self.ai_thread.set_stable_frames_to_commit(self.stable_frames_slider.value())
@@ -4080,6 +4503,9 @@ class SignLanguageApp(QMainWindow):
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Traductor de Lengua de Señas (MediaPipe)")
     p.add_argument("--camera", type=int, help="Índice de la cámara")
+    p.add_argument("--camera-backend", choices=CONFIG_CHOICES["camera_backend"],
+                   help="auto: en la Raspberry Pi la cámara CSI (AI Camera) y, si falla, una webcam USB; "
+                        "picamera2: solo la CSI; opencv: solo webcam")
     p.add_argument("--config", type=Path, help="Archivo de configuración JSON")
     p.add_argument("--threshold", type=float, help="Confianza mínima de detección (0-1)")
     p.add_argument("--max-hands", type=int, help="Número máximo de manos a detectar")
@@ -4103,6 +4529,8 @@ def main() -> int:
     # hacian fallar a MediaPipe al iniciar).
     if args.camera is not None:
         cfg.set_validated("camera_index", args.camera)
+    if args.camera_backend is not None:
+        cfg.set_validated("camera_backend", args.camera_backend)
     if args.threshold is not None:
         cfg.set_validated("min_detection_confidence", args.threshold)
     if args.max_hands is not None:

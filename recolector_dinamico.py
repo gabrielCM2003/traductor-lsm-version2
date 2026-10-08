@@ -38,7 +38,7 @@ Cada muestra guardada se escribe DOS veces, con el mismo indice N:
     los 33 puntos del cuerpo de MediaPipe Pose por frame, igual sin procesar)
 
 Uso:
-    python recolector_dinamico.py [--camera 0]
+    python recolector_dinamico.py [--camera 0] [--camera-backend auto|picamera2|opencv]
 
 Controles:
     'g'      -> primera vez: empieza a grabar. segunda vez: termina.
@@ -70,7 +70,7 @@ import numpy as np
 import mediapipe as mp
 
 from sign_classifier import normalize_keypoints, hand_to_feature_vector
-from senas import ensure_hand_model, HandDetection, draw_hand_landmarks
+from senas import CONFIG_CHOICES, LiveCamera, ensure_hand_model, HandDetection, draw_hand_landmarks
 from body_tracker import (
     N_BODY_FEATURES, N_POSE_LANDMARKS, BodyDetection, body_location_features,
     BodyTracker, draw_body_skeleton, draw_body_status,
@@ -379,6 +379,9 @@ def save_muestra(
 def main() -> int:
     parser = argparse.ArgumentParser(description="Recolector de senas dinamicas (con movimiento)")
     parser.add_argument("--camera", type=int, default=0)
+    parser.add_argument("--camera-backend", choices=CONFIG_CHOICES["camera_backend"], default="auto",
+                        help="auto: en la Raspberry Pi la camara CSI (AI Camera) y, si falla, una webcam USB; "
+                             "picamera2: solo la CSI; opencv: solo webcam")
     args = parser.parse_args()
 
     print("=== Recolector de senas DINAMICAS ===")
@@ -387,9 +390,11 @@ def main() -> int:
     landmarker = init_hand_landmarker(max_num_hands=2)
     body_tracker = BodyTracker()
 
-    cap = cv2.VideoCapture(args.camera)
+    # Misma camara que el traductor: en la Raspberry Pi la AI Camera (con
+    # webcam USB de respaldo), y se reconecta sola si deja de dar imagen.
+    cap = LiveCamera(args.camera, args.camera_backend)
     if not cap.isOpened():
-        print(f"ERROR: no se pudo abrir la camara {args.camera}", file=sys.stderr)
+        print(f"ERROR: no se pudo abrir la camara {args.camera}: {cap.last_error}", file=sys.stderr)
         return 1
 
     window = "Recolector dinamico - LSM"
@@ -434,8 +439,19 @@ def main() -> int:
             while True:
                 ret, frame = cap.read()
                 if not ret:
-                    print("ERROR: fallo al leer de la camara", file=sys.stderr)
-                    break
+                    if cap.gave_up:
+                        print(f"ERROR: la camara no da imagen desde hace {cap.lost_for_s:.0f} s "
+                              f"({cap.last_error or 'sin detalle'})", file=sys.stderr)
+                        quit_all = True
+                        break
+                    # Reconectando: la ventana sigue respondiendo (ESC sale).
+                    # Si se estaba grabando, la grabacion sigue al volver la
+                    # imagen (los cuadros perdidos no se agregan).
+                    cv2.imshow(window, cap.placeholder())
+                    if cv2.waitKey(30) & 0xFF == 27 and not recording:
+                        quit_all = True
+                        break
+                    continue
                 frame = cv2.flip(frame, 1)  # mismo mirror que CameraThread en senas.py
 
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -490,10 +506,16 @@ def main() -> int:
                         guardar = False
                         while not decidido:
                             ret2, frame2 = cap.read()
-                            if not ret2:
+                            if ret2:
+                                frame2 = cv2.flip(frame2, 1)
+                            elif cap.gave_up:
                                 guardar = False
                                 break
-                            frame2 = cv2.flip(frame2, 1)
+                            else:
+                                # Camara reconectando: se sigue esperando la
+                                # decision con el ultimo cuadro, en vez de
+                                # perder la grabacion por un cuadro fallido.
+                                frame2 = frame.copy()
                             aviso = (
                                 f"Confirmar '{word}': {stats['n_frames']} frames, "
                                 f"{stats['duracion_s']:.1f}s"

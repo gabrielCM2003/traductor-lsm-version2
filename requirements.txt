@@ -17,3 +17,5 @@ py7zr
 
 # Raspberry Pi con cámara CSI (no se instala con pip):
 #   sudo apt install python3-picamera2
+# Raspberry Pi AI Camera (IMX500): además su firmware
+#   sudo apt install imx500-all

@@ -235,12 +235,15 @@ def main() -> int:
         BodyTracker, body_location_features, draw_body_skeleton, draw_body_status,
         draw_rest_line, hands_in_signing_space,
     )
-    from senas import HandDistanceWarning, draw_hand_landmarks, draw_warning
+    from senas import CONFIG_CHOICES, HandDistanceWarning, LiveCamera, draw_hand_landmarks, draw_warning
 
     parser = argparse.ArgumentParser(
         description="Segmentador automatico de senas dinamicas (sin teclas): reconoce o graba"
     )
     parser.add_argument("--camera", type=int, default=0)
+    parser.add_argument("--camera-backend", choices=CONFIG_CHOICES["camera_backend"], default="auto",
+                        help="auto: en la Raspberry Pi la camara CSI (AI Camera) y, si falla, una webcam USB; "
+                             "picamera2: solo la CSI; opencv: solo webcam")
     parser.add_argument("--k", type=int, default=3, help="cuantos candidatos mostrar por prediccion")
     parser.add_argument(
         "--modo", choices=("letras", "palabras"), default="letras",
@@ -286,9 +289,11 @@ def main() -> int:
     landmarker = rd.init_hand_landmarker(max_num_hands=2)
     body_tracker = BodyTracker()
 
-    cap = cv2.VideoCapture(args.camera)
+    # Misma camara que el traductor: en la Raspberry Pi la AI Camera (con
+    # webcam USB de respaldo), y se reconecta sola si deja de dar imagen.
+    cap = LiveCamera(args.camera, args.camera_backend)
     if not cap.isOpened():
-        print(f"ERROR: no se pudo abrir la camara {args.camera}", file=sys.stderr)
+        print(f"ERROR: no se pudo abrir la camara {args.camera}: {cap.last_error}", file=sys.stderr)
         landmarker.close()
         body_tracker.close()
         return 1
@@ -318,8 +323,15 @@ def main() -> int:
         while True:
             ret, frame = cap.read()
             if not ret:
-                print("ERROR: fallo al leer de la camara", file=sys.stderr)
-                break
+                if cap.gave_up:
+                    print(f"ERROR: la camara no da imagen desde hace {cap.lost_for_s:.0f} s "
+                          f"({cap.last_error or 'sin detalle'})", file=sys.stderr)
+                    break
+                # Reconectando: la ventana sigue respondiendo (ESC sale).
+                cv2.imshow(window, cap.placeholder())
+                if cv2.waitKey(30) & 0xFF == 27:
+                    break
+                continue
             frame = cv2.flip(frame, 1)  # mismo mirror que el resto del proyecto
             frame_h, frame_w = frame.shape[:2]
 

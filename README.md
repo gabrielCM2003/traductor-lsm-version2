@@ -41,7 +41,7 @@ El repositorio incluye también la documentación del **guante instrumentado** d
 | `grabar_guante.py` | Graba muestras de cada guante: derecho en `datos_guante/dataset_guante.jsonl`, izquierdo (`--mano I`) en `datos_guante/dataset_guante_izquierdo.jsonl` y frases con los dos (`--mano DI`) en `datos_guante/dataset_guante_ambas.jsonl` (`--probar` para reconocer sin grabar) |
 | `simular_guante.py` | ESP32 falsa: manda muestras del dataset por UDP para probar sin el guante (`--mano I` para el izquierdo, `--mano DI` para frases) |
 | `datos_guante/` | Dataset de cada guante (una línea JSON por muestra: persona, mano, etiqueta y 2 s de lecturas) |
-| `tests/` | Pruebas unitarias: configuración, alfabeto estático, modo automático, DTW con cuerpo, retroalimentación, ventana y guante |
+| `tests/` | Pruebas unitarias: configuración, alfabeto estático, modo automático, DTW con cuerpo, retroalimentación, ventana, guante y cámara de la Raspberry (AI Camera, con una Picamera2 falsa) |
 | `probar_modo_dinamico_senas.py` | Pruebas de regresión del alfabeto dinámico integrado en `senas.py` |
 | `requirements.txt` | Dependencias de Python |
 | `Guante_LSM_Indivisa_Ingenium_2026.pdf` | Guía técnica del guante v2: enlace inalámbrico ESP-NOW, batería LiPo y estación Raspberry Pi |
@@ -76,6 +76,7 @@ La primera vez descarga los modelos de manos y de pose de MediaPipe en `~/.sign_
 | Opción | Descripción |
 |---|---|
 | `--camera N` | Índice de la cámara a usar (por defecto: 0) |
+| `--camera-backend X` | `auto` (por defecto: en la Raspberry Pi, la cámara CSI y, si falla, una webcam USB), `picamera2` (solo la CSI) u `opencv` (solo webcam). También `"camera_backend"` en la configuración |
 | `--config RUTA` | Archivo de configuración JSON |
 | `--threshold X` | Confianza mínima de detección (0–1) |
 | `--max-hands N` | Número máximo de manos a detectar |
@@ -86,6 +87,22 @@ Ejemplo:
 ```bash
 python senas.py --camera 1 --threshold 0.7
 ```
+
+### Raspberry Pi AI Camera (IMX500)
+
+La cámara de la Raspberry es la **Raspberry Pi AI Camera**. El programa la usa como una cámara CSI más, con Picamera2: MediaPipe corre en el CPU de la Pi y no se usa la red neuronal del sensor.
+
+```bash
+sudo apt install imx500-all python3-picamera2   # firmware de la AI Camera y Picamera2; reinicia después
+rpicam-hello --list-cameras                     # debe aparecer imx500
+```
+
+- Se pide el modo de 30 fps del sensor (2028×1520) y el ISP lo baja a 640×480. La primera vez que se enciende, el sensor carga su firmware y la imagen puede tardar varios segundos (se espera hasta 20 s).
+- **Si la AI Camera falla, el programa no se cae:**
+  - Si no abre (no se detecta, está ocupada por `rpicam-hello` u otro programa, o no da imagen por falta de firmware), se intenta con una webcam USB. La barra de estado dice cuál quedó: `Cámara conectada (AI Camera)` o `Cámara conectada (webcam USB; la cámara CSI falló)`. Si tampoco hay webcam, el mensaje de error dice qué pasó y qué hacer (p. ej. `sudo apt install imx500-all`).
+  - Si deja de mandar imagen a medio uso, cada lectura espera a lo más 1 s; tras 5 lecturas fallidas se cierra (sin quedarse trabada en el cierre) y se reconecta sola, con la AI Camera o, si no responde, con la webcam.
+- `--camera-backend picamera2` usa solo la AI Camera (sin webcam de respaldo) y `--camera-backend opencv` solo la webcam, aunque la AI Camera esté conectada.
+- Los programas para grabar vocabulario (`recolector_estatico.py`, `recolector_dinamico.py` y `segmentador_automatico.py`) abren la cámara igual que el traductor y aceptan el mismo `--camera-backend`. Si la cámara deja de dar imagen, la ventana muestra «Camara perdida, reconectando...» y se recupera sola; una grabación de `recolector_dinamico.py` que esperaba confirmación no se pierde. Si pasan 30 s sin imagen, el programa termina con un mensaje que dice qué pasó.
 
 Si la mano se acerca demasiado a la cámara, el video muestra un aviso: MediaPipe sigue la mano mientras no la pierda, pero una vez perdida no la puede volver a detectar si ocupa ~80% de la imagen o más.
 

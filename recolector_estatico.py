@@ -11,7 +11,7 @@ Pose, ver body_location_features en body_tracker.py). entrenar_palabras.py
 sigue leyendo solo v0..v125 hasta que se entrene un modelo que las use.
 
 Uso:
-    python recolector_estatico.py [--camera 0]
+    python recolector_estatico.py [--camera 0] [--camera-backend auto|picamera2|opencv]
 
 Controles:
     ESPACIO  -> captura y guarda una muestra de la palabra actual
@@ -40,7 +40,7 @@ import numpy as np
 import mediapipe as mp
 
 from sign_classifier import normalize_keypoints, hand_to_feature_vector
-from senas import ensure_hand_model, HandDetection, draw_hand_landmarks
+from senas import CONFIG_CHOICES, LiveCamera, ensure_hand_model, HandDetection, draw_hand_landmarks
 from body_tracker import (
     N_BODY_FEATURES, BodyTracker, body_location_features,
     draw_body_skeleton, draw_body_status,
@@ -172,6 +172,9 @@ def append_sample(vec: np.ndarray, body_vec: np.ndarray, label: str, recorder: s
 def main() -> int:
     parser = argparse.ArgumentParser(description="Recolector de senas estaticas (1-2 manos)")
     parser.add_argument("--camera", type=int, default=0)
+    parser.add_argument("--camera-backend", choices=CONFIG_CHOICES["camera_backend"], default="auto",
+                        help="auto: en la Raspberry Pi la camara CSI (AI Camera) y, si falla, una webcam USB; "
+                             "picamera2: solo la CSI; opencv: solo webcam")
     args = parser.parse_args()
 
     print("=== Recolector de senas ESTATICAS ===")
@@ -188,9 +191,11 @@ def main() -> int:
     landmarker = init_hand_landmarker(max_num_hands=2)
     body_tracker = BodyTracker()
 
-    cap = cv2.VideoCapture(args.camera)
+    # Misma camara que el traductor: en la Raspberry Pi la AI Camera (con
+    # webcam USB de respaldo), y se reconecta sola si deja de dar imagen.
+    cap = LiveCamera(args.camera, args.camera_backend)
     if not cap.isOpened():
-        print(f"ERROR: no se pudo abrir la camara {args.camera}", file=sys.stderr)
+        print(f"ERROR: no se pudo abrir la camara {args.camera}: {cap.last_error}", file=sys.stderr)
         return 1
 
     window = "Recolector estatico - LSM"
@@ -220,8 +225,17 @@ def main() -> int:
             while True:
                 ret, frame = cap.read()
                 if not ret:
-                    print("ERROR: fallo al leer de la camara", file=sys.stderr)
-                    break
+                    if cap.gave_up:
+                        print(f"ERROR: la camara no da imagen desde hace {cap.lost_for_s:.0f} s "
+                              f"({cap.last_error or 'sin detalle'})", file=sys.stderr)
+                        quit_all = True
+                        break
+                    # Reconectando: la ventana sigue respondiendo (ESC sale).
+                    cv2.imshow(window, cap.placeholder())
+                    if cv2.waitKey(30) & 0xFF == 27:
+                        quit_all = True
+                        break
+                    continue
                 frame = cv2.flip(frame, 1)  # mismo mirror que CameraThread en senas.py
 
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
